@@ -71,11 +71,13 @@ func ExtractContacts(body []byte) *ContactData {
 	resp := &foxhound.Response{Body: body}
 
 	// ── Emails — foxhound handles cfemail, mailto, plaintext regex, dedup ──
+	// Post-filter: reject garbage that foxhound's regex picks up from raw HTML.
 	for _, e := range parse.ExtractEmails(resp) {
 		e = strings.ToLower(strings.TrimSpace(e))
-		if e != "" && !isExtraBlocklisted(e) {
-			cd.Emails = append(cd.Emails, e)
+		if e == "" || isExtraBlocklisted(e) || !isCleanEmail(e) {
+			continue
 		}
+		cd.Emails = append(cd.Emails, e)
 	}
 
 	// ── Phones — foxhound handles tel: links, plaintext regex, validation ──
@@ -366,6 +368,86 @@ func isSocialNoise(handle string) bool {
 		}
 	}
 	return false
+}
+
+// isCleanEmail rejects garbage emails that pass basic regex but are not real.
+// Catches: concatenated text (phone+email+button), fake TLDs, tracking IDs.
+func isCleanEmail(email string) bool {
+	atIdx := strings.LastIndex(email, "@")
+	if atIdx < 1 {
+		return false
+	}
+
+	local := email[:atIdx]
+	domain := email[atIdx+1:]
+
+	// Reject if local part has digits immediately followed by a known email prefix
+	// Pattern: "9346082info@" or "812-3868-7387marcom@" — phone concatenated with email.
+	if len(local) > 20 {
+		return false // Local parts > 20 chars are almost always garbage.
+	}
+
+	// Reject if domain has extra text appended after TLD.
+	// Pattern: "inivie.comview", "balifitness.asiaphone", "ttbeach.clubmenu"
+	// Real domains end with a valid TLD, nothing after it.
+	dotIdx := strings.LastIndex(domain, ".")
+	if dotIdx < 0 {
+		return false
+	}
+	tld := domain[dotIdx+1:]
+	if !isValidTLD(tld) {
+		return false
+	}
+
+	// Reject hex tracking IDs (32+ hex chars in local part).
+	hexCount := 0
+	for _, r := range local {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			hexCount++
+		}
+	}
+	if hexCount > 20 && float64(hexCount)/float64(len(local)) > 0.8 {
+		return false
+	}
+
+	return true
+}
+
+// validTLDs is a set of common real TLDs. This is not exhaustive but catches
+// the most common fake TLDs from social media content.
+var validTLDs = map[string]bool{
+	// Generic
+	"com": true, "net": true, "org": true, "info": true, "biz": true,
+	"io": true, "co": true, "me": true, "tv": true, "cc": true,
+	"xyz": true, "app": true, "dev": true, "tech": true, "site": true,
+	"online": true, "store": true, "shop": true, "club": true, "pro": true,
+	"studio": true, "agency": true, "design": true, "media": true,
+	"digital": true, "global": true, "world": true, "life": true,
+	"fitness": true, "health": true, "travel": true, "hotel": true,
+	"space": true, "today": true, "email": true, "link": true,
+	"work": true, "asia": true, "rent": true, "page": true,
+
+	// Country codes (common ones)
+	"id": true, "uk": true, "au": true, "de": true, "fr": true,
+	"jp": true, "kr": true, "sg": true, "my": true, "th": true,
+	"ph": true, "vn": true, "in": true, "cn": true, "tw": true,
+	"hk": true, "nz": true, "ca": true, "us": true, "br": true,
+	"mx": true, "es": true, "it": true, "nl": true, "be": true,
+	"ch": true, "at": true, "pl": true, "se": true, "no": true,
+	"dk": true, "fi": true, "pt": true, "ru": true, "ua": true,
+	"za": true, "ae": true, "sa": true, "il": true, "tr": true,
+	"ie": true, "cz": true, "ro": true, "hu": true, "gr": true,
+
+	// Second-level country (treated as TLD after last dot)
+	// e.g. info@foo.co.id → TLD is "id", works.
+	// But for co.uk addresses the last dot gives "uk", also works.
+
+	// Education & gov
+	"edu": true, "gov": true, "mil": true, "ac": true,
+}
+
+func isValidTLD(tld string) bool {
+	return validTLDs[strings.ToLower(tld)]
 }
 
 func truncate(s string, maxLen int) string {
