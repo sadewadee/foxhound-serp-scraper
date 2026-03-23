@@ -10,14 +10,15 @@ import (
 )
 
 type Config struct {
-	Postgres PostgresConfig `yaml:"postgres"`
-	Redis    RedisConfig    `yaml:"redis"`
-	SERP     SERPConfig     `yaml:"serp"`
-	Website  WebsiteConfig  `yaml:"website"`
-	Contact  ContactConfig  `yaml:"contact"`
-	Proxy    ProxyConfig    `yaml:"proxy"`
-	Fetch    FetchConfig    `yaml:"fetch"`
-	Monitor  MonitorConfig  `yaml:"monitor"`
+	Postgres     PostgresConfig     `yaml:"postgres"`
+	Redis        RedisConfig        `yaml:"redis"`
+	SERP         SERPConfig         `yaml:"serp"`
+	Website      WebsiteConfig      `yaml:"website"`
+	Contact      ContactConfig      `yaml:"contact"`
+	Proxy        ProxyConfig        `yaml:"proxy"`
+	Fetch        FetchConfig        `yaml:"fetch"`
+	Monitor      MonitorConfig      `yaml:"monitor"`
+	Mordibouncer MordibouncerConfig `yaml:"mordibouncer"`
 }
 
 type PostgresConfig struct {
@@ -51,6 +52,12 @@ type ContactConfig struct {
 	TimeoutMs        int  `yaml:"timeout_ms"`
 	ValidateMX       bool `yaml:"validate_mx"`
 	SocialExtraction bool `yaml:"social_extraction"`
+	ValidateEmail    bool `yaml:"validate_email"`
+}
+
+type MordibouncerConfig struct {
+	APIURL string `yaml:"api_url"`
+	Secret string `yaml:"secret"`
 }
 
 type ProxyConfig struct {

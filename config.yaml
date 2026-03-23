@@ -24,6 +24,7 @@ contact:
   workers: 10
   timeout_ms: 15000
   validate_mx: false
+  validate_email: false
   social_extraction: true
 
 proxy:
@@ -32,6 +33,10 @@ proxy:
 fetch:
   headless: true
   block_images: true
+
+mordibouncer:
+  api_url: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
+  secret: "${MORDIBOUNCER_SECRET}"
 
 monitor:
   enabled: true

@@ -23,6 +23,27 @@ var googleDomains = []string{
 	"maps.google", "translate.google",
 }
 
+// socialDomains are social media and content platforms to exclude from SERP results.
+// These waste crawl budget — no contact emails on social profiles.
+var socialDomains = []string{
+	// Social media
+	"facebook.com", "instagram.com", "twitter.com", "x.com",
+	"linkedin.com", "tiktok.com", "pinterest.com", "snapchat.com",
+	"reddit.com", "tumblr.com", "threads.net",
+	// Video
+	"vimeo.com", "dailymotion.com",
+	// Review / listing (no direct contact)
+	"yelp.com", "tripadvisor.com", "trustpilot.com",
+	"foursquare.com", "zomato.com",
+	// Aggregators / directories (low email yield)
+	"wikipedia.org", "wikimedia.org",
+	"amazon.com", "ebay.com", "alibaba.com",
+	"apple.com", "play.google.com",
+	// Link shorteners / aggregators
+	"linktr.ee", "linkin.bio", "bit.ly", "t.co",
+	"medium.com", "blogspot.com", "wordpress.com",
+}
+
 // BuildSERPURL constructs a Google Search URL.
 func BuildSERPURL(query string, page, resultsPerPage int) string {
 	q := url.QueryEscape(query)
@@ -65,6 +86,10 @@ func ParseSERPResults(body []byte) ([]string, error) {
 			}
 			// Filter Google domains.
 			if isGoogleDomain(href) {
+				return
+			}
+			// Filter social media and low-yield platforms.
+			if isExcludedDomain(href) {
 				return
 			}
 			if !seen[href] {
@@ -114,6 +139,21 @@ func isGoogleDomain(rawURL string) bool {
 	host := strings.ToLower(u.Hostname())
 	for _, gd := range googleDomains {
 		if host == gd || strings.HasSuffix(host, "."+gd) {
+			return true
+		}
+	}
+	return false
+}
+
+// isExcludedDomain returns true if the URL is a social media or low-yield platform.
+func isExcludedDomain(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, sd := range socialDomains {
+		if host == sd || strings.HasSuffix(host, "."+sd) {
 			return true
 		}
 	}

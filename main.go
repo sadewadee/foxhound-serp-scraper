@@ -138,8 +138,12 @@ func runScrape(cfg *config.Config, args []string) error {
 	pages := fs.Int("pages", 0, "Override pages per query")
 	workers := fs.Int("workers", 0, "Override contact extraction workers")
 	contactPages := fs.Bool("contact-pages", true, "Also visit /contact, /about pages")
+	validateEmail := fs.Bool("validate-email", false, "Validate emails via Mordibouncer API")
 	fs.Parse(args)
 
+	if *validateEmail {
+		cfg.Contact.ValidateEmail = true
+	}
 	if *query == "" {
 		return fmt.Errorf("scrape: -q is required")
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/scraper"
+	"github.com/sadewadee/serp-scraper/internal/validate"
 )
 
 // contactPagePaths are common paths that contain contact information.
@@ -54,6 +55,7 @@ type Result struct {
 	WhatsApp         string
 	OpeningHours     string
 	Rating           string
+	EmailStatus      string // safe, risky, invalid, unknown (from mordibouncer)
 }
 
 // Runner executes the full pipeline in-memory without PG/Redis.
@@ -61,6 +63,9 @@ type Runner struct {
 	cfg    *config.Config
 	query  string
 	output string
+
+	// Email validation.
+	validator *validate.MordibouncerClient
 
 	// In-memory state.
 	urlSeen    sync.Map // map[string]bool — URL hash dedup
@@ -89,6 +94,7 @@ func New(cfg *config.Config, query, output string) *Runner {
 		cfg:          cfg,
 		query:        query,
 		output:       output,
+		validator:    validate.NewMordibouncer(&cfg.Mordibouncer),
 		websiteQueue: make(chan string, 10000),
 		contactQueue: make(chan string, 50000),
 	}
@@ -304,9 +310,25 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 				continue
 			}
 
-			// Optional MX validation.
+			// Optional MX validation (local DNS check).
 			if r.cfg.Contact.ValidateMX && !scraper.ValidateMX(email) {
 				continue
+			}
+
+			// Optional Mordibouncer email validation (SMTP-level check).
+			emailStatus := ""
+			if r.cfg.Contact.ValidateEmail && r.validator != nil {
+				result, err := r.validator.Check(ctx, email)
+				if err != nil {
+					slog.Debug("enrichment: mordibouncer check failed", "email", email, "error", err)
+				} else {
+					emailStatus = result.IsReachable
+					if !result.IsGoodEmail() {
+						slog.Debug("enrichment: email rejected by mordibouncer",
+							"email", email, "status", result.IsReachable, "sub", result.SubStatus)
+						continue
+					}
+				}
 			}
 
 			phone := ""
@@ -332,6 +354,7 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 				WhatsApp:         cd.WhatsApp,
 				OpeningHours:     cd.OpeningHours,
 				Rating:           cd.Rating,
+				EmailStatus:      emailStatus,
 			})
 			r.resultsMu.Unlock()
 
@@ -413,7 +436,7 @@ func (r *Runner) writeCSV() error {
 
 	// Header.
 	w.Write([]string{
-		"email", "phone", "domain", "source_url",
+		"email", "email_status", "phone", "domain", "source_url",
 		"business_name", "business_category", "description", "location", "address",
 		"instagram", "facebook", "twitter", "linkedin", "whatsapp",
 		"opening_hours", "rating",
@@ -421,7 +444,7 @@ func (r *Runner) writeCSV() error {
 
 	for _, res := range results {
 		w.Write([]string{
-			res.Email, res.Phone, res.Domain, res.SourceURL,
+			res.Email, res.EmailStatus, res.Phone, res.Domain, res.SourceURL,
 			res.BusinessName, res.BusinessCategory, res.Description, res.Location, res.Address,
 			res.Instagram, res.Facebook, res.Twitter, res.LinkedIn, res.WhatsApp,
 			res.OpeningHours, res.Rating,
