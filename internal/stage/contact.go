@@ -45,12 +45,23 @@ func (c *ContactStage) Run(ctx context.Context) error {
 	numWorkers := c.cfg.Contact.Workers
 	slog.Info("contact: starting workers", "count", numWorkers)
 
+	// One shared browser for all workers (fallback for JS-heavy sites).
+	// Camoufox handles concurrency internally via page pooling.
+	var sharedBrowser *fetch.CamoufoxFetcher
+	browser, err := internalScraper.NewBrowser(c.cfg)
+	if err != nil {
+		slog.Warn("contact: shared browser init failed, stealth-only mode", "error", err)
+	} else {
+		sharedBrowser = browser
+		defer sharedBrowser.Close()
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			c.worker(ctx, workerID)
+			c.worker(ctx, workerID, sharedBrowser)
 		}(i)
 	}
 
@@ -62,21 +73,12 @@ func (c *ContactStage) Run(ctx context.Context) error {
 	return nil
 }
 
-func (c *ContactStage) worker(ctx context.Context, workerID int) {
+func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *fetch.CamoufoxFetcher) {
 	slog.Info("contact: worker starting", "worker", workerID)
 
-	// Each worker gets its own stealth + browser fetcher.
+	// Each worker gets its own stealth HTTP fetcher (lightweight, per-worker identity).
 	stealth := internalScraper.NewStealth(c.cfg)
 	defer stealth.Close()
-
-	browser, err := internalScraper.NewBrowser(c.cfg)
-	if err != nil {
-		slog.Error("contact: browser init failed, using stealth only", "worker", workerID, "error", err)
-		browser = nil
-	}
-	if browser != nil {
-		defer browser.Close()
-	}
 
 	queueKey := "serp:queue:contacts"
 
@@ -130,8 +132,8 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
 		var body string
-		if browser != nil {
-			body, err = internalScraper.FetchPage(fetchCtx, stealth, browser, pageURL, job.ID)
+		if sharedBrowser != nil {
+			body, err = internalScraper.FetchPage(fetchCtx, stealth, sharedBrowser, pageURL, job.ID)
 		} else {
 			body, err = fetchStealthOnly(fetchCtx, stealth, pageURL, job.ID)
 		}
