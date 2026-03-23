@@ -1,0 +1,47 @@
+# .dockerignore — keeps the build context lean and avoids leaking secrets.
+
+# Version control
+.git
+.gitignore
+
+# Go build artifacts
+serp-scraper
+*.exe
+*.test
+*.out
+
+# Test and benchmark data
+*_test.go
+testdata/
+*-results.csv
+*.csv
+
+# Documentation
+*.md
+docs/
+
+# IDE / editor metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docker files themselves (not needed inside the image)
+Dockerfile*
+docker-compose*.yaml
+.dockerignore
+
+# Environment files — never include secrets in the image
+.env
+.env.*
+*.env
+
+# Config overrides — mounted at runtime, not baked in
+config.yaml
+
+# Go module cache (if somehow present locally)
+vendor/
+
+# OS artifacts
+Thumbs.db

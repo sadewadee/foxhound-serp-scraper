@@ -19,6 +19,8 @@ import (
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
+	"github.com/sadewadee/serp-scraper/internal/directory"
+	"github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
 // contactPagePaths are common paths that contain contact information.
@@ -84,6 +86,10 @@ func (w *WebsiteStage) Run(ctx context.Context) error {
 func (w *WebsiteStage) worker(ctx context.Context, workerID int) {
 	slog.Info("website: worker starting", "worker", workerID)
 
+	// Stealth fetcher for directory page fetches.
+	stealth := scraper.NewStealth(w.cfg)
+	defer stealth.Close()
+
 	queueKey := "serp:queue:websites"
 	contactQueueKey := "serp:queue:contacts"
 
@@ -143,6 +149,44 @@ func (w *WebsiteStage) worker(ctx context.Context, workerID int) {
 			case int64:
 				queryID = v
 			}
+		}
+
+		// Directory path: fetch the page and extract individual business listings.
+		// Each listing with a URL is pushed directly to the contacts queue for enrichment.
+		if directory.IsDirectory(siteURL) {
+			slog.Debug("website: directory detected, fetching listings", "url", siteURL, "worker", workerID)
+
+			timeout := time.Duration(w.cfg.Website.TimeoutMs) * time.Millisecond
+			fetchCtx, cancel := context.WithTimeout(ctx, timeout)
+			body, fetchErr := fetchStealthOnly(fetchCtx, stealth, siteURL, fmt.Sprintf("dir-%s", dedup.HashURL(siteURL)[:8]))
+			cancel()
+
+			if fetchErr != nil {
+				slog.Warn("website: directory fetch failed", "url", siteURL, "error", fetchErr)
+			} else {
+				listings := directory.ExtractListings(siteURL, []byte(body))
+				slog.Info("website: directory listings extracted",
+					"url", siteURL, "count", len(listings), "worker", workerID)
+
+				for _, l := range listings {
+					if l.URL == "" {
+						continue
+					}
+					listingHash := dedup.HashURL(l.URL)
+					isNew, err := w.dedup.Add(ctx, dedup.KeyURLs, listingHash)
+					if err != nil || !isNew {
+						continue
+					}
+					if err := w.pushContactJob(ctx, contactQueueKey, l.URL, queryID); err != nil {
+						slog.Warn("website: push directory listing failed", "url", l.URL, "error", err)
+					} else {
+						w.pagesQueued.Add(1)
+					}
+				}
+			}
+
+			slog.Debug("website: directory domain processed", "domain", domain, "worker", workerID)
+			continue
 		}
 
 		// Always push the original URL to contacts queue.

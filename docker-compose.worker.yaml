@@ -1,0 +1,78 @@
+# docker-compose.worker.yaml — Server B / C / D (Worker only)
+#
+# Runs a single pipeline-stage worker that connects to a REMOTE PostgreSQL
+# and Redis instance (typically on Server A, reachable via Tailscale or VPN).
+#
+# There are NO local db/redis services — this compose file is intentionally
+# lightweight: one container, no volumes for PG/Redis.
+#
+# Usage:
+#   cp .env.worker.example .env
+#   docker compose -f docker-compose.worker.yaml up -d
+#
+# Scale horizontally by running this file on multiple servers with different
+# WORKER_STAGE / WORKER_COUNT values.
+#
+# Required environment variables (set in .env or Dokploy env panel):
+#   POSTGRES_DSN     — Full DSN to the remote PG instance, e.g.
+#                      postgres://serp:pass@100.x.x.x:5432/serp_scraper?sslmode=disable
+#   REDIS_ADDR       — Remote Redis address (e.g. 100.x.x.x:6379)
+#   REDIS_PASSWORD   — Remote Redis password (default: empty)
+#
+# Optional tuning:
+#   WORKER_STAGE     — Pipeline stage to run: all | serp | website | contact (default: contact)
+#   WORKER_COUNT     — Number of concurrent workers (default: 20)
+#   PROXY_URL        — HTTP/SOCKS5 proxy URL
+#   SERP_IMAGE       — Docker image tag (default: serp-scraper:latest)
+#   WORKER_MEMORY    — Memory limit for the container (default: 1g)
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # serp-scraper worker (single pipeline stage, connects to remote PG + Redis)
+  # ---------------------------------------------------------------------------
+  worker:
+    image: "${SERP_IMAGE:-serp-scraper:latest}"
+    restart: unless-stopped
+    environment:
+      # Remote database — must be set; no default (fail fast if missing).
+      POSTGRES_DSN: "${POSTGRES_DSN}"
+      # Remote Redis.
+      REDIS_ADDR: "${REDIS_ADDR:-localhost:6379}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      # Optional proxy.
+      PROXY_URL: "${PROXY_URL:-}"
+      # Timezone.
+      TZ: "${TZ:-UTC}"
+      # Prometheus metrics — expose on a non-default port to avoid collisions
+      # when multiple workers run on the same host.
+      MONITOR_PORT: "${MONITOR_PORT:-9091}"
+    # Shared memory for browser stability under concurrent workers.
+    shm_size: "512mb"
+    ports:
+      - "${MONITOR_PORT:-9091}:9091"
+    healthcheck:
+      # Workers do not expose the HTTP API; check the metrics endpoint instead.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${MONITOR_PORT:-9091}/metrics || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # Run the specified stage with the specified worker count.
+    command:
+      - "run"
+      - "-stage"
+      - "${WORKER_STAGE:-contact}"
+      - "-workers"
+      - "${WORKER_COUNT:-20}"
+    deploy:
+      resources:
+        limits:
+          memory: "${WORKER_MEMORY:-1g}"
+
+# No volumes block — workers are stateless; all state lives in PG + Redis on
+# Server A.
+#
+# No networks block — uses the default bridge network. Connect to Server A via
+# Tailscale, WireGuard, or a private VPC; set POSTGRES_DSN and REDIS_ADDR
+# to the appropriate private IP/hostname.

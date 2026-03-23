@@ -16,6 +16,7 @@ import (
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
+	"github.com/sadewadee/serp-scraper/internal/directory"
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
@@ -142,6 +143,63 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 		}
 
 		c.pagesProcessed.Add(1)
+
+		// Directory path: extract business listings and store their data directly.
+		if directory.IsDirectory(pageURL) {
+			listings := directory.ExtractListings(pageURL, []byte(body))
+			if len(listings) > 0 {
+				slog.Info("contact: directory listings extracted",
+					"url", pageURL, "count", len(listings), "worker", workerID)
+			}
+			for _, l := range listings {
+				// Store listing contact data if email is present.
+				if l.Email != "" {
+					emailHash := dedup.HashEmail(l.Email)
+
+					isNew, dedupErr := c.dedup.Add(ctx, dedup.KeyEmails, emailHash)
+					if dedupErr != nil {
+						slog.Warn("contact: listing email dedup failed", "error", dedupErr)
+						continue
+					}
+					if !isNew {
+						continue
+					}
+
+					phone := l.Phone
+					_, insertErr := c.db.Exec(`
+						INSERT INTO contacts (
+							email, email_hash, phone, domain, source_url, source_query_id,
+							address
+						) VALUES ($1, $2, $3, $4, $5, $6, $7)
+						ON CONFLICT (email_hash, domain) DO NOTHING
+					`, l.Email, emailHash, phone,
+						dedup.ExtractDomain(pageURL), pageURL, queryID,
+						l.Address)
+					if insertErr != nil {
+						slog.Warn("contact: listing insert failed", "email", l.Email, "error", insertErr)
+						continue
+					}
+					c.emailsFound.Add(1)
+				} else if l.Phone != "" {
+					// Phone-only listing.
+					_, insertErr := c.db.Exec(`
+						INSERT INTO contacts (
+							phone, domain, source_url, source_query_id,
+							address
+						) VALUES ($1, $2, $3, $4, $5)
+						ON CONFLICT DO NOTHING
+					`, l.Phone, dedup.ExtractDomain(pageURL), pageURL, queryID,
+						l.Address)
+					if insertErr != nil {
+						slog.Debug("contact: listing phone-only insert failed", "error", insertErr)
+					}
+					c.phonesFound.Add(1)
+				}
+			}
+			slog.Debug("contact: directory page done",
+				"url", pageURL, "listings", len(listings), "worker", workerID)
+			continue
+		}
 
 		// Extract contacts.
 		cd := internalScraper.ExtractContacts([]byte(body))

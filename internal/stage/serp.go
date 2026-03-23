@@ -44,12 +44,7 @@ func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPSt
 		db:        database,
 		dedup:     dd,
 		queryRepo: query.NewRepository(database),
-		timing: behavior.NewTiming(behavior.TimingConfig{
-			Mu:    1.0,
-			Sigma: 0.8,
-			Min:   2 * time.Second,
-			Max:   30 * time.Second,
-		}),
+		timing:    behavior.NewTiming(behavior.CarefulProfile().Timing),
 	}
 }
 
@@ -84,8 +79,8 @@ func (s *SERPStage) Run(ctx context.Context) error {
 func (s *SERPStage) worker(ctx context.Context, workerID int) {
 	slog.Info("serp: worker starting", "worker", workerID)
 
-	// Each worker gets its own browser instance.
-	browser, err := scraper.NewBrowser(s.cfg)
+	// Each worker gets its own browser instance with persistent session + page pooling.
+	browser, err := scraper.NewSERPBrowser(s.cfg)
 	if err != nil {
 		slog.Error("serp: worker browser init failed", "worker", workerID, "error", err)
 		return
@@ -164,9 +159,9 @@ func (s *SERPStage) processQuery(ctx context.Context, browser *fetch.CamoufoxFet
 			continue
 		}
 
-		// Fetch SERP page via browser.
+		// Fetch SERP page via browser with consent banner handling.
 		slog.Debug("serp: fetching page", "query", q.Text, "page", page, "url", serpURL)
-		body, err := scraper.FetchWithBrowser(ctx, browser, serpURL, fmt.Sprintf("serp-%d-%d", q.ID, page))
+		body, err := scraper.FetchSERP(ctx, browser, serpURL, fmt.Sprintf("serp-%d-%d", q.ID, page))
 		if err != nil {
 			slog.Warn("serp: fetch failed", "query", q.Text, "page", page, "error", err)
 			s.db.Exec(`UPDATE serp_seeds SET status = 'failed' WHERE id = $1`, seedID)
