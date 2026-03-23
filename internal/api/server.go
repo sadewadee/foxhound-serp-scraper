@@ -14,20 +14,24 @@ import (
 
 // Server is the REST API server for pipeline mode.
 type Server struct {
-	db     *sql.DB
-	redis  *redis.Client
-	auth   *Auth
-	mux    *http.ServeMux
-	server *http.Server
+	db      *sql.DB
+	redis   *redis.Client
+	auth    *Auth
+	dokploy *DokployClient
+	workers map[string]*WorkerInfo // composeID → worker info
+	mux     *http.ServeMux
+	server  *http.Server
 }
 
 // NewServer creates an API server.
-func NewServer(db *sql.DB, redisClient *redis.Client, authCfg AuthConfig) *Server {
+func NewServer(db *sql.DB, redisClient *redis.Client, authCfg AuthConfig, dokployCfg DokployConfig) *Server {
 	s := &Server{
-		db:    db,
-		redis: redisClient,
-		auth:  NewAuth(authCfg),
-		mux:   http.NewServeMux(),
+		db:      db,
+		redis:   redisClient,
+		auth:    NewAuth(authCfg),
+		dokploy: NewDokployClient(dokployCfg),
+		workers: make(map[string]*WorkerInfo),
+		mux:     http.NewServeMux(),
 	}
 	s.registerRoutes()
 	return s
@@ -54,6 +58,13 @@ func (s *Server) registerRoutes() {
 
 	// Pipeline.
 	s.mux.HandleFunc("GET /api/pipeline/stats", RequireRole(RoleViewer, s.handlePipelineStats))
+
+	// Workers (Dokploy-managed).
+	s.mux.HandleFunc("POST /api/workers/deploy", RequireRole(RoleAdmin, s.handleDeployWorker))
+	s.mux.HandleFunc("GET /api/workers", RequireRole(RoleViewer, s.handleListWorkers))
+	s.mux.HandleFunc("POST /api/workers/stop", RequireRole(RoleAdmin, s.handleStopWorker))
+	s.mux.HandleFunc("POST /api/workers/start", RequireRole(RoleAdmin, s.handleStartWorker))
+	s.mux.HandleFunc("DELETE /api/workers", RequireRole(RoleAdmin, s.handleDeleteWorker))
 
 	// Health.
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
@@ -386,6 +397,119 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 	stats["dedup"] = dedupStats
 
 	writeJSON(w, http.StatusOK, stats)
+}
+
+// ── Worker management (Dokploy) ──
+
+func (s *Server) handleDeployWorker(w http.ResponseWriter, r *http.Request) {
+	if s.dokploy == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "Dokploy not configured (set dokploy.url and dokploy.api_key in config)",
+		})
+		return
+	}
+
+	var req WorkerDeployRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request: " + err.Error()})
+		return
+	}
+	if req.Name == "" || req.EnvID == "" || req.ServerID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name, environment_id, server_id are required"})
+		return
+	}
+	if req.PostgresDSN == "" || req.RedisAddr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "postgres_dsn, redis_addr are required"})
+		return
+	}
+
+	info, err := s.dokploy.DeployWorker(req)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	s.workers[info.ComposeID] = info
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
+	list := make([]*WorkerInfo, 0, len(s.workers))
+	for _, w := range s.workers {
+		list = append(list, w)
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleStopWorker(w http.ResponseWriter, r *http.Request) {
+	if s.dokploy == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Dokploy not configured"})
+		return
+	}
+
+	var req struct {
+		ComposeID string `json:"compose_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ComposeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "compose_id is required"})
+		return
+	}
+
+	if err := s.dokploy.StopWorker(req.ComposeID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if info, ok := s.workers[req.ComposeID]; ok {
+		info.Status = "stopped"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+}
+
+func (s *Server) handleStartWorker(w http.ResponseWriter, r *http.Request) {
+	if s.dokploy == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Dokploy not configured"})
+		return
+	}
+
+	var req struct {
+		ComposeID string `json:"compose_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ComposeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "compose_id is required"})
+		return
+	}
+
+	if err := s.dokploy.StartWorker(req.ComposeID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if info, ok := s.workers[req.ComposeID]; ok {
+		info.Status = "running"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
+}
+
+func (s *Server) handleDeleteWorker(w http.ResponseWriter, r *http.Request) {
+	if s.dokploy == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Dokploy not configured"})
+		return
+	}
+
+	composeID := r.URL.Query().Get("compose_id")
+	if composeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "compose_id query param required"})
+		return
+	}
+
+	if err := s.dokploy.DeleteWorker(composeID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	delete(s.workers, composeID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 // ── Health ──

@@ -47,6 +47,10 @@ api:
       api_key: "${API_KEY}"
       role: admin
 
+dokploy:
+  url: "${DOKPLOY_URL}"
+  api_key: "${DOKPLOY_API_KEY}"
+
 monitor:
   enabled: true
   port: 9090

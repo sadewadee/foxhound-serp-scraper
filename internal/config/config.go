@@ -20,12 +20,18 @@ type Config struct {
 	Monitor      MonitorConfig      `yaml:"monitor"`
 	Mordibouncer MordibouncerConfig `yaml:"mordibouncer"`
 	API          APIConfig          `yaml:"api"`
+	Dokploy      DokployConfig      `yaml:"dokploy"`
 }
 
 type APIConfig struct {
 	Addr   string     `yaml:"addr"`
 	Secret string     `yaml:"secret"`
 	Users  []APIUser  `yaml:"users"`
+}
+
+type DokployConfig struct {
+	URL    string `yaml:"url"`
+	APIKey string `yaml:"api_key"`
 }
 
 type APIUser struct {
