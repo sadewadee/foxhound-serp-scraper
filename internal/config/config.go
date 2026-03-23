@@ -19,6 +19,20 @@ type Config struct {
 	Fetch        FetchConfig        `yaml:"fetch"`
 	Monitor      MonitorConfig      `yaml:"monitor"`
 	Mordibouncer MordibouncerConfig `yaml:"mordibouncer"`
+	API          APIConfig          `yaml:"api"`
+}
+
+type APIConfig struct {
+	Addr   string     `yaml:"addr"`
+	Secret string     `yaml:"secret"`
+	Users  []APIUser  `yaml:"users"`
+}
+
+type APIUser struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	APIKey   string `yaml:"api_key"`
+	Role     string `yaml:"role"`
 }
 
 type PostgresConfig struct {

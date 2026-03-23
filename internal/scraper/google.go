@@ -32,9 +32,8 @@ var socialDomains = []string{
 	"reddit.com", "tumblr.com", "threads.net",
 	// Video
 	"vimeo.com", "dailymotion.com",
-	// Review / listing (no direct contact)
-	"yelp.com", "tripadvisor.com", "trustpilot.com",
-	"foursquare.com", "zomato.com",
+	// Review / listing (no direct contact) — yelp, tripadvisor handled as directories
+	"trustpilot.com", "foursquare.com", "zomato.com",
 	// Aggregators / directories (low email yield)
 	"wikipedia.org", "wikimedia.org",
 	"amazon.com", "ebay.com", "alibaba.com",
@@ -88,8 +87,9 @@ func ParseSERPResults(body []byte) ([]string, error) {
 			if isGoogleDomain(href) {
 				return
 			}
-			// Filter social media and low-yield platforms.
-			if isExcludedDomain(href) {
+			// Filter social media — but keep directory sites (yelp, classpass, etc.)
+			// They'll be handled by the directory extractor.
+			if isExcludedDomain(href) && !isDirectoryDomain(href) {
 				return
 			}
 			if !seen[href] {
@@ -139,6 +139,26 @@ func isGoogleDomain(rawURL string) bool {
 	host := strings.ToLower(u.Hostname())
 	for _, gd := range googleDomains {
 		if host == gd || strings.HasSuffix(host, "."+gd) {
+			return true
+		}
+	}
+	return false
+}
+
+// isDirectoryDomain returns true if the URL is a known business directory
+// that should be kept for listing extraction.
+func isDirectoryDomain(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	dirDomains := []string{
+		"classpass.com", "yelp.com", "yellowpages.com",
+		"yogaalliance.org", "tripadvisor.com",
+	}
+	for _, d := range dirDomains {
+		if host == d || strings.HasSuffix(host, "."+d) {
 			return true
 		}
 	}

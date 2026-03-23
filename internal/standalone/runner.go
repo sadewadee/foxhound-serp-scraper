@@ -20,6 +20,7 @@ import (
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
+	"github.com/sadewadee/serp-scraper/internal/directory"
 	"github.com/sadewadee/serp-scraper/internal/scraper"
 	"github.com/sadewadee/serp-scraper/internal/validate"
 )
@@ -299,7 +300,46 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 
 		r.pagesProcessed.Add(1)
 
-		// Extract contacts.
+		// Check if this is a directory page — extract listings instead of contacts.
+		if listings := directory.ExtractListings(pageURL, []byte(body)); len(listings) > 0 {
+			slog.Info("enrichment: directory detected",
+				"url", pageURL, "listings", len(listings), "source", listings[0].Source)
+			for _, l := range listings {
+				if l.URL != "" && !directory.IsDirectoryDomain(dedup.ExtractDomain(l.URL)) {
+					// Push business website URLs to contact queue for enrichment.
+					// Skip if URL is itself a directory (avoid loops).
+					hash := dedup.HashURL(l.URL)
+					if _, loaded := r.urlSeen.LoadOrStore(hash, true); !loaded {
+						// Non-blocking send — contactQueue might be full or closing.
+						select {
+						case r.contactQueue <- l.URL:
+						default:
+						}
+					}
+				}
+				// Store listing data directly if it has email or phone.
+				if l.Email != "" || l.Phone != "" {
+					r.resultsMu.Lock()
+					r.results = append(r.results, Result{
+						Email:            l.Email,
+						Phone:            l.Phone,
+						Domain:           dedup.ExtractDomain(pageURL),
+						SourceURL:        pageURL,
+						BusinessName:     l.Name,
+						BusinessCategory: l.Category,
+						Address:          l.Address,
+						Rating:           l.Rating,
+					})
+					r.resultsMu.Unlock()
+					if l.Email != "" {
+						r.emailsFound.Add(1)
+					}
+				}
+			}
+			continue
+		}
+
+		// Regular page — extract contacts.
 		cd := scraper.ExtractContacts([]byte(body))
 		domain := dedup.ExtractDomain(pageURL)
 

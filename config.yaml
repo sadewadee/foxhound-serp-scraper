@@ -38,6 +38,15 @@ mordibouncer:
   api_url: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
   secret: "${MORDIBOUNCER_SECRET}"
 
+api:
+  addr: ":8080"
+  secret: "${API_SECRET:-serp-scraper-secret}"
+  users:
+    - username: admin
+      password: "${API_ADMIN_PASSWORD:-admin}"
+      api_key: "${API_KEY}"
+      role: admin
+
 monitor:
   enabled: true
   port: 9090
