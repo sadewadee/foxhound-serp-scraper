@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/sadewadee/serp-scraper/internal/api"
 	"github.com/sadewadee/serp-scraper/internal/config"
@@ -16,9 +19,10 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
 )
 
-// RunPipeline starts the scraping pipeline with API server.
+// RunPipeline starts the API server and scraping pipeline.
+// API server is the main process — stays alive even when pipeline is idle.
+// Pipeline stages run in background goroutines.
 func RunPipeline(cfg *config.Config, stageName string, workers int) error {
-	// Override worker count if specified.
 	if workers > 0 {
 		switch stageName {
 		case "serp":
@@ -50,27 +54,52 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	}
 	defer dd.Close()
 
-	// Start Prometheus metrics server if enabled.
+	// Graceful shutdown.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		slog.Info("received signal, shutting down", "signal", sig)
+		cancel()
+	}()
+
+	// Start Prometheus metrics server.
 	if cfg.Monitor.Enabled {
 		go func() {
 			addr := fmt.Sprintf(":%d", cfg.Monitor.Port)
 			http.Handle("/metrics", monitor.Handler())
-			slog.Info("monitor: starting metrics server", "addr", addr)
+			slog.Info("monitor: metrics server starting", "addr", addr)
 			if err := http.ListenAndServe(addr, nil); err != nil {
 				slog.Warn("monitor: metrics server error", "error", err)
 			}
 		}()
 	}
 
-	// Start REST API server.
+	// Start pipeline stages in background.
+	orch := pipeline.New(cfg, database, dd)
+	go func() {
+		var pipeErr error
+		if stageName == "" || stageName == "all" {
+			pipeErr = orch.RunAll(ctx)
+		} else {
+			pipeErr = orch.RunStage(ctx, stageName)
+		}
+		if pipeErr != nil {
+			slog.Error("pipeline error", "error", pipeErr)
+		}
+		slog.Info("pipeline stages finished — API server still running")
+	}()
+
+	// Start REST API server (blocking — keeps process alive).
 	apiAddr := cfg.API.Addr
 	if apiAddr == "" {
 		apiAddr = ":8080"
 	}
 
-	authCfg := api.AuthConfig{
-		Secret: cfg.API.Secret,
-	}
+	authCfg := api.AuthConfig{Secret: cfg.API.Secret}
 	for _, u := range cfg.API.Users {
 		authCfg.Users = append(authCfg.Users, api.User{
 			Username: u.Username,
@@ -86,19 +115,18 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	}
 
 	apiServer := api.NewServer(database, dd.Client(), authCfg, dokployCfg)
+
+	slog.Info("api: server starting", "addr", apiAddr)
 	go func() {
-		slog.Info("api: starting server", "addr", apiAddr)
 		if err := apiServer.Start(apiAddr); err != nil && err.Error() != "http: Server closed" {
 			slog.Error("api: server error", "error", err)
 		}
 	}()
 
-	// Create and run orchestrator.
-	orch := pipeline.New(cfg, database, dd)
+	// Block until shutdown signal.
+	<-ctx.Done()
+	slog.Info("shutting down API server")
+	apiServer.Shutdown(context.Background())
 
-	ctx := context.Background()
-	if stageName == "" || stageName == "all" {
-		return orch.RunAll(ctx)
-	}
-	return orch.RunStage(ctx, stageName)
+	return nil
 }
