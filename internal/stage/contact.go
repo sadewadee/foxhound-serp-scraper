@@ -41,6 +41,14 @@ func NewContactStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Con
 }
 
 // Run starts contact enrichment workers. Blocks until ctx is cancelled.
+//
+// Browser lifecycle:
+//   - 1 shared Camoufox browser with N pooled tabs (N = worker count)
+//   - Browser auto-recycles every maxBrowserRequests (default 300) via foxhound
+//   - Stealth HTTP handles 95%+ of requests (no browser needed)
+//   - Browser pool is fallback-only for JS-heavy sites
+//   - Stealth fetchers are recycled every stealthRecycleInterval to prevent
+//     memory growth from accumulated TLS sessions and connection pools
 func (c *ContactStage) Run(ctx context.Context) error {
 	numWorkers := c.cfg.Contact.Workers
 	slog.Info("contact: starting workers", "count", numWorkers)
@@ -48,6 +56,8 @@ func (c *ContactStage) Run(ctx context.Context) error {
 	// One shared browser for all workers (fallback for JS-heavy sites).
 	// Pool size = worker count so each goroutine can acquire a pre-warmed tab.
 	// Architecture: 1 browser process → N tabs, NOT N browser processes.
+	// Browser auto-restarts every 300 requests (foxhound built-in) to clear
+	// accumulated DOM cache, JS heap, extension state, and network cache.
 	var sharedBrowser *fetch.CamoufoxFetcher
 	browser, err := internalScraper.NewBrowserWithPool(c.cfg, numWorkers)
 	if err != nil {
@@ -75,11 +85,19 @@ func (c *ContactStage) Run(ctx context.Context) error {
 	return nil
 }
 
+// stealthRecycleAfter controls how many requests before a stealth fetcher
+// is recycled. TLS sessions and HTTP connection pools accumulate memory over
+// time; recycling creates a fresh fetcher with a new identity.
+const stealthRecycleAfter = 500
+
 func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *fetch.CamoufoxFetcher) {
 	slog.Info("contact: worker starting", "worker", workerID)
 
 	// Each worker gets its own stealth HTTP fetcher (lightweight, per-worker identity).
+	// Recycled every stealthRecycleAfter requests to prevent memory growth.
 	stealth := internalScraper.NewStealth(c.cfg)
+	stealthCount := 0
+
 	defer stealth.Close()
 
 	queueKey := "serp:queue:contacts"
@@ -87,6 +105,15 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Recycle stealth fetcher periodically — new identity, fresh TLS sessions.
+		stealthCount++
+		if stealthCount >= stealthRecycleAfter {
+			stealth.Close()
+			stealth = internalScraper.NewStealth(c.cfg)
+			stealthCount = 0
+			slog.Debug("contact: stealth recycled", "worker", workerID)
 		}
 
 		// Pop from Redis queue.

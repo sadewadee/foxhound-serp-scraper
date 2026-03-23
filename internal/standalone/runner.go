@@ -278,13 +278,23 @@ func (r *Runner) runDiscovery(ctx context.Context, workerID int) {
 
 // runEnrichment reads URLs from contactQueue, fetches pages, extracts contacts.
 // Standalone mode uses stealth HTTP only (no browser) for speed and clean shutdown.
+// Stealth fetcher is recycled every 500 requests to prevent memory growth.
 func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 	stealth := scraper.NewStealth(r.cfg)
 	defer stealth.Close()
+	requestCount := 0
 
 	for pageURL := range r.contactQueue {
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Recycle stealth fetcher periodically.
+		requestCount++
+		if requestCount >= 500 {
+			stealth.Close()
+			stealth = scraper.NewStealth(r.cfg)
+			requestCount = 0
 		}
 
 		timeout := time.Duration(r.cfg.Contact.TimeoutMs) * time.Millisecond
