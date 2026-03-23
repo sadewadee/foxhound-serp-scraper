@@ -46,14 +46,16 @@ func (c *ContactStage) Run(ctx context.Context) error {
 	slog.Info("contact: starting workers", "count", numWorkers)
 
 	// One shared browser for all workers (fallback for JS-heavy sites).
-	// Camoufox handles concurrency internally via page pooling.
+	// Pool size = worker count so each goroutine can acquire a pre-warmed tab.
+	// Architecture: 1 browser process → N tabs, NOT N browser processes.
 	var sharedBrowser *fetch.CamoufoxFetcher
-	browser, err := internalScraper.NewBrowser(c.cfg)
+	browser, err := internalScraper.NewBrowserWithPool(c.cfg, numWorkers)
 	if err != nil {
 		slog.Warn("contact: shared browser init failed, stealth-only mode", "error", err)
 	} else {
 		sharedBrowser = browser
 		defer sharedBrowser.Close()
+		slog.Info("contact: shared browser ready", "pool_size", numWorkers)
 	}
 
 	var wg sync.WaitGroup

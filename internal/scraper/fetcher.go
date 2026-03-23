@@ -58,8 +58,23 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 	return browser, nil
 }
 
-// NewBrowser creates a basic Camoufox browser for website scraping fallback.
+// NewBrowser creates a Camoufox browser for website scraping fallback.
+// poolSize controls concurrent tabs (0 = create/destroy context per request).
+// For shared use by multiple goroutines, set poolSize >= number of goroutines.
 func NewBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
+	return NewBrowserWithPool(cfg, 0)
+}
+
+// NewBrowserWithPool creates a Camoufox browser with pre-warmed page pool.
+// Each pool slot is a BrowserContext+Page pair — concurrent Fetch() calls
+// acquire a slot, navigate, then release. No context creation overhead after warmup.
+//
+// Architecture:
+//   1 browser process → N pooled tabs (N = poolSize)
+//   Multiple goroutines call Fetch() concurrently
+//   Each gets a pre-warmed tab from the pool
+//   Cookies/state cleared between uses (no session bleed)
+func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetcher, error) {
 	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
 
 	headless := "virtual"
@@ -73,6 +88,9 @@ func NewBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		fetch.WithBlockImages(cfg.Fetch.BlockImages),
 		fetch.WithBrowserTimeout(30 * time.Second),
 		fetch.WithMaxBrowserRequests(300),
+	}
+	if poolSize > 0 {
+		opts = append(opts, fetch.WithPoolSize(poolSize))
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithBrowserProxy(cfg.Proxy.URL))
