@@ -423,7 +423,8 @@ var validTLDs = map[string]bool{
 	"online": true, "store": true, "shop": true, "club": true, "pro": true,
 	"studio": true, "agency": true, "design": true, "media": true,
 	"digital": true, "global": true, "world": true, "life": true,
-	"fitness": true, "health": true, "travel": true, "hotel": true,
+	"fitness": true, "health": true, "travel": true, "hotel": true, "yoga": true,
+	"gym": true, "beauty": true, "salon": true, "restaurant": true, "cafe": true,
 	"space": true, "today": true, "email": true, "link": true,
 	"work": true, "asia": true, "rent": true, "page": true,
 
