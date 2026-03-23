@@ -29,7 +29,7 @@ services:
       start_period: 5s
 
   manager:
-    build: .
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
     restart: unless-stopped
     depends_on:
       db:
@@ -58,7 +58,7 @@ services:
           memory: 2g
 
   seed:
-    build: .
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
     restart: unless-stopped
     depends_on:
       db:
@@ -79,7 +79,7 @@ services:
           memory: 2g
 
   enrich-1:
-    build: .
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
     restart: unless-stopped
     depends_on:
       db:
@@ -100,7 +100,7 @@ services:
           memory: 2g
 
   enrich-2:
-    build: .
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
     restart: unless-stopped
     depends_on:
       db:
