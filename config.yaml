@@ -1,0 +1,38 @@
+postgres:
+  dsn: "${POSTGRES_DSN}"
+  max_open_conns: 50
+  max_idle_conns: 10
+
+redis:
+  addr: "${REDIS_ADDR:-localhost:6379}"
+  password: "${REDIS_PASSWORD:-}"
+  db: 0
+
+serp:
+  pages_per_query: 10
+  results_per_page: 10
+  delay_between_pages_ms: 5000
+  delay_between_queries_ms: 30000
+  workers: 2
+
+website:
+  workers: 5
+  contact_pages: true
+  timeout_ms: 20000
+
+contact:
+  workers: 10
+  timeout_ms: 15000
+  validate_mx: false
+  social_extraction: true
+
+proxy:
+  url: "${PROXY_URL}"
+
+fetch:
+  headless: true
+  block_images: true
+
+monitor:
+  enabled: true
+  port: 9090
