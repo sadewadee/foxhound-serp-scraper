@@ -75,10 +75,10 @@ services:
   # serp-scraper manager (all pipeline stages)
   # ---------------------------------------------------------------------------
   manager:
-    image: "${SERP_IMAGE:-serp-scraper:latest}"
+    image: "${SERP_IMAGE:-ghcr.io/sadewadee/foxhound-serp-scraper:latest}"
     build:
-      context: ..
-      dockerfile: serp-scraper/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
       db:

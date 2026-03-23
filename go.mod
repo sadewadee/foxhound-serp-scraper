@@ -7,11 +7,9 @@ require (
 	github.com/lib/pq v1.11.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0
-	github.com/sadewadee/foxhound v0.0.6-0.20260320125819-8f2bacc531af
+	github.com/sadewadee/foxhound v0.0.6
 	gopkg.in/yaml.v3 v3.0.1
 )
-
-replace github.com/sadewadee/foxhound => ../foxhound
 
 require (
 	github.com/Noooste/azuretls-client v1.12.12 // indirect
