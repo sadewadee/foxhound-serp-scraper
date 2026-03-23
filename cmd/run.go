@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/sadewadee/serp-scraper/internal/api"
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
@@ -15,7 +16,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
 )
 
-// RunPipeline starts the scraping pipeline.
+// RunPipeline starts the scraping pipeline with API server.
 func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	// Override worker count if specified.
 	if workers > 0 {
@@ -27,7 +28,6 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		case "contact":
 			cfg.Contact.Workers = workers
 		default:
-			// For "all", apply to contact stage (most scalable).
 			cfg.Contact.Workers = workers
 		}
 	}
@@ -61,6 +61,37 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 			}
 		}()
 	}
+
+	// Start REST API server.
+	apiAddr := cfg.API.Addr
+	if apiAddr == "" {
+		apiAddr = ":8080"
+	}
+
+	authCfg := api.AuthConfig{
+		Secret: cfg.API.Secret,
+	}
+	for _, u := range cfg.API.Users {
+		authCfg.Users = append(authCfg.Users, api.User{
+			Username: u.Username,
+			Password: u.Password,
+			APIKey:   u.APIKey,
+			Role:     api.Role(u.Role),
+		})
+	}
+
+	dokployCfg := api.DokployConfig{
+		URL:    cfg.Dokploy.URL,
+		APIKey: cfg.Dokploy.APIKey,
+	}
+
+	apiServer := api.NewServer(database, dd.Client(), authCfg, dokployCfg)
+	go func() {
+		slog.Info("api: starting server", "addr", apiAddr)
+		if err := apiServer.Start(apiAddr); err != nil && err.Error() != "http: Server closed" {
+			slog.Error("api: server error", "error", err)
+		}
+	}()
 
 	// Create and run orchestrator.
 	orch := pipeline.New(cfg, database, dd)
