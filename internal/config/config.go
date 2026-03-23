@@ -132,6 +132,51 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// LoadFromEnv creates config purely from environment variables with defaults.
+// Used when no config.yaml file exists (e.g. Docker containers).
+func LoadFromEnv() (*Config, error) {
+	cfg := &Config{
+		Postgres: PostgresConfig{
+			DSN: os.Getenv("POSTGRES_DSN"),
+		},
+		Redis: RedisConfig{
+			Addr:     os.Getenv("REDIS_ADDR"),
+			Password: os.Getenv("REDIS_PASSWORD"),
+		},
+		Proxy: ProxyConfig{
+			URL: os.Getenv("PROXY_URL"),
+		},
+		Fetch: FetchConfig{
+			Headless:    true,
+			BlockImages: true,
+		},
+		Mordibouncer: MordibouncerConfig{
+			APIURL: os.Getenv("MORDIBOUNCER_API_URL"),
+			Secret: os.Getenv("MORDIBOUNCER_SECRET"),
+		},
+		API: APIConfig{
+			Addr:   ":8080",
+			Secret: os.Getenv("API_SECRET"),
+			Users: []APIUser{{
+				Username: "admin",
+				Password: os.Getenv("API_ADMIN_PASSWORD"),
+				APIKey:   os.Getenv("API_KEY"),
+				Role:     "admin",
+			}},
+		},
+		Dokploy: DokployConfig{
+			URL:    os.Getenv("DOKPLOY_URL"),
+			APIKey: os.Getenv("DOKPLOY_API_KEY"),
+		},
+		Monitor: MonitorConfig{
+			Enabled: true,
+			Port:    9090,
+		},
+	}
+	setDefaults(cfg)
+	return cfg, nil
+}
+
 // LoadFromString parses config from a YAML string (for testing).
 func LoadFromString(s string) (*Config, error) {
 	expanded := expandEnv(s)

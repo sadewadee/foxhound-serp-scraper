@@ -59,10 +59,16 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	// Load config.
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+	// Load config — if file doesn't exist, use defaults with env vars.
+	var cfg *config.Config
+	var cfgErr error
+	if _, statErr := os.Stat(*configPath); statErr == nil {
+		cfg, cfgErr = config.Load(*configPath)
+	} else {
+		cfg, cfgErr = config.LoadFromEnv()
+	}
+	if cfgErr != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", cfgErr)
 		os.Exit(1)
 	}
 
@@ -70,27 +76,28 @@ func main() {
 	command := args[0]
 	subArgs := args[1:]
 
+	var cmdErr error
 	switch command {
 	case "scrape":
-		err = runScrape(cfg, subArgs)
+		cmdErr = runScrape(cfg, subArgs)
 	case "import":
-		err = runImport(cfg, subArgs)
+		cmdErr = runImport(cfg, subArgs)
 	case "generate":
-		err = runGenerate(cfg, subArgs)
+		cmdErr = runGenerate(cfg, subArgs)
 	case "run":
-		err = runPipeline(cfg, subArgs)
+		cmdErr = runPipeline(cfg, subArgs)
 	case "status":
-		err = cmd.RunStatus(cfg)
+		cmdErr = cmd.RunStatus(cfg)
 	case "export":
-		err = runExport(cfg, subArgs)
+		cmdErr = runExport(cfg, subArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	if cmdErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", cmdErr)
 		os.Exit(1)
 	}
 }
