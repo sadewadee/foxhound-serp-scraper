@@ -7,10 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
@@ -40,20 +37,8 @@ func New(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Orchestrator {
 	}
 }
 
-// RunAll starts all stages concurrently with graceful shutdown.
+// RunAll starts all stages concurrently.
 func (o *Orchestrator) RunAll(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Graceful shutdown on signals.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		slog.Info("pipeline: received signal, shutting down", "signal", sig)
-		cancel()
-	}()
-
 	slog.Info("pipeline: starting all stages")
 
 	var wg sync.WaitGroup
@@ -102,18 +87,46 @@ func (o *Orchestrator) RunAll(ctx context.Context) error {
 	return nil
 }
 
-// RunStage starts a specific stage.
-func (o *Orchestrator) RunStage(ctx context.Context, stageName string) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+// RunEnrich starts website discovery + contact enrichment concurrently (no serp).
+func (o *Orchestrator) RunEnrich(ctx context.Context) error {
+	slog.Info("pipeline: starting enrich stages (website + contact)")
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+
+	wg.Add(1)
 	go func() {
-		<-sigCh
-		cancel()
+		defer wg.Done()
+		if err := o.website.Run(ctx); err != nil {
+			errCh <- fmt.Errorf("website stage: %w", err)
+		}
 	}()
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := o.contact.Run(ctx); err != nil {
+			errCh <- fmt.Errorf("contact stage: %w", err)
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+
+	var errs []error
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("enrich pipeline errors: %v", errs)
+	}
+
+	slog.Info("pipeline: enrich stages completed")
+	return nil
+}
+
+// RunStage starts a specific stage.
+func (o *Orchestrator) RunStage(ctx context.Context, stageName string) error {
 	switch stageName {
 	case "serp":
 		return o.serp.Run(ctx)

@@ -29,8 +29,7 @@ services:
       start_period: 5s
 
   manager:
-    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
-    pull_policy: always
+    build: .
     restart: unless-stopped
     depends_on:
       db:
@@ -51,16 +50,15 @@ services:
     ports:
       - "8080:8080"
       - "9090:9090"
-    command: ["run"]
+    command: ["run", "-stage", "none"]
     deploy:
       resources:
         limits:
           cpus: "2"
           memory: 2g
 
-  worker-contact-1:
-    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
-    pull_policy: always
+  seed:
+    build: .
     restart: unless-stopped
     depends_on:
       db:
@@ -72,72 +70,50 @@ services:
       - REDIS_ADDR=redis:6379
       - REDIS_PASSWORD=${REDIS_PASSWORD}
       - MORDIBOUNCER_SECRET=${MORDIBOUNCER_SECRET}
-      - TZ=Asia/Jakarta
-    command: ["run", "-stage", "contact", "-workers", "20"]
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  worker-contact-2:
-    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
-    pull_policy: always
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      - POSTGRES_DSN=postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable
-      - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - MORDIBOUNCER_SECRET=${MORDIBOUNCER_SECRET}
-      - TZ=Asia/Jakarta
-    command: ["run", "-stage", "contact", "-workers", "20"]
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  worker-website:
-    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
-    pull_policy: always
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      - POSTGRES_DSN=postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable
-      - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - TZ=Asia/Jakarta
-    command: ["run", "-stage", "website", "-workers", "10"]
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  worker-serp:
-    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
-    pull_policy: always
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      - POSTGRES_DSN=postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable
-      - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - TZ=Asia/Jakarta
     command: ["run", "-stage", "serp", "-workers", "2"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  enrich-1:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - POSTGRES_DSN=postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - MORDIBOUNCER_SECRET=${MORDIBOUNCER_SECRET}
+      - TZ=Asia/Jakarta
+    command: ["run", "-stage", "enrich", "-workers", "20"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  enrich-2:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - POSTGRES_DSN=postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - MORDIBOUNCER_SECRET=${MORDIBOUNCER_SECRET}
+      - TZ=Asia/Jakarta
+    command: ["run", "-stage", "enrich", "-workers", "20"]
     deploy:
       resources:
         limits:

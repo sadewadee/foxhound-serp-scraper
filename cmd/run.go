@@ -31,6 +31,9 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 			cfg.Website.Workers = workers
 		case "contact":
 			cfg.Contact.Workers = workers
+		case "enrich":
+			cfg.Website.Workers = workers
+			cfg.Contact.Workers = workers
 		default:
 			cfg.Contact.Workers = workers
 		}
@@ -78,20 +81,27 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		}()
 	}
 
-	// Start pipeline stages in background.
-	orch := pipeline.New(cfg, database, dd)
-	go func() {
-		var pipeErr error
-		if stageName == "" || stageName == "all" {
-			pipeErr = orch.RunAll(ctx)
-		} else {
-			pipeErr = orch.RunStage(ctx, stageName)
-		}
-		if pipeErr != nil {
-			slog.Error("pipeline error", "error", pipeErr)
-		}
-		slog.Info("pipeline stages finished — API server still running")
-	}()
+	// Start pipeline stages in background (skip for "none" — API only mode).
+	if stageName != "none" {
+		orch := pipeline.New(cfg, database, dd)
+		go func() {
+			var pipeErr error
+			switch stageName {
+			case "", "all":
+				pipeErr = orch.RunAll(ctx)
+			case "enrich":
+				pipeErr = orch.RunEnrich(ctx)
+			default:
+				pipeErr = orch.RunStage(ctx, stageName)
+			}
+			if pipeErr != nil {
+				slog.Error("pipeline error", "error", pipeErr)
+			}
+			slog.Info("pipeline stages finished — API server still running")
+		}()
+	} else {
+		slog.Info("stage=none: API-only mode, no pipeline stages")
+	}
 
 	// Start REST API server (blocking — keeps process alive).
 	apiAddr := cfg.API.Addr
