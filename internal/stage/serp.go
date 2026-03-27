@@ -86,7 +86,11 @@ func (s *SERPStage) worker(ctx context.Context, workerID int) {
 		slog.Error("serp: worker browser init failed", "worker", workerID, "error", err)
 		return
 	}
-	defer browser.Close()
+	defer func() {
+		if browser != nil {
+			browser.Close()
+		}
+	}()
 
 	// Each worker tracks its own browser lifecycle independently — each has its
 	// own browser process so counters must not be shared across workers.
@@ -222,6 +226,7 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 				newBrowser, restartErr := lifecycle.Restart(*browserPtr)
 				if restartErr != nil {
 					slog.Error("serp: browser restart failed", "error", restartErr)
+					*browserPtr = nil
 					return totalURLs
 				}
 				*browserPtr = newBrowser
@@ -240,6 +245,7 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 				newBrowser, restartErr := lifecycle.Restart(*browserPtr)
 				if restartErr != nil {
 					slog.Error("serp: lifecycle restart failed", "error", restartErr)
+					*browserPtr = nil
 					return totalURLs
 				}
 				*browserPtr = newBrowser
@@ -306,6 +312,7 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 			newBrowser, restartErr := lifecycle.Restart(*browserPtr)
 			if restartErr != nil {
 				slog.Error("serp: lifecycle restart failed", "error", restartErr)
+				*browserPtr = nil
 				return totalURLs
 			}
 			*browserPtr = newBrowser

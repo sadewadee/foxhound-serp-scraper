@@ -228,15 +228,25 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 			slog.Info("enrich: page reuse limit reached, restarting browser", "worker", workerID)
 			c.browserMu.Lock()
 			// Re-check: another worker may have already restarted.
-			if c.sharedBrowser == currentBrowser {
-				newBrowser, restartErr := c.lifecycle.Restart(c.sharedBrowser)
+			if c.sharedBrowser != currentBrowser {
+				// Another worker already restarted — just use the new one.
+				c.browserMu.Unlock()
+			} else {
+				// Mark nil so other workers fall back to stealth-only during restart.
+				oldBrowser := c.sharedBrowser
+				c.sharedBrowser = nil
+				c.browserMu.Unlock()
+
+				// Restart outside the lock — Close() may block waiting for in-flight fetches.
+				newBrowser, restartErr := c.lifecycle.Restart(oldBrowser)
+				c.browserMu.Lock()
 				if restartErr != nil {
 					slog.Error("enrich: lifecycle restart failed", "error", restartErr)
 				} else {
 					c.sharedBrowser = newBrowser
 				}
+				c.browserMu.Unlock()
 			}
-			c.browserMu.Unlock()
 		}
 
 		if err != nil {

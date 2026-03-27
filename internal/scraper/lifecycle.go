@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -141,20 +142,29 @@ func killOrphanBrowserProcesses(label string) {
 			continue
 		}
 
-		// Read /proc/<pid>/stat to check the parent PID (4th field).
+		// Read /proc/<pid>/stat to check the parent PID.
+		// Format: "pid (comm with spaces) S ppid ..."
+		// comm can contain spaces and parens, so find last ')' first.
 		statBytes, err := os.ReadFile(filepath.Join("/proc", pid, "stat"))
 		if err != nil {
 			continue
 		}
-		fields := strings.Fields(string(statBytes))
-		if len(fields) <= 3 || fields[3] != "1" {
+		stat := string(statBytes)
+		rp := strings.LastIndex(stat, ")")
+		if rp < 0 || rp+2 >= len(stat) {
+			continue
+		}
+		rest := strings.Fields(stat[rp+2:])
+		// rest[0] = state, rest[1] = ppid
+		if len(rest) < 2 || rest[1] != "1" {
 			continue // Not an orphan (ppid != 1).
 		}
 
 		slog.Warn(fmt.Sprintf("%s: killing orphan browser process", label), "pid", pid)
-		proc, err := os.FindProcess(atoiSafe(pid))
-		if err == nil && proc != nil {
-			proc.Kill()
+		if pidInt, err := strconv.Atoi(pid); err == nil {
+			if proc, err := os.FindProcess(pidInt); err == nil && proc != nil {
+				proc.Kill()
+			}
 		}
 	}
 }
@@ -173,12 +183,3 @@ func isAllDigits(s string) bool {
 }
 
 // atoiSafe converts a string of ASCII digits to int without importing strconv.
-func atoiSafe(s string) int {
-	n := 0
-	for _, c := range s {
-		if c >= '0' && c <= '9' {
-			n = n*10 + int(c-'0')
-		}
-	}
-	return n
-}
