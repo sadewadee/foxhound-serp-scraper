@@ -7,31 +7,35 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/sadewadee/serp-scraper/internal/query"
 )
 
 // Server is the REST API server for pipeline mode.
 type Server struct {
-	db      *sql.DB
-	redis   *redis.Client
-	auth    *Auth
-	dokploy *DokployClient
-	workers map[string]*WorkerInfo // composeID → worker info
-	mux     *http.ServeMux
-	server  *http.Server
+	db        *sql.DB
+	redis     *redis.Client
+	auth      *Auth
+	dokploy   *DokployClient
+	workers   map[string]*WorkerInfo // composeID → worker info
+	mux       *http.ServeMux
+	server    *http.Server
+	queryRepo *query.Repository
 }
 
 // NewServer creates an API server.
 func NewServer(db *sql.DB, redisClient *redis.Client, authCfg AuthConfig, dokployCfg DokployConfig) *Server {
 	s := &Server{
-		db:      db,
-		redis:   redisClient,
-		auth:    NewAuth(authCfg),
-		dokploy: NewDokployClient(dokployCfg),
-		workers: make(map[string]*WorkerInfo),
-		mux:     http.NewServeMux(),
+		db:        db,
+		redis:     redisClient,
+		auth:      NewAuth(authCfg),
+		dokploy:   NewDokployClient(dokployCfg),
+		workers:   make(map[string]*WorkerInfo),
+		mux:       http.NewServeMux(),
+		queryRepo: query.NewRepository(db),
 	}
 	s.registerRoutes()
 	return s
@@ -46,6 +50,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/contacts", RequireRole(RoleViewer, s.handleListContacts))
 	s.mux.HandleFunc("GET /api/contacts/export", RequireRole(RoleViewer, s.handleExportContacts))
 	s.mux.HandleFunc("GET /api/contacts/stats", RequireRole(RoleViewer, s.handleContactStats))
+	s.mux.HandleFunc("DELETE /api/contacts", RequireRole(RoleAdmin, s.handleDeleteContacts))
 
 	// Domains.
 	s.mux.HandleFunc("GET /api/domains", RequireRole(RoleViewer, s.handleListDomains))
@@ -55,9 +60,14 @@ func (s *Server) registerRoutes() {
 
 	// Queries.
 	s.mux.HandleFunc("GET /api/queries", RequireRole(RoleViewer, s.handleListQueries))
+	s.mux.HandleFunc("POST /api/queries", RequireRole(RoleAdmin, s.handleCreateQueries))
+	s.mux.HandleFunc("DELETE /api/queries", RequireRole(RoleAdmin, s.handleDeleteQueries))
+	s.mux.HandleFunc("POST /api/queries/retry", RequireRole(RoleAdmin, s.handleRetryQueries))
+	s.mux.HandleFunc("GET /api/queries/stats", RequireRole(RoleViewer, s.handleQueryStats))
 
 	// Pipeline.
 	s.mux.HandleFunc("GET /api/pipeline/stats", RequireRole(RoleViewer, s.handlePipelineStats))
+	s.mux.HandleFunc("POST /api/pipeline/reset", RequireRole(RoleAdmin, s.handlePipelineReset))
 
 	// Workers (Dokploy-managed).
 	s.mux.HandleFunc("POST /api/workers/deploy", RequireRole(RoleAdmin, s.handleDeployWorker))
@@ -296,6 +306,43 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs    []int64 `json:"ids"`
+		Domain string  `json:"domain"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if len(req.IDs) == 0 && req.Domain == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide ids or domain"})
+		return
+	}
+	var res sql.Result
+	var err error
+	if req.Domain != "" {
+		res, err = s.db.Exec("DELETE FROM contacts WHERE domain = $1", req.Domain)
+	} else {
+		placeholders := make([]string, len(req.IDs))
+		args := make([]any, len(req.IDs))
+		for i, id := range req.IDs {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+			args[i] = id
+		}
+		res, err = s.db.Exec(
+			fmt.Sprintf("DELETE FROM contacts WHERE id IN (%s)", strings.Join(placeholders, ",")),
+			args...,
+		)
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	n, _ := res.RowsAffected()
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
+}
+
 // ── Domain handlers ──
 
 func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
@@ -336,10 +383,41 @@ func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
 // ── Query handlers ──
 
 func (s *Server) handleListQueries(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(`
+	q := r.URL.Query()
+	page := queryInt(q, "page", 1)
+	perPage := queryInt(q, "per_page", 50)
+	if perPage > 200 {
+		perPage = 200
+	}
+	offset := (page - 1) * perPage
+
+	where := "WHERE 1=1"
+	args := []any{}
+	argIdx := 1
+
+	if status := q.Get("status"); status != "" {
+		where += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, status)
+		argIdx++
+	}
+	if search := q.Get("search"); search != "" {
+		where += fmt.Sprintf(" AND text ILIKE $%d", argIdx)
+		args = append(args, "%"+search+"%")
+		argIdx++
+	}
+
+	var total int
+	s.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM queries %s", where), args...).Scan(&total)
+
+	dataQuery := fmt.Sprintf(`
 		SELECT id, text, status, result_count, COALESCE(error_msg,''), created_at
-		FROM queries ORDER BY id DESC LIMIT 100
-	`)
+		FROM queries %s
+		ORDER BY id DESC
+		LIMIT $%d OFFSET $%d
+	`, where, argIdx, argIdx+1)
+	args = append(args, perPage, offset)
+
+	rows, err := s.db.Query(dataQuery, args...)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -358,7 +436,83 @@ func (s *Server) handleListQueries(w http.ResponseWriter, r *http.Request) {
 			"result_count": resultCount, "error": errMsg, "created_at": createdAt,
 		})
 	}
-	writeJSON(w, http.StatusOK, queries)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data":     queries,
+		"total":    total,
+		"page":     page,
+		"per_page": perPage,
+	})
+}
+
+func (s *Server) handleCreateQueries(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Queries []string `json:"queries"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	var cleaned []string
+	for _, q := range req.Queries {
+		q = strings.TrimSpace(q)
+		if q != "" {
+			cleaned = append(cleaned, q)
+		}
+	}
+	if len(cleaned) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "queries array is empty"})
+		return
+	}
+	inserted, err := s.queryRepo.InsertBatch(cleaned, "")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"inserted":   inserted,
+		"duplicates": len(cleaned) - inserted,
+		"total":      len(cleaned),
+	})
+}
+
+func (s *Server) handleDeleteQueries(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.IDs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids array is required"})
+		return
+	}
+	deleted, err := s.queryRepo.DeleteByIDs(req.IDs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+}
+
+func (s *Server) handleRetryQueries(w http.ResponseWriter, r *http.Request) {
+	retried, err := s.queryRepo.RetryErrors()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"retried": retried})
+}
+
+func (s *Server) handleQueryStats(w http.ResponseWriter, r *http.Request) {
+	counts, err := s.queryRepo.CountByStatus()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+	counts["total"] = total
+	writeJSON(w, http.StatusOK, counts)
 }
 
 // ── Pipeline stats ──
@@ -397,6 +551,38 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 	stats["dedup"] = dedupStats
 
 	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handlePipelineReset(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Dedup  bool `json:"dedup"`
+		Queues bool `json:"queues"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if !req.Dedup && !req.Queues {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "specify dedup and/or queues to reset"})
+		return
+	}
+	ctx := context.Background()
+	cleared := map[string]int64{}
+	if req.Dedup {
+		for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"} {
+			n, _ := s.redis.SCard(ctx, key).Result()
+			s.redis.Del(ctx, key)
+			cleared[key] = n
+		}
+	}
+	if req.Queues {
+		for _, key := range []string{"serp:queue:websites", "serp:queue:contacts"} {
+			n, _ := s.redis.ZCard(ctx, key).Result()
+			s.redis.Del(ctx, key)
+			cleared[key] = n
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": cleared})
 }
 
 // ── Worker management (Dokploy) ──

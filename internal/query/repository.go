@@ -3,6 +3,7 @@ package query
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
@@ -131,6 +132,39 @@ func (r *Repository) Total() (int, error) {
 	var n int
 	err := r.db.QueryRow(`SELECT COUNT(*) FROM queries`).Scan(&n)
 	return n, err
+}
+
+// DeleteByIDs removes queries by their IDs and returns the count deleted.
+func (r *Repository) DeleteByIDs(ids []int64) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	query := fmt.Sprintf("DELETE FROM queries WHERE id IN (%s)", strings.Join(placeholders, ","))
+	res, err := r.db.Exec(query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("query: delete by ids: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// RetryErrors resets all error-status queries back to pending for reprocessing.
+func (r *Repository) RetryErrors() (int, error) {
+	res, err := r.db.Exec(`
+		UPDATE queries SET status = 'pending', error_msg = '', updated_at = NOW()
+		WHERE status = 'error'
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("query: retry errors: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // MarkProcessing atomically marks a pending query as processing and returns it.
