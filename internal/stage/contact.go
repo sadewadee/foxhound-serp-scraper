@@ -52,6 +52,17 @@ func NewContactStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Con
 //   - Stealth fetchers are recycled every stealthRecycleInterval to prevent
 //     memory growth from accumulated TLS sessions and connection pools
 func (c *ContactStage) Run(ctx context.Context) error {
+	// Requeue stuck processing jobs from previous run.
+	res, err := c.db.Exec(`UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, updated_at = NOW() WHERE status = 'processing'`)
+	if err != nil {
+		slog.Warn("enrich: requeue stuck jobs failed", "error", err)
+	} else {
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			slog.Info("enrich: requeued stuck processing jobs", "count", n)
+		}
+	}
+
 	numWorkers := c.cfg.Contact.Workers
 	slog.Info("contact: starting workers", "count", numWorkers)
 

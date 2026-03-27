@@ -5,6 +5,9 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
+	"strings"
+
+	pq "github.com/lib/pq"
 )
 
 // CSVOptions configures the CSV export.
@@ -13,25 +16,18 @@ type CSVOptions struct {
 	EmailOnly bool
 }
 
-// ExportCSV exports contacts from PostgreSQL to a CSV file.
+// ExportCSV exports enriched contacts from PostgreSQL to a CSV file.
 func ExportCSV(db *sql.DB, opts CSVOptions) (int, error) {
-	whereClause := ""
-	if opts.EmailOnly {
-		whereClause = "WHERE email IS NOT NULL AND email != ''"
-	}
-
-	query := fmt.Sprintf(`
-		SELECT COALESCE(email,''), COALESCE(phone,''), domain, source_url,
-		       COALESCE(instagram,''), COALESCE(facebook,''), COALESCE(twitter,''),
-		       COALESCE(linkedin,''), COALESCE(whatsapp,''), COALESCE(address,'')
-		FROM contacts
-		%s
+	query := `
+		SELECT emails, phones, domain, url, social_links, address
+		FROM enrich_jobs
+		WHERE status = 'completed' AND array_length(emails, 1) > 0
 		ORDER BY id ASC
-	`, whereClause)
+	`
 
 	rows, err := db.Query(query)
 	if err != nil {
-		return 0, fmt.Errorf("export: query contacts: %w", err)
+		return 0, fmt.Errorf("export: query enrich_jobs: %w", err)
 	}
 	defer rows.Close()
 
@@ -45,27 +41,35 @@ func ExportCSV(db *sql.DB, opts CSVOptions) (int, error) {
 	defer w.Flush()
 
 	// Write header.
-	header := []string{
-		"email", "phone", "domain", "source_url",
-		"instagram", "facebook", "twitter", "linkedin", "whatsapp", "address",
-	}
+	header := []string{"emails", "phones", "domain", "url", "social_links", "address"}
 	if err := w.Write(header); err != nil {
 		return 0, fmt.Errorf("export: writing header: %w", err)
 	}
 
 	count := 0
 	for rows.Next() {
-		var email, phone, domain, sourceURL string
-		var instagram, facebook, twitter, linkedin, whatsapp, address string
+		var emails, phones []string
+		var domain, url, address string
+		var socialLinksJSON []byte
 
-		if err := rows.Scan(&email, &phone, &domain, &sourceURL,
-			&instagram, &facebook, &twitter, &linkedin, &whatsapp, &address); err != nil {
+		if err := rows.Scan(
+			pq.Array(&emails),
+			pq.Array(&phones),
+			&domain,
+			&url,
+			&socialLinksJSON,
+			&address,
+		); err != nil {
 			return count, fmt.Errorf("export: scanning row: %w", err)
 		}
 
 		record := []string{
-			email, phone, domain, sourceURL,
-			instagram, facebook, twitter, linkedin, whatsapp, address,
+			strings.Join(emails, ";"),
+			strings.Join(phones, ";"),
+			domain,
+			url,
+			string(socialLinksJSON),
+			address,
 		}
 		if err := w.Write(record); err != nil {
 			return count, fmt.Errorf("export: writing row: %w", err)

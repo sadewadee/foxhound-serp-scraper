@@ -148,7 +148,7 @@ func (b *Bot) handleQueries(msg *Message) {
 		total,
 		counts["pending"],
 		counts["processing"],
-		counts["done"],
+		counts["completed"],
 		counts["error"],
 	)
 	b.sendMessage(msg.Chat.ID, text)

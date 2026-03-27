@@ -43,19 +43,19 @@ func GetStatus(db *sql.DB, redisClient *redis.Client) (*Status, error) {
 
 	// Query counts by status.
 	s.Queries = getTableStatus(db, "queries")
-	s.Seeds = getTableStatus(db, "serp_seeds")
+	s.Seeds = getTableStatus(db, "serp_jobs")
 	s.Websites = getTableStatus(db, "websites")
-	s.Contacts = getTableStatus(db, "contacts")
+	s.Contacts = getTableStatus(db, "enrich_jobs")
 
 	// Queue depths.
-	queues := []string{"serp:queue:queries", "serp:queue:websites", "serp:queue:contacts"}
+	queues := []string{"serp:queue:queries", "serp:queue:websites", "serp:queue:enrich"}
 	for _, q := range queues {
 		depth, _ := redisClient.ZCard(ctx, q).Result()
 		s.Queues = append(s.Queues, QueueStatus{Name: q, Depth: depth})
 	}
 
 	// Dedup set sizes.
-	dedups := []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"}
+	dedups := []string{"serp:dedup:urls", "serp:dedup:domains"}
 	for _, d := range dedups {
 		size, _ := redisClient.SCard(ctx, d).Result()
 		s.Dedup = append(s.Dedup, DedupStatus{Name: d, Size: size})
