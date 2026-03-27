@@ -89,6 +89,8 @@ COPY --from=browser --chown=scraper:scraper \
     /root/.cache/camoufox /home/scraper/.cache/camoufox
 COPY --from=browser --chown=scraper:scraper \
     /root/.cache/ms-playwright /home/scraper/.cache/ms-playwright
+COPY --from=browser --chown=scraper:scraper \
+    /root/.cache/ms-playwright-go /home/scraper/.cache/ms-playwright-go
 
 RUN mkdir -p /data/output /app/config && \
     chown -R scraper:scraper /data /app
