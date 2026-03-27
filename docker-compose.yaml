@@ -53,8 +53,7 @@ services:
 
   # ── Manager (API only, no scraping) ──
   manager:
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
     restart: unless-stopped
     depends_on:
       db:
@@ -90,8 +89,7 @@ services:
 
   # ── SERP Worker (Google search via Camoufox browser) ──
   serp:
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
     restart: unless-stopped
     depends_on:
       db:
@@ -117,8 +115,7 @@ services:
 
   # ── Enrich Worker (website crawl + contact extraction) ──
   enrich:
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:main
     restart: unless-stopped
     depends_on:
       db:
