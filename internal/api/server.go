@@ -319,6 +319,14 @@ func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide ids or domain"})
 		return
 	}
+	if len(req.IDs) > 0 && req.Domain != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide ids or domain, not both"})
+		return
+	}
+	if len(req.IDs) > 1000 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 1000 ids per request"})
+		return
+	}
 	var res sql.Result
 	var err error
 	if req.Domain != "" {
@@ -464,6 +472,10 @@ func (s *Server) handleCreateQueries(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "queries array is empty"})
 		return
 	}
+	if len(cleaned) > 500 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 500 queries per request"})
+		return
+	}
 	inserted, err := s.queryRepo.InsertBatch(cleaned, "")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -482,6 +494,10 @@ func (s *Server) handleDeleteQueries(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.IDs) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids array is required"})
+		return
+	}
+	if len(req.IDs) > 1000 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 1000 ids per request"})
 		return
 	}
 	deleted, err := s.queryRepo.DeleteByIDs(req.IDs)
