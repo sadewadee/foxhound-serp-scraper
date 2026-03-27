@@ -56,13 +56,22 @@ RUN pip3 install --break-system-packages camoufox \
 
 # Playwright Firefox driver (version from go.mod).
 COPY go.mod /tmp/go.mod
-RUN apt-get update && apt-get install -y --no-install-recommends golang \
+RUN apt-get update && apt-get install -y --no-install-recommends golang unzip \
     && PWGO_VER=$(grep -oE 'playwright-community/playwright-go v[0-9]+\.[0-9]+\.[0-9.]+' /tmp/go.mod | awk '{print $2}') \
     && go install github.com/playwright-community/playwright-go/cmd/playwright@${PWGO_VER} \
     && /root/go/bin/playwright install --with-deps firefox \
     && apt-get purge -y golang \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /root/go/pkg /tmp/go.mod
+
+# Pre-cache NopeCHA extension (auto-solve captcha).
+RUN mkdir -p /root/.cache/foxhound/extensions/nopecha \
+    && RELEASE_URL=$(curl -fsSL https://api.github.com/repos/NopeCHALLC/nopecha-extension/releases/latest \
+       | grep -o '"browser_download_url": *"[^"]*firefox\.zip"' \
+       | head -1 | cut -d'"' -f4) \
+    && curl -fsSL "$RELEASE_URL" -o /tmp/nopecha.zip \
+    && unzip -q /tmp/nopecha.zip -d /root/.cache/foxhound/extensions/nopecha \
+    && rm /tmp/nopecha.zip
 
 # ---------------------------------------------------------------------------
 # Stage 3: runtime
@@ -91,6 +100,8 @@ COPY --from=browser --chown=scraper:scraper \
     /root/.cache/ms-playwright /home/scraper/.cache/ms-playwright
 COPY --from=browser --chown=scraper:scraper \
     /root/.cache/ms-playwright-go /home/scraper/.cache/ms-playwright-go
+COPY --from=browser --chown=scraper:scraper \
+    /root/.cache/foxhound /home/scraper/.cache/foxhound
 
 RUN mkdir -p /data/output /app/config && \
     chown -R scraper:scraper /data /app
@@ -108,5 +119,5 @@ EXPOSE 8080 9090
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -fsS http://localhost:8080/api/health || exit 1
 
-ENTRYPOINT ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & exec serp-scraper \"$@\"", "--"]
+ENTRYPOINT ["sh", "-c", "Xvfb :99 -screen 0 2560x1600x24 -nolisten tcp & exec serp-scraper \"$@\"", "--"]
 CMD ["run"]
