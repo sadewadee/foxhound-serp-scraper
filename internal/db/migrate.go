@@ -7,30 +7,38 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS queries (
-    id           BIGSERIAL PRIMARY KEY,
-    text         TEXT NOT NULL,
-    text_hash    TEXT NOT NULL,
-    template_id  TEXT,
-    status       TEXT NOT NULL DEFAULT 'pending',
-    result_count INTEGER DEFAULT 0,
-    error_msg    TEXT,
-    created_at   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    id              BIGSERIAL PRIMARY KEY,
+    text            TEXT NOT NULL,
+    text_hash       TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    result_count    INTEGER DEFAULT 0,
+    error_msg       TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(text_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_queries_status ON queries(status);
 
-CREATE TABLE IF NOT EXISTS serp_seeds (
-    id           BIGSERIAL PRIMARY KEY,
-    query_id     BIGINT NOT NULL REFERENCES queries(id),
-    google_url   TEXT NOT NULL,
-    page_num     INTEGER NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',
-    result_count INTEGER DEFAULT 0,
-    created_at   TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(query_id, page_num)
+CREATE TABLE IF NOT EXISTS serp_jobs (
+    id              TEXT PRIMARY KEY,
+    parent_job_id   BIGINT NOT NULL REFERENCES queries(id),
+    priority        INTEGER DEFAULT 0,
+    search_url      TEXT NOT NULL,
+    page_num        INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'new',
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 3,
+    next_attempt_at TIMESTAMPTZ,
+    locked_by       TEXT,
+    locked_at       TIMESTAMPTZ,
+    result_count    INTEGER DEFAULT 0,
+    error_msg       TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_serp_seeds_status ON serp_seeds(status);
+CREATE INDEX IF NOT EXISTS idx_serp_jobs_claim ON serp_jobs(parent_job_id, status, priority DESC, created_at) WHERE status = 'new';
+CREATE INDEX IF NOT EXISTS idx_serp_jobs_parent ON serp_jobs(parent_job_id);
+CREATE INDEX IF NOT EXISTS idx_serp_jobs_status ON serp_jobs(status);
 
 CREATE TABLE IF NOT EXISTS websites (
     id              BIGSERIAL PRIMARY KEY,
@@ -38,37 +46,44 @@ CREATE TABLE IF NOT EXISTS websites (
     url             TEXT NOT NULL,
     url_hash        TEXT NOT NULL,
     source_query_id BIGINT REFERENCES queries(id),
-    source_serp_id  BIGINT REFERENCES serp_seeds(id),
+    source_serp_id  TEXT REFERENCES serp_jobs(id),
     page_type       TEXT DEFAULT 'serp_result',
     status          TEXT NOT NULL DEFAULT 'pending',
     created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(url_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_websites_status ON websites(status);
 CREATE INDEX IF NOT EXISTS idx_websites_domain ON websites(domain);
 
-CREATE TABLE IF NOT EXISTS contacts (
-    id              BIGSERIAL PRIMARY KEY,
-    email           TEXT,
-    email_hash      TEXT,
-    phone           TEXT,
-    domain          TEXT NOT NULL,
-    website_id      BIGINT REFERENCES websites(id),
-    source_url      TEXT NOT NULL,
-    source_query_id BIGINT REFERENCES queries(id),
-    instagram       TEXT,
-    facebook        TEXT,
-    twitter         TEXT,
-    linkedin        TEXT,
-    whatsapp        TEXT,
-    address         TEXT,
-    raw_context     TEXT,
-    mx_valid        BOOLEAN,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(email_hash, domain)
+CREATE TABLE IF NOT EXISTS enrich_jobs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_job_id       BIGINT REFERENCES queries(id),
+    source_website_id   BIGINT REFERENCES websites(id),
+    domain              TEXT NOT NULL,
+    url                 TEXT NOT NULL,
+    url_hash            TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    max_attempts        INTEGER NOT NULL DEFAULT 5,
+    next_attempt_at     TIMESTAMPTZ DEFAULT NOW(),
+    locked_by           TEXT,
+    locked_at           TIMESTAMPTZ,
+    error_msg           TEXT,
+    emails              TEXT[] DEFAULT '{}',
+    phones              TEXT[] DEFAULT '{}',
+    social_links        JSONB DEFAULT '{}',
+    address             TEXT,
+    raw_context         TEXT,
+    mx_valid            BOOLEAN,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    UNIQUE(url_hash)
 );
-CREATE INDEX IF NOT EXISTS idx_contacts_email_hash ON contacts(email_hash);
-CREATE INDEX IF NOT EXISTS idx_contacts_domain ON contacts(domain);
+CREATE INDEX IF NOT EXISTS idx_enrich_claim ON enrich_jobs(status, next_attempt_at, created_at) WHERE status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS idx_enrich_domain ON enrich_jobs(domain);
+CREATE INDEX IF NOT EXISTS idx_enrich_parent ON enrich_jobs(parent_job_id);
 
 CREATE TABLE IF NOT EXISTS pipeline_state (
     key        TEXT PRIMARY KEY,

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	pq "github.com/lib/pq"
 )
 
 func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
@@ -82,7 +84,7 @@ func (b *Bot) handleScrape(msg *Message, args string) {
 		return
 	}
 
-	inserted, err := b.queryRepo.InsertBatch(keywords, "")
+	inserted, err := b.queryRepo.InsertBatch(keywords)
 	if err != nil {
 		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
 		return
@@ -100,9 +102,9 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 	// Table counts.
 	tables := []struct{ label, table string }{
 		{"Queries", "queries"},
-		{"Seeds", "serp_seeds"},
+		{"SERP Jobs", "serp_jobs"},
 		{"Websites", "websites"},
-		{"Contacts", "contacts"},
+		{"Enrich Jobs", "enrich_jobs"},
 	}
 	lines := []string{"*Pipeline Status*", ""}
 	for _, t := range tables {
@@ -113,7 +115,7 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 
 	// Queue depths.
 	lines = append(lines, "", "_Queues:_")
-	for _, q := range []string{"serp:queue:websites", "serp:queue:contacts"} {
+	for _, q := range []string{"serp:queue:websites", "serp:queue:enrich"} {
 		depth, _ := b.redis.ZCard(ctx, q).Result()
 		short := q[len("serp:queue:"):]
 		lines = append(lines, fmt.Sprintf("  %s: %d", short, depth))
@@ -121,7 +123,7 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 
 	// Dedup sizes.
 	lines = append(lines, "", "_Dedup:_")
-	for _, d := range []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"} {
+	for _, d := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
 		size, _ := b.redis.SCard(ctx, d).Result()
 		short := d[len("serp:dedup:"):]
 		lines = append(lines, fmt.Sprintf("  %s: %d", short, size))
@@ -155,11 +157,11 @@ func (b *Bot) handleQueries(msg *Message) {
 func (b *Bot) handleContacts(msg *Message) {
 	var total, withEmail, uniqueDomains, lastHour, last24h int
 
-	b.db.QueryRow("SELECT COUNT(*) FROM contacts").Scan(&total)
-	b.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE email IS NOT NULL AND email != ''").Scan(&withEmail)
-	b.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM contacts").Scan(&uniqueDomains)
-	b.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
-	b.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
+	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'").Scan(&total)
+	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0").Scan(&withEmail)
+	b.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'").Scan(&uniqueDomains)
+	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
+	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
 
 	text := fmt.Sprintf("*Contact Stats*\n\nTotal: *%d*\nWith email: %d\nDomains: %d\nLast hour: %d\nLast 24h: %d",
 		total, withEmail, uniqueDomains, lastHour, last24h)
@@ -170,11 +172,9 @@ func (b *Bot) handleExport(msg *Message) {
 	b.sendMessage(msg.Chat.ID, "Generating CSV export...")
 
 	rows, err := b.db.Query(`
-		SELECT COALESCE(email,''), COALESCE(phone,''), domain, source_url,
-		       COALESCE(instagram,''), COALESCE(facebook,''), COALESCE(twitter,''),
-		       COALESCE(linkedin,''), COALESCE(whatsapp,''), COALESCE(address,'')
-		FROM contacts
-		WHERE email IS NOT NULL AND email != ''
+		SELECT emails, phones, domain, url, social_links, address
+		FROM enrich_jobs
+		WHERE status = 'completed' AND array_length(emails, 1) > 0
 		ORDER BY id ASC
 	`)
 	if err != nil {
@@ -184,16 +184,19 @@ func (b *Bot) handleExport(msg *Message) {
 	defer rows.Close()
 
 	var buf strings.Builder
-	buf.WriteString("email,phone,domain,source_url,instagram,facebook,twitter,linkedin,whatsapp,address\n")
+	buf.WriteString("emails,phones,domain,url,social_links,address\n")
 
 	count := 0
 	for rows.Next() {
-		var email, phone, domain, sourceURL string
-		var ig, fb, tw, li, wa, addr string
-		rows.Scan(&email, &phone, &domain, &sourceURL, &ig, &fb, &tw, &li, &wa, &addr)
-		fmt.Fprintf(&buf, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-			csvEscape(email), csvEscape(phone), csvEscape(domain), csvEscape(sourceURL),
-			csvEscape(ig), csvEscape(fb), csvEscape(tw), csvEscape(li), csvEscape(wa), csvEscape(addr))
+		var emails, phones []string
+		var domain, url, address string
+		var socialLinksJSON []byte
+		rows.Scan(pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address)
+		emailsStr := strings.Join(emails, ";")
+		phonesStr := strings.Join(phones, ";")
+		fmt.Fprintf(&buf, "%s,%s,%s,%s,%s,%s\n",
+			csvEscape(emailsStr), csvEscape(phonesStr), csvEscape(domain), csvEscape(url),
+			csvEscape(string(socialLinksJSON)), csvEscape(address))
 		count++
 	}
 
@@ -223,7 +226,7 @@ func (b *Bot) handleRetry(msg *Message) {
 func (b *Bot) handleReset(ctx context.Context, msg *Message) {
 	lines := []string{"*Dedup Reset*", ""}
 
-	for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"} {
+	for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
 		n, _ := b.redis.SCard(ctx, key).Result()
 		b.redis.Del(ctx, key)
 		short := key[len("serp:dedup:"):]

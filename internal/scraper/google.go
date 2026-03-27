@@ -165,6 +165,26 @@ func isDirectoryDomain(rawURL string) bool {
 	return false
 }
 
+// IsCaptchaPage checks if the HTML body contains Google captcha/block indicators.
+func IsCaptchaPage(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	indicators := []string{
+		"captcha",
+		"unusual traffic",
+		"not a robot",
+		"recaptcha",
+		"/sorry/",
+		"detected unusual traffic",
+		"systems have detected",
+	}
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			return true
+		}
+	}
+	return false
+}
+
 // isExcludedDomain returns true if the URL is a social media or low-yield platform.
 func isExcludedDomain(rawURL string) bool {
 	u, err := url.Parse(rawURL)

@@ -39,7 +39,7 @@ func RunGenerate(cfg *config.Config, templatePath string) error {
 	results := query.Generate(tmplCfg.Templates)
 
 	for name, queries := range results {
-		inserted, err := repo.InsertBatch(queries, name)
+		inserted, err := repo.InsertBatch(queries)
 		if err != nil {
 			return fmt.Errorf("generate: template %s: %w", name, err)
 		}

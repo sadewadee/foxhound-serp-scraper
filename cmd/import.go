@@ -34,7 +34,7 @@ func RunImport(cfg *config.Config, filePath string) error {
 
 	// Insert queries.
 	repo := query.NewRepository(database)
-	inserted, err := repo.InsertBatch(queries, "")
+	inserted, err := repo.InsertBatch(queries)
 	if err != nil {
 		return fmt.Errorf("import: %w", err)
 	}

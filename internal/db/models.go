@@ -6,7 +6,6 @@ type Query struct {
 	ID          int64     `json:"id"`
 	Text        string    `json:"text"`
 	TextHash    string    `json:"text_hash"`
-	TemplateID  string    `json:"template_id,omitempty"`
 	Status      string    `json:"status"`
 	ResultCount int       `json:"result_count"`
 	ErrorMsg    string    `json:"error_msg,omitempty"`
@@ -14,14 +13,22 @@ type Query struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-type SERPSeed struct {
-	ID          int64     `json:"id"`
-	QueryID     int64     `json:"query_id"`
-	GoogleURL   string    `json:"google_url"`
-	PageNum     int       `json:"page_num"`
-	Status      string    `json:"status"`
-	ResultCount int       `json:"result_count"`
-	CreatedAt   time.Time `json:"created_at"`
+type SERPJob struct {
+	ID            string     `json:"id"`
+	ParentJobID   int64      `json:"parent_job_id"`
+	Priority      int        `json:"priority"`
+	SearchURL     string     `json:"search_url"`
+	PageNum       int        `json:"page_num"`
+	Status        string     `json:"status"`
+	AttemptCount  int        `json:"attempt_count"`
+	MaxAttempts   int        `json:"max_attempts"`
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	LockedBy      string     `json:"locked_by,omitempty"`
+	LockedAt      *time.Time `json:"locked_at,omitempty"`
+	ResultCount   int        `json:"result_count"`
+	ErrorMsg      string     `json:"error_msg,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 type Website struct {
@@ -30,30 +37,36 @@ type Website struct {
 	URL           string    `json:"url"`
 	URLHash       string    `json:"url_hash"`
 	SourceQueryID int64     `json:"source_query_id,omitempty"`
-	SourceSERPID  int64     `json:"source_serp_id,omitempty"`
+	SourceSerpID  string    `json:"source_serp_id,omitempty"`
 	PageType      string    `json:"page_type"`
 	Status        string    `json:"status"`
 	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-type Contact struct {
-	ID            int64     `json:"id"`
-	Email         string    `json:"email,omitempty"`
-	EmailHash     string    `json:"email_hash,omitempty"`
-	Phone         string    `json:"phone,omitempty"`
-	Domain        string    `json:"domain"`
-	WebsiteID     int64     `json:"website_id,omitempty"`
-	SourceURL     string    `json:"source_url"`
-	SourceQueryID int64     `json:"source_query_id,omitempty"`
-	Instagram     string    `json:"instagram,omitempty"`
-	Facebook      string    `json:"facebook,omitempty"`
-	Twitter       string    `json:"twitter,omitempty"`
-	LinkedIn      string    `json:"linkedin,omitempty"`
-	WhatsApp      string    `json:"whatsapp,omitempty"`
-	Address       string    `json:"address,omitempty"`
-	RawContext    string    `json:"raw_context,omitempty"`
-	MXValid       *bool     `json:"mx_valid,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
+type EnrichJob struct {
+	ID              string     `json:"id"`
+	ParentJobID     int64      `json:"parent_job_id,omitempty"`
+	SourceWebsiteID int64      `json:"source_website_id,omitempty"`
+	Domain          string     `json:"domain"`
+	URL             string     `json:"url"`
+	URLHash         string     `json:"url_hash"`
+	Status          string     `json:"status"`
+	AttemptCount    int        `json:"attempt_count"`
+	MaxAttempts     int        `json:"max_attempts"`
+	NextAttemptAt   *time.Time `json:"next_attempt_at,omitempty"`
+	LockedBy        string     `json:"locked_by,omitempty"`
+	LockedAt        *time.Time `json:"locked_at,omitempty"`
+	ErrorMsg        string     `json:"error_msg,omitempty"`
+	Emails          []string   `json:"emails"`
+	Phones          []string   `json:"phones"`
+	SocialLinks     any        `json:"social_links"`
+	Address         string     `json:"address,omitempty"`
+	RawContext      string     `json:"raw_context,omitempty"`
+	MXValid         *bool      `json:"mx_valid,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
 }
 
 type PipelineState struct {

@@ -26,11 +26,11 @@ import (
 
 // SERPStage runs Stage 2: SERP discovery workers.
 type SERPStage struct {
-	cfg     *config.Config
-	db      *sql.DB
-	dedup   *dedup.Store
+	cfg       *config.Config
+	db        *sql.DB
+	dedup     *dedup.Store
 	queryRepo *query.Repository
-	timing  *behavior.Timing
+	timing    *behavior.Timing
 
 	// Metrics.
 	queriesProcessed atomic.Int64
@@ -77,6 +77,7 @@ func (s *SERPStage) Run(ctx context.Context) error {
 }
 
 func (s *SERPStage) worker(ctx context.Context, workerID int) {
+	workerIDStr := fmt.Sprintf("serp-worker-%d", workerID)
 	slog.Info("serp: worker starting", "worker", workerID)
 
 	// Each worker gets its own browser instance with persistent session + page pooling.
@@ -111,13 +112,10 @@ func (s *SERPStage) worker(ctx context.Context, workerID int) {
 		}
 
 		slog.Info("serp: processing query", "worker", workerID, "query", q.Text, "id", q.ID)
-		resultCount := s.processQuery(ctx, browser, q)
+		resultCount := s.processQuery(ctx, &browser, q, workerIDStr)
 
 		status := "completed"
 		errMsg := ""
-		if resultCount == 0 {
-			status = "completed" // Still completed, just no results.
-		}
 		if err := s.queryRepo.UpdateStatus(q.ID, status, resultCount, errMsg); err != nil {
 			slog.Error("serp: update status failed", "error", err)
 		}
@@ -135,44 +133,113 @@ func (s *SERPStage) worker(ctx context.Context, workerID int) {
 	}
 }
 
-func (s *SERPStage) processQuery(ctx context.Context, browser *fetch.CamoufoxFetcher, q *db.Query) int {
+func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.CamoufoxFetcher, q *db.Query, workerID string) int {
 	totalURLs := 0
 	queueKey := "serp:queue:websites"
 
-	for page := 0; page < s.cfg.SERP.PagesPerQuery; page++ {
+	// Step 1: Generate all serp_jobs upfront for pages 0 to PagesPerQuery-1.
+	for pageNum := 0; pageNum < s.cfg.SERP.PagesPerQuery; pageNum++ {
+		serpURL := scraper.BuildSERPURL(q.Text, pageNum, s.cfg.SERP.ResultsPerPage)
+		jobID := fmt.Sprintf("serp-%d-p%d", q.ID, pageNum)
+
+		_, err := s.db.Exec(`
+			INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, status)
+			VALUES ($1, $2, $3, $4, 'new')
+			ON CONFLICT (id) DO NOTHING
+		`, jobID, q.ID, serpURL, pageNum)
+		if err != nil {
+			slog.Error("serp: insert serp_job failed", "job", jobID, "error", err)
+		}
+	}
+
+	// Step 2: Process serp_jobs with retry loop.
+	for {
 		if ctx.Err() != nil {
 			break
 		}
 
-		serpURL := scraper.BuildSERPURL(q.Text, page, s.cfg.SERP.ResultsPerPage)
-
-		// Insert SERP seed.
-		var seedID int64
+		// Get next unprocessed job for this query.
+		var job db.SERPJob
 		err := s.db.QueryRow(`
-			INSERT INTO serp_seeds (query_id, google_url, page_num, status)
-			VALUES ($1, $2, $3, 'processing')
-			ON CONFLICT (query_id, page_num) DO UPDATE SET status = 'processing'
-			RETURNING id
-		`, q.ID, serpURL, page).Scan(&seedID)
+			SELECT id, search_url, page_num, attempt_count, max_attempts
+			FROM serp_jobs
+			WHERE parent_job_id = $1 AND status = 'new'
+			ORDER BY page_num ASC
+			LIMIT 1
+		`, q.ID).Scan(&job.ID, &job.SearchURL, &job.PageNum, &job.AttemptCount, &job.MaxAttempts)
+		if err == sql.ErrNoRows {
+			break // All jobs for this query are done (completed, failed, or still processing).
+		}
 		if err != nil {
-			slog.Error("serp: insert seed failed", "error", err)
-			continue
+			slog.Error("serp: query serp_jobs failed", "query_id", q.ID, "error", err)
+			break
 		}
 
-		// Fetch SERP page via browser with consent banner handling.
-		slog.Debug("serp: fetching page", "query", q.Text, "page", page, "url", serpURL)
-		body, err := scraper.FetchSERP(ctx, browser, serpURL, fmt.Sprintf("serp-%d-%d", q.ID, page))
-		if err != nil {
-			slog.Warn("serp: fetch failed", "query", q.Text, "page", page, "error", err)
-			s.db.Exec(`UPDATE serp_seeds SET status = 'failed' WHERE id = $1`, seedID)
+		// Lock it.
+		s.db.Exec(`
+			UPDATE serp_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
+			WHERE id = $2
+		`, workerID, job.ID)
+
+		browser := *browserPtr
+
+		// Fetch SERP.
+		slog.Debug("serp: fetching page", "query", q.Text, "page", job.PageNum, "url", job.SearchURL)
+		body, fetchErr := scraper.FetchSERP(ctx, browser, job.SearchURL, job.ID)
+
+		// Check for captcha even on successful fetch.
+		if fetchErr == nil && scraper.IsCaptchaPage(body) {
+			fetchErr = fmt.Errorf("captcha detected")
+		}
+
+		if fetchErr != nil {
+			newAttempt := job.AttemptCount + 1
+			slog.Warn("serp: fetch failed", "job", job.ID, "attempt", newAttempt, "error", fetchErr)
+
+			if newAttempt >= job.MaxAttempts {
+				s.db.Exec(`
+					UPDATE serp_jobs SET status = 'failed', attempt_count = $1, error_msg = $2, updated_at = NOW()
+					WHERE id = $3
+				`, newAttempt, fetchErr.Error(), job.ID)
+			} else {
+				// Backoff: 30s, 60s, 120s, ...
+				backoffSeconds := 30 * (1 << (newAttempt - 1))
+				s.db.Exec(`
+					UPDATE serp_jobs SET status = 'new', attempt_count = $1,
+						next_attempt_at = NOW() + interval '1 second' * $2,
+						error_msg = $3, updated_at = NOW()
+					WHERE id = $4
+				`, newAttempt, backoffSeconds, fetchErr.Error(), job.ID)
+
+				// Restart browser for fresh fingerprint on captcha/block.
+				slog.Warn("serp: captcha/block detected, restarting browser", "job", job.ID, "attempt", newAttempt)
+				browser.Close()
+				newBrowser, restartErr := scraper.NewSERPBrowser(s.cfg)
+				if restartErr != nil {
+					slog.Error("serp: browser restart failed", "error", restartErr)
+					return totalURLs
+				}
+				*browserPtr = newBrowser
+
+				// Wait for backoff.
+				backoff := time.Duration(backoffSeconds) * time.Second
+				select {
+				case <-ctx.Done():
+					return totalURLs
+				case <-time.After(backoff):
+				}
+			}
 			continue
 		}
 
 		// Parse results.
-		urls, err := scraper.ParseSERPResults(body)
-		if err != nil {
-			slog.Warn("serp: parse failed", "query", q.Text, "page", page, "error", err)
-			s.db.Exec(`UPDATE serp_seeds SET status = 'failed' WHERE id = $1`, seedID)
+		urls, parseErr := scraper.ParseSERPResults(body)
+		if parseErr != nil {
+			slog.Warn("serp: parse failed", "job", job.ID, "error", parseErr)
+			s.db.Exec(`
+				UPDATE serp_jobs SET status = 'failed', error_msg = $1, updated_at = NOW()
+				WHERE id = $2
+			`, parseErr.Error(), job.ID)
 			continue
 		}
 
@@ -182,9 +249,9 @@ func (s *SERPStage) processQuery(ctx context.Context, browser *fetch.CamoufoxFet
 			urlHash := dedup.HashURL(u)
 
 			// Redis URL dedup.
-			isNew, err := s.dedup.Add(ctx, dedup.KeyURLs, urlHash)
-			if err != nil {
-				slog.Warn("serp: dedup check failed", "error", err)
+			isNew, dedupErr := s.dedup.Add(ctx, dedup.KeyURLs, urlHash)
+			if dedupErr != nil {
+				slog.Warn("serp: dedup check failed", "error", dedupErr)
 				continue
 			}
 			if !isNew {
@@ -196,19 +263,19 @@ func (s *SERPStage) processQuery(ctx context.Context, browser *fetch.CamoufoxFet
 				continue
 			}
 
-			// Insert website.
-			_, err = s.db.Exec(`
+			// Insert website — source_serp_id is now TEXT (serp_jobs.id).
+			_, insertErr := s.db.Exec(`
 				INSERT INTO websites (domain, url, url_hash, source_query_id, source_serp_id, page_type, status)
 				VALUES ($1, $2, $3, $4, $5, 'serp_result', 'pending')
 				ON CONFLICT (url_hash) DO NOTHING
-			`, domain, u, urlHash, q.ID, seedID)
-			if err != nil {
-				slog.Warn("serp: insert website failed", "url", u, "error", err)
+			`, domain, u, urlHash, q.ID, job.ID)
+			if insertErr != nil {
+				slog.Warn("serp: insert website failed", "url", u, "error", insertErr)
 				continue
 			}
 
-			// Push to Redis queue for Stage 3.
-			if err := pushToQueue(ctx, s.dedup.Client(), queueKey, u, q.ID, seedID); err != nil {
+			// Push to Redis queue for website stage.
+			if err := pushToQueue(ctx, s.dedup.Client(), queueKey, u, q.ID, job.ID); err != nil {
 				slog.Warn("serp: push to queue failed", "url", u, "error", err)
 			}
 
@@ -218,16 +285,18 @@ func (s *SERPStage) processQuery(ctx context.Context, browser *fetch.CamoufoxFet
 		totalURLs += inserted
 		s.urlsFound.Add(int64(inserted))
 
-		// Update seed.
-		s.db.Exec(`UPDATE serp_seeds SET status = 'completed', result_count = $1 WHERE id = $2`,
-			len(urls), seedID)
+		// Mark completed.
+		s.db.Exec(`
+			UPDATE serp_jobs SET status = 'completed', result_count = $1, updated_at = NOW()
+			WHERE id = $2
+		`, len(urls), job.ID)
 
 		slog.Info("serp: page done",
-			"query", q.Text, "page", page,
+			"query", q.Text, "page", job.PageNum,
 			"found", len(urls), "new", inserted)
 
 		// Delay between pages.
-		if page < s.cfg.SERP.PagesPerQuery-1 {
+		if job.PageNum < s.cfg.SERP.PagesPerQuery-1 {
 			delay := s.timing.PaginationDelay()
 			select {
 			case <-ctx.Done():
@@ -241,7 +310,7 @@ func (s *SERPStage) processQuery(ctx context.Context, browser *fetch.CamoufoxFet
 }
 
 // pushToQueue pushes a URL job to a Redis sorted set queue.
-func pushToQueue(ctx context.Context, client *redis.Client, queueKey, urlStr string, queryID, serpID int64) error {
+func pushToQueue(ctx context.Context, client *redis.Client, queueKey, urlStr string, queryID int64, serpID string) error {
 	job := &foxhound.Job{
 		ID:        fmt.Sprintf("web-%d-%s", queryID, dedup.HashURL(urlStr)[:8]),
 		URL:       urlStr,
@@ -257,7 +326,7 @@ func pushToQueue(ctx context.Context, client *redis.Client, queueKey, urlStr str
 	micros := job.CreatedAt.UnixMicro()
 	score := -(float64(job.Priority) * 1_000_000_000) + float64(micros)
 
-	data := fmt.Sprintf(`{"id":"%s","url":"%s","method":"GET","priority":%d,"meta":{"query_id":%d,"serp_id":%d}}`,
+	data := fmt.Sprintf(`{"id":"%s","url":"%s","method":"GET","priority":%d,"meta":{"query_id":%d,"serp_id":"%s"}}`,
 		job.ID, urlStr, job.Priority, queryID, serpID)
 
 	return client.ZAdd(ctx, queueKey, redis.Z{

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	pq "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"github.com/sadewadee/serp-scraper/internal/query"
 )
@@ -162,7 +163,7 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	offset := (page - 1) * perPage
 
 	// Build WHERE clause from filters.
-	where := "WHERE 1=1"
+	where := "WHERE status = 'completed'"
 	args := []any{}
 	argIdx := 1
 
@@ -171,27 +172,24 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 		args = append(args, domain)
 		argIdx++
 	}
-	if email := q.Get("email"); email != "" {
-		where += fmt.Sprintf(" AND email ILIKE $%d", argIdx)
-		args = append(args, "%"+email+"%")
-		argIdx++
-	}
 	if hasEmail := q.Get("has_email"); hasEmail == "true" {
-		where += " AND email IS NOT NULL AND email != ''"
+		where += " AND array_length(emails, 1) > 0"
+	}
+	if email := q.Get("email"); email != "" {
+		where += fmt.Sprintf(" AND $%d = ANY(emails)", argIdx)
+		args = append(args, email)
+		argIdx++
 	}
 
 	// Count total.
 	var total int
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM contacts %s", where)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM enrich_jobs %s", where)
 	s.db.QueryRow(countQuery, args...).Scan(&total)
 
 	// Fetch rows.
 	dataQuery := fmt.Sprintf(`
-		SELECT id, COALESCE(email,''), COALESCE(phone,''), domain, source_url,
-		       COALESCE(instagram,''), COALESCE(facebook,''), COALESCE(twitter,''),
-		       COALESCE(linkedin,''), COALESCE(whatsapp,''), COALESCE(address,''),
-		       created_at
-		FROM contacts %s
+		SELECT id, emails, phones, domain, url, social_links, address, status, created_at
+		FROM enrich_jobs %s
 		ORDER BY id DESC
 		LIMIT $%d OFFSET $%d
 	`, where, argIdx, argIdx+1)
@@ -206,20 +204,18 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 
 	var contacts []map[string]any
 	for rows.Next() {
-		var id int64
-		var email, phone, domain, sourceURL string
-		var instagram, facebook, twitter, linkedin, whatsapp, address string
+		var id string
+		var emails, phones []string
+		var domain, url, address, status string
+		var socialLinksJSON []byte
 		var createdAt time.Time
 
-		rows.Scan(&id, &email, &phone, &domain, &sourceURL,
-			&instagram, &facebook, &twitter, &linkedin, &whatsapp, &address,
-			&createdAt)
+		rows.Scan(&id, pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address, &status, &createdAt)
 
 		contacts = append(contacts, map[string]any{
-			"id": id, "email": email, "phone": phone, "domain": domain,
-			"source_url": sourceURL, "instagram": instagram, "facebook": facebook,
-			"twitter": twitter, "linkedin": linkedin, "whatsapp": whatsapp,
-			"address": address, "created_at": createdAt,
+			"id": id, "emails": emails, "phones": phones, "domain": domain,
+			"url": url, "social_links": json.RawMessage(socialLinksJSON),
+			"address": address, "status": status, "created_at": createdAt,
 		})
 	}
 
@@ -238,19 +234,17 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 		format = "json"
 	}
 
-	where := ""
+	where := "WHERE status = 'completed'"
 	if q.Get("has_email") == "true" {
-		where = "WHERE email IS NOT NULL AND email != ''"
+		where += " AND array_length(emails, 1) > 0"
 	}
 
-	query := fmt.Sprintf(`
-		SELECT COALESCE(email,''), COALESCE(phone,''), domain, source_url,
-		       COALESCE(instagram,''), COALESCE(facebook,''), COALESCE(twitter,''),
-		       COALESCE(linkedin,''), COALESCE(whatsapp,''), COALESCE(address,'')
-		FROM contacts %s ORDER BY id ASC
+	exportQuery := fmt.Sprintf(`
+		SELECT emails, phones, domain, url, social_links, address
+		FROM enrich_jobs %s ORDER BY id ASC
 	`, where)
 
-	rows, err := s.db.Query(query)
+	rows, err := s.db.Query(exportQuery)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -260,27 +254,31 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		w.Header().Set("Content-Disposition", "attachment; filename=contacts.csv")
-		fmt.Fprintln(w, "email,phone,domain,source_url,instagram,facebook,twitter,linkedin,whatsapp,address")
+		fmt.Fprintln(w, "emails,phones,domain,url,social_links,address")
 		for rows.Next() {
-			var email, phone, domain, sourceURL string
-			var ig, fb, tw, li, wa, addr string
-			rows.Scan(&email, &phone, &domain, &sourceURL, &ig, &fb, &tw, &li, &wa, &addr)
-			fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-				csvEscape(email), csvEscape(phone), csvEscape(domain), csvEscape(sourceURL),
-				csvEscape(ig), csvEscape(fb), csvEscape(tw), csvEscape(li), csvEscape(wa), csvEscape(addr))
+			var emails, phones []string
+			var domain, url, address string
+			var socialLinksJSON []byte
+			rows.Scan(pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address)
+			emailsStr := strings.Join(emails, ";")
+			phonesStr := strings.Join(phones, ";")
+			fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s\n",
+				csvEscape(emailsStr), csvEscape(phonesStr), csvEscape(domain), csvEscape(url),
+				csvEscape(string(socialLinksJSON)), csvEscape(address))
 		}
 		return
 	}
 
 	// JSON export.
-	var contacts []map[string]string
+	var contacts []map[string]any
 	for rows.Next() {
-		var email, phone, domain, sourceURL string
-		var ig, fb, tw, li, wa, addr string
-		rows.Scan(&email, &phone, &domain, &sourceURL, &ig, &fb, &tw, &li, &wa, &addr)
-		contacts = append(contacts, map[string]string{
-			"email": email, "phone": phone, "domain": domain, "source_url": sourceURL,
-			"instagram": ig, "facebook": fb, "twitter": tw, "linkedin": li, "whatsapp": wa, "address": addr,
+		var emails, phones []string
+		var domain, url, address string
+		var socialLinksJSON []byte
+		rows.Scan(pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address)
+		contacts = append(contacts, map[string]any{
+			"emails": emails, "phones": phones, "domain": domain, "url": url,
+			"social_links": json.RawMessage(socialLinksJSON), "address": address,
 		})
 	}
 	writeJSON(w, http.StatusOK, contacts)
@@ -289,12 +287,12 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 	var total, withEmail, uniqueDomains, uniqueEmails, lastHour, last24h int
 
-	s.db.QueryRow("SELECT COUNT(*) FROM contacts").Scan(&total)
-	s.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE email IS NOT NULL AND email != ''").Scan(&withEmail)
-	s.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM contacts").Scan(&uniqueDomains)
-	s.db.QueryRow("SELECT COUNT(DISTINCT email) FROM contacts WHERE email IS NOT NULL AND email != ''").Scan(&uniqueEmails)
-	s.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
-	s.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
+	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'").Scan(&total)
+	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0").Scan(&withEmail)
+	s.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'").Scan(&uniqueDomains)
+	s.db.QueryRow("SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'").Scan(&uniqueEmails)
+	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
+	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
 
 	writeJSON(w, http.StatusOK, map[string]int{
 		"total":          total,
@@ -308,8 +306,8 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs    []int64 `json:"ids"`
-		Domain string  `json:"domain"`
+		IDs    []string `json:"ids"`
+		Domain string   `json:"domain"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -330,18 +328,9 @@ func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 	var res sql.Result
 	var err error
 	if req.Domain != "" {
-		res, err = s.db.Exec("DELETE FROM contacts WHERE domain = $1", req.Domain)
+		res, err = s.db.Exec("DELETE FROM enrich_jobs WHERE domain = $1", req.Domain)
 	} else {
-		placeholders := make([]string, len(req.IDs))
-		args := make([]any, len(req.IDs))
-		for i, id := range req.IDs {
-			placeholders[i] = fmt.Sprintf("$%d", i+1)
-			args[i] = id
-		}
-		res, err = s.db.Exec(
-			fmt.Sprintf("DELETE FROM contacts WHERE id IN (%s)", strings.Join(placeholders, ",")),
-			args...,
-		)
+		res, err = s.db.Exec("DELETE FROM enrich_jobs WHERE id = ANY($1)", pq.Array(req.IDs))
 	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -356,8 +345,9 @@ func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(`
 		SELECT domain, COUNT(*) as contact_count,
-		       COUNT(CASE WHEN email IS NOT NULL AND email != '' THEN 1 END) as email_count
-		FROM contacts
+		       COUNT(CASE WHEN array_length(emails, 1) > 0 THEN 1 END) as email_count
+		FROM enrich_jobs
+		WHERE status = 'completed'
 		GROUP BY domain
 		ORDER BY contact_count DESC
 		LIMIT 500
@@ -476,7 +466,7 @@ func (s *Server) handleCreateQueries(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 500 queries per request"})
 		return
 	}
-	inserted, err := s.queryRepo.InsertBatch(cleaned, "")
+	inserted, err := s.queryRepo.InsertBatch(cleaned)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -539,8 +529,8 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 
 	// Table counts.
 	tables := map[string]string{
-		"queries": "queries", "seeds": "serp_seeds",
-		"websites": "websites", "contacts": "contacts",
+		"queries": "queries", "serp_jobs": "serp_jobs",
+		"websites": "websites", "enrich_jobs": "enrich_jobs",
 	}
 	for key, table := range tables {
 		var total int
@@ -549,7 +539,7 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Queue depths from Redis.
-	queues := []string{"serp:queue:websites", "serp:queue:contacts"}
+	queues := []string{"serp:queue:websites", "serp:queue:enrich"}
 	queueStats := map[string]int64{}
 	for _, q := range queues {
 		depth, _ := s.redis.ZCard(ctx, q).Result()
@@ -558,7 +548,7 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 	stats["queues"] = queueStats
 
 	// Dedup sizes.
-	dedups := []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"}
+	dedups := []string{"serp:dedup:urls", "serp:dedup:domains"}
 	dedupStats := map[string]int64{}
 	for _, d := range dedups {
 		size, _ := s.redis.SCard(ctx, d).Result()
@@ -585,14 +575,14 @@ func (s *Server) handlePipelineReset(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	cleared := map[string]int64{}
 	if req.Dedup {
-		for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"} {
+		for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
 			n, _ := s.redis.SCard(ctx, key).Result()
 			s.redis.Del(ctx, key)
 			cleared[key] = n
 		}
 	}
 	if req.Queues {
-		for _, key := range []string{"serp:queue:websites", "serp:queue:contacts"} {
+		for _, key := range []string{"serp:queue:websites", "serp:queue:enrich"} {
 			n, _ := s.redis.ZCard(ctx, key).Result()
 			s.redis.Del(ctx, key)
 			cleared[key] = n

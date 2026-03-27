@@ -5,6 +5,7 @@ package stage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/fetch"
+	"github.com/lib/pq"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
@@ -55,9 +57,6 @@ func (c *ContactStage) Run(ctx context.Context) error {
 
 	// One shared browser for all workers (fallback for JS-heavy sites).
 	// Pool size = worker count so each goroutine can acquire a pre-warmed tab.
-	// Architecture: 1 browser process → N tabs, NOT N browser processes.
-	// Browser auto-restarts every 300 requests (foxhound built-in) to clear
-	// accumulated DOM cache, JS heap, extension state, and network cache.
 	var sharedBrowser *fetch.CamoufoxFetcher
 	browser, err := internalScraper.NewBrowserWithPool(c.cfg, numWorkers)
 	if err != nil {
@@ -91,6 +90,7 @@ func (c *ContactStage) Run(ctx context.Context) error {
 const stealthRecycleAfter = 500
 
 func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *fetch.CamoufoxFetcher) {
+	workerIDStr := fmt.Sprintf("enrich-worker-%d", workerID)
 	slog.Info("contact: worker starting", "worker", workerID)
 
 	// Each worker gets its own stealth HTTP fetcher (lightweight, per-worker identity).
@@ -100,7 +100,7 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 
 	defer stealth.Close()
 
-	queueKey := "serp:queue:contacts"
+	queueKey := "serp:queue:enrich"
 
 	for {
 		if ctx.Err() != nil {
@@ -116,7 +116,7 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 			slog.Debug("contact: stealth recycled", "worker", workerID)
 		}
 
-		// Pop from Redis queue.
+		// Pop from Redis enrich queue.
 		job, err := popFromQueue(ctx, c.dedup.Client(), queueKey)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -145,16 +145,35 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 			continue
 		}
 
-		// Extract query_id from meta.
-		var queryID int64
-		if qid, ok := job.Meta["query_id"]; ok {
-			switch v := qid.(type) {
-			case float64:
-				queryID = int64(v)
-			case int64:
-				queryID = v
-			}
+		// Extract url_hash from meta to look up the enrich_job.
+		urlHash, _ := job.Meta["url_hash"].(string)
+		if urlHash == "" {
+			urlHash = dedup.HashURL(pageURL)
 		}
+
+		// Look up enrich_job by url_hash.
+		var enrichJobID string
+		var attemptCount, maxAttempts int
+		lookupErr := c.db.QueryRowContext(ctx, `
+			SELECT id, attempt_count, max_attempts
+			FROM enrich_jobs
+			WHERE url_hash = $1
+			LIMIT 1
+		`, urlHash).Scan(&enrichJobID, &attemptCount, &maxAttempts)
+		if lookupErr == sql.ErrNoRows {
+			slog.Debug("contact: enrich_job not found, skipping", "url", pageURL)
+			continue
+		}
+		if lookupErr != nil {
+			slog.Warn("contact: lookup enrich_job failed", "url", pageURL, "error", lookupErr)
+			continue
+		}
+
+		// Lock the enrich_job.
+		c.db.ExecContext(ctx, `
+			UPDATE enrich_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
+			WHERE id = $2
+		`, workerIDStr, enrichJobID)
 
 		// Fetch page.
 		timeout := time.Duration(c.cfg.Contact.TimeoutMs) * time.Millisecond
@@ -170,6 +189,16 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 
 		if err != nil {
 			slog.Debug("contact: fetch failed", "url", pageURL, "error", err)
+			c.db.ExecContext(ctx, `
+				UPDATE enrich_jobs SET
+					attempt_count = attempt_count + 1,
+					error_msg = $1,
+					status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'dead' ELSE 'failed' END,
+					next_attempt_at = CASE WHEN attempt_count + 1 >= max_attempts THEN NULL
+						ELSE NOW() + interval '1 second' * 30 * power(2, attempt_count) END,
+					updated_at = NOW()
+				WHERE id = $2
+			`, err.Error(), enrichJobID)
 			continue
 		}
 
@@ -182,51 +211,38 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 				slog.Info("contact: directory listings extracted",
 					"url", pageURL, "count", len(listings), "worker", workerID)
 			}
+
+			// Collect all emails and phones from directory listings.
+			var allEmails, allPhones []string
 			for _, l := range listings {
-				// Store listing contact data if email is present.
 				if l.Email != "" {
-					emailHash := dedup.HashEmail(l.Email)
-
-					isNew, dedupErr := c.dedup.Add(ctx, dedup.KeyEmails, emailHash)
-					if dedupErr != nil {
-						slog.Warn("contact: listing email dedup failed", "error", dedupErr)
-						continue
-					}
-					if !isNew {
-						continue
-					}
-
-					phone := l.Phone
-					_, insertErr := c.db.Exec(`
-						INSERT INTO contacts (
-							email, email_hash, phone, domain, source_url, source_query_id,
-							address
-						) VALUES ($1, $2, $3, $4, $5, $6, $7)
-						ON CONFLICT (email_hash, domain) DO NOTHING
-					`, l.Email, emailHash, phone,
-						dedup.ExtractDomain(pageURL), pageURL, queryID,
-						l.Address)
-					if insertErr != nil {
-						slog.Warn("contact: listing insert failed", "email", l.Email, "error", insertErr)
-						continue
-					}
-					c.emailsFound.Add(1)
-				} else if l.Phone != "" {
-					// Phone-only listing.
-					_, insertErr := c.db.Exec(`
-						INSERT INTO contacts (
-							phone, domain, source_url, source_query_id,
-							address
-						) VALUES ($1, $2, $3, $4, $5)
-						ON CONFLICT DO NOTHING
-					`, l.Phone, dedup.ExtractDomain(pageURL), pageURL, queryID,
-						l.Address)
-					if insertErr != nil {
-						slog.Debug("contact: listing phone-only insert failed", "error", insertErr)
-					}
-					c.phonesFound.Add(1)
+					allEmails = append(allEmails, l.Email)
+				}
+				if l.Phone != "" {
+					allPhones = append(allPhones, l.Phone)
 				}
 			}
+
+			socialLinks := buildSocialLinks(nil)
+			socialJSON, _ := json.Marshal(socialLinks)
+
+			_, updateErr := c.db.ExecContext(ctx, `
+				UPDATE enrich_jobs SET
+					emails = $1,
+					phones = $2,
+					social_links = $3,
+					status = 'completed',
+					completed_at = NOW(),
+					updated_at = NOW()
+				WHERE id = $4
+			`, pq.Array(allEmails), pq.Array(allPhones), socialJSON, enrichJobID)
+			if updateErr != nil {
+				slog.Warn("contact: directory update enrich_job failed", "error", updateErr)
+			}
+
+			c.emailsFound.Add(int64(len(allEmails)))
+			c.phonesFound.Add(int64(len(allPhones)))
+
 			slog.Debug("contact: directory page done",
 				"url", pageURL, "listings", len(listings), "worker", workerID)
 			continue
@@ -235,79 +251,86 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 		// Extract contacts.
 		cd := internalScraper.ExtractContacts([]byte(body))
 
-		// Store each email as a contact.
-		for _, email := range cd.Emails {
-			emailLower := dedup.HashEmail(email)
-
-			// Redis email dedup.
-			isNew, err := c.dedup.Add(ctx, dedup.KeyEmails, emailLower)
-			if err != nil {
-				slog.Warn("contact: email dedup failed", "error", err)
-				continue
-			}
-			if !isNew {
-				continue
-			}
-
-			// Optional MX validation.
-			var mxValid *bool
-			if c.cfg.Contact.ValidateMX {
-				v := internalScraper.ValidateMX(email)
-				mxValid = &v
-				if !v {
-					continue
-				}
-			}
-
-			// Get first phone if available.
-			phone := ""
-			if len(cd.Phones) > 0 {
-				phone = cd.Phones[0]
-			}
-
-			// Insert contact.
-			_, err = c.db.Exec(`
-				INSERT INTO contacts (
-					email, email_hash, phone, domain, source_url, source_query_id,
-					instagram, facebook, twitter, linkedin, whatsapp, address, mx_valid
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-				ON CONFLICT (email_hash, domain) DO NOTHING
-			`, email, dedup.HashEmail(email), phone, domain, pageURL, queryID,
-				cd.Instagram, cd.Facebook, cd.Twitter, cd.LinkedIn,
-				cd.WhatsApp, cd.Address, mxValid)
-			if err != nil {
-				slog.Warn("contact: insert failed", "email", email, "error", err)
-				continue
-			}
-
-			c.emailsFound.Add(1)
-		}
-
-		// Also store phone-only contacts if no email was found.
-		if len(cd.Emails) == 0 && len(cd.Phones) > 0 {
-			for _, phone := range cd.Phones {
-				_, err = c.db.Exec(`
-					INSERT INTO contacts (
-						phone, domain, source_url, source_query_id,
-						instagram, facebook, twitter, linkedin, whatsapp, address
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-					ON CONFLICT DO NOTHING
-				`, phone, domain, pageURL, queryID,
-					cd.Instagram, cd.Facebook, cd.Twitter, cd.LinkedIn,
-					cd.WhatsApp, cd.Address)
-				if err != nil {
-					slog.Debug("contact: insert phone-only failed", "error", err)
-				}
-				c.phonesFound.Add(1)
+		// Optional MX validation — filter emails that fail MX check.
+		emails := cd.Emails
+		var mxValid *bool
+		if c.cfg.Contact.ValidateMX && len(emails) > 0 {
+			// Validate MX for the first email's domain (representative for the site).
+			v := internalScraper.ValidateMX(emails[0])
+			mxValid = &v
+			if !v {
+				// Discard emails from domains without MX records.
+				emails = nil
 			}
 		}
+
+		// Build social links JSON.
+		socialLinks := buildSocialLinks(cd)
+		socialJSON, _ := json.Marshal(socialLinks)
+
+		// Update enrich_job with collected arrays.
+		_, updateErr := c.db.ExecContext(ctx, `
+			UPDATE enrich_jobs SET
+				emails = $1,
+				phones = $2,
+				social_links = $3,
+				address = $4,
+				raw_context = $5,
+				mx_valid = $6,
+				status = 'completed',
+				completed_at = NOW(),
+				updated_at = NOW()
+			WHERE id = $7
+		`, pq.Array(emails), pq.Array(cd.Phones), socialJSON,
+			cd.Address, cd.BusinessName, mxValid, enrichJobID)
+		if updateErr != nil {
+			slog.Warn("contact: update enrich_job failed", "url", pageURL, "error", updateErr)
+			c.db.ExecContext(ctx, `
+				UPDATE enrich_jobs SET
+					attempt_count = attempt_count + 1,
+					error_msg = $1,
+					status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'dead' ELSE 'failed' END,
+					next_attempt_at = CASE WHEN attempt_count + 1 >= max_attempts THEN NULL
+						ELSE NOW() + interval '1 second' * 30 * power(2, attempt_count) END,
+					updated_at = NOW()
+				WHERE id = $2
+			`, updateErr.Error(), enrichJobID)
+			continue
+		}
+
+		c.emailsFound.Add(int64(len(emails)))
+		c.phonesFound.Add(int64(len(cd.Phones)))
 
 		slog.Debug("contact: page done",
 			"url", pageURL,
-			"emails", len(cd.Emails),
+			"emails", len(emails),
 			"phones", len(cd.Phones),
 			"worker", workerID)
 	}
+}
+
+// buildSocialLinks converts ContactData social fields into a map for JSONB storage.
+func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
+	links := map[string]string{}
+	if cd == nil {
+		return links
+	}
+	if cd.Instagram != "" {
+		links["instagram"] = cd.Instagram
+	}
+	if cd.Facebook != "" {
+		links["facebook"] = cd.Facebook
+	}
+	if cd.Twitter != "" {
+		links["twitter"] = cd.Twitter
+	}
+	if cd.LinkedIn != "" {
+		links["linkedin"] = cd.LinkedIn
+	}
+	if cd.WhatsApp != "" {
+		links["whatsapp"] = cd.WhatsApp
+	}
+	return links
 }
 
 func fetchStealthOnly(ctx context.Context, stealth *fetch.StealthFetcher, pageURL, jobID string) (string, error) {

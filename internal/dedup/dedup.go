@@ -17,7 +17,6 @@ import (
 const (
 	KeyURLs    = "serp:dedup:urls"
 	KeyDomains = "serp:dedup:domains"
-	KeyEmails  = "serp:dedup:emails"
 )
 
 // Store wraps a Redis client for dedup operations using SETs.

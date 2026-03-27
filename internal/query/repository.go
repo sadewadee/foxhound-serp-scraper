@@ -21,7 +21,7 @@ func NewRepository(database *sql.DB) *Repository {
 
 // InsertBatch bulk-inserts queries, skipping duplicates by text_hash.
 // Returns the number of new queries inserted.
-func (r *Repository) InsertBatch(queries []string, templateID string) (int, error) {
+func (r *Repository) InsertBatch(queries []string) (int, error) {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("query: begin tx: %w", err)
@@ -29,8 +29,8 @@ func (r *Repository) InsertBatch(queries []string, templateID string) (int, erro
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO queries (text, text_hash, template_id, status, created_at, updated_at)
-		VALUES ($1, $2, $3, 'pending', NOW(), NOW())
+		INSERT INTO queries (text, text_hash, status, created_at, updated_at)
+		VALUES ($1, $2, 'pending', NOW(), NOW())
 		ON CONFLICT (text_hash) DO NOTHING
 	`)
 	if err != nil {
@@ -41,7 +41,7 @@ func (r *Repository) InsertBatch(queries []string, templateID string) (int, erro
 	inserted := 0
 	for _, q := range queries {
 		hash := dedup.HashQuery(q)
-		res, err := stmt.Exec(q, hash, templateID)
+		res, err := stmt.Exec(q, hash)
 		if err != nil {
 			return inserted, fmt.Errorf("query: insert %q: %w", q, err)
 		}
@@ -58,7 +58,7 @@ func (r *Repository) InsertBatch(queries []string, templateID string) (int, erro
 // GetPending returns all queries with status='pending'.
 func (r *Repository) GetPending(limit int) ([]db.Query, error) {
 	rows, err := r.db.Query(`
-		SELECT id, text, text_hash, COALESCE(template_id,''), status, result_count,
+		SELECT id, text, text_hash, status, result_count,
 		       COALESCE(error_msg,''), created_at, updated_at
 		FROM queries
 		WHERE status = 'pending'
@@ -73,7 +73,7 @@ func (r *Repository) GetPending(limit int) ([]db.Query, error) {
 	var result []db.Query
 	for rows.Next() {
 		var q db.Query
-		if err := rows.Scan(&q.ID, &q.Text, &q.TextHash, &q.TemplateID,
+		if err := rows.Scan(&q.ID, &q.Text, &q.TextHash,
 			&q.Status, &q.ResultCount, &q.ErrorMsg, &q.CreatedAt, &q.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("query: scan: %w", err)
 		}
@@ -176,9 +176,9 @@ func (r *Repository) MarkProcessing() (*db.Query, error) {
 			SELECT id FROM queries WHERE status = 'pending' ORDER BY id ASC LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, text, text_hash, COALESCE(template_id,''), status, result_count,
+		RETURNING id, text, text_hash, status, result_count,
 		          COALESCE(error_msg,''), created_at, updated_at
-	`).Scan(&q.ID, &q.Text, &q.TextHash, &q.TemplateID,
+	`).Scan(&q.ID, &q.Text, &q.TextHash,
 		&q.Status, &q.ResultCount, &q.ErrorMsg, &q.CreatedAt, &q.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
