@@ -172,11 +172,6 @@ func (w *WebsiteStage) worker(ctx context.Context, workerID int) {
 					if l.URL == "" {
 						continue
 					}
-					listingHash := dedup.HashURL(l.URL)
-					isNew, err := w.dedup.Add(ctx, dedup.KeyURLs, listingHash)
-					if err != nil || !isNew {
-						continue
-					}
 					if err := w.pushEnrichJob(ctx, enrichQueueKey, l.URL, queryID); err != nil {
 						slog.Warn("website: push directory listing failed", "url", l.URL, "error", err)
 					} else {
@@ -207,13 +202,7 @@ func (w *WebsiteStage) worker(ctx context.Context, workerID int) {
 				contactURL := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, path)
 				contactHash := dedup.HashURL(contactURL)
 
-				// URL-level dedup.
-				isNew, err := w.dedup.Add(ctx, dedup.KeyURLs, contactHash)
-				if err != nil || !isNew {
-					continue
-				}
-
-				// Insert website record for the contact page.
+				// Insert website record for the contact page (DB dedup via url_hash UNIQUE).
 				w.db.Exec(`
 					INSERT INTO websites (domain, url, url_hash, source_query_id, page_type, status)
 					VALUES ($1, $2, $3, $4, 'contact', 'pending')

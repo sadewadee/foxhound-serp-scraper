@@ -243,20 +243,10 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 			continue
 		}
 
-		// Dedup and insert websites.
+		// Insert websites (no URL dedup — every unique URL must be enriched).
 		inserted := 0
 		for _, u := range urls {
 			urlHash := dedup.HashURL(u)
-
-			// Redis URL dedup.
-			isNew, dedupErr := s.dedup.Add(ctx, dedup.KeyURLs, urlHash)
-			if dedupErr != nil {
-				slog.Warn("serp: dedup check failed", "error", dedupErr)
-				continue
-			}
-			if !isNew {
-				continue
-			}
 
 			domain := dedup.ExtractDomain(u)
 			if domain == "" {
