@@ -88,6 +88,10 @@ func (s *SERPStage) worker(ctx context.Context, workerID int) {
 	}
 	defer browser.Close()
 
+	// Each worker tracks its own browser lifecycle independently — each has its
+	// own browser process so counters must not be shared across workers.
+	lifecycle := scraper.NewBrowserLifecycle(s.cfg, scraper.NewSERPBrowser, fmt.Sprintf("serp-worker-%d", workerID))
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -112,7 +116,7 @@ func (s *SERPStage) worker(ctx context.Context, workerID int) {
 		}
 
 		slog.Info("serp: processing query", "worker", workerID, "query", q.Text, "id", q.ID)
-		resultCount := s.processQuery(ctx, &browser, q, workerIDStr)
+		resultCount := s.processQuery(ctx, &browser, q, workerIDStr, lifecycle)
 
 		status := "completed"
 		errMsg := ""
@@ -133,7 +137,7 @@ func (s *SERPStage) worker(ctx context.Context, workerID int) {
 	}
 }
 
-func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.CamoufoxFetcher, q *db.Query, workerID string) int {
+func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.CamoufoxFetcher, q *db.Query, workerID string, lifecycle *scraper.BrowserLifecycle) int {
 	totalURLs := 0
 	queueKey := "serp:queue:websites"
 
@@ -212,9 +216,10 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 				`, newAttempt, backoffSeconds, fetchErr.Error(), job.ID)
 
 				// Restart browser for fresh fingerprint on captcha/block.
+				// Use lifecycle.Restart so temp dirs are cleaned and orphan
+				// processes are reaped (counts as a lifecycle-triggered restart).
 				slog.Warn("serp: captcha/block detected, restarting browser", "job", job.ID, "attempt", newAttempt)
-				browser.Close()
-				newBrowser, restartErr := scraper.NewSERPBrowser(s.cfg)
+				newBrowser, restartErr := lifecycle.Restart(*browserPtr)
 				if restartErr != nil {
 					slog.Error("serp: browser restart failed", "error", restartErr)
 					return totalURLs
@@ -228,6 +233,16 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 					return totalURLs
 				case <-time.After(backoff):
 				}
+			}
+			// Count this fetch attempt for lifecycle tracking.
+			if lifecycle.IncrementAndCheck() {
+				slog.Info("serp: page reuse limit reached, restarting browser", "worker", workerID)
+				newBrowser, restartErr := lifecycle.Restart(*browserPtr)
+				if restartErr != nil {
+					slog.Error("serp: lifecycle restart failed", "error", restartErr)
+					return totalURLs
+				}
+				*browserPtr = newBrowser
 			}
 			continue
 		}
@@ -284,6 +299,17 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 		slog.Info("serp: page done",
 			"query", q.Text, "page", job.PageNum,
 			"found", len(urls), "new", inserted)
+
+		// Count this successful fetch for lifecycle tracking.
+		if lifecycle.IncrementAndCheck() {
+			slog.Info("serp: page reuse limit reached, restarting browser", "worker", workerID)
+			newBrowser, restartErr := lifecycle.Restart(*browserPtr)
+			if restartErr != nil {
+				slog.Error("serp: lifecycle restart failed", "error", restartErr)
+				return totalURLs
+			}
+			*browserPtr = newBrowser
+		}
 
 		// Delay between pages.
 		if job.PageNum < s.cfg.SERP.PagesPerQuery-1 {

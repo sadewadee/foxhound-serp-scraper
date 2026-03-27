@@ -28,6 +28,12 @@ type ContactStage struct {
 	db    *sql.DB
 	dedup *dedup.Store
 
+	// Shared browser state — all workers share one browser process (pool of tabs).
+	// browserMu guards sharedBrowser pointer replacement during lifecycle restarts.
+	browserMu     sync.Mutex
+	sharedBrowser *fetch.CamoufoxFetcher
+	lifecycle     *internalScraper.BrowserLifecycle
+
 	pagesProcessed atomic.Int64
 	emailsFound    atomic.Int64
 	phonesFound    atomic.Int64
@@ -35,10 +41,15 @@ type ContactStage struct {
 
 // NewContactStage creates a new contact enrichment stage.
 func NewContactStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *ContactStage {
+	// Browser factory that matches the pool size to the configured worker count.
+	browserFactory := func(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
+		return internalScraper.NewBrowserWithPool(cfg, cfg.Contact.Workers)
+	}
 	return &ContactStage{
-		cfg:   cfg,
-		db:    database,
-		dedup: dd,
+		cfg:       cfg,
+		db:        database,
+		dedup:     dd,
+		lifecycle: internalScraper.NewBrowserLifecycle(cfg, browserFactory, "enrich"),
 	}
 }
 
@@ -68,13 +79,20 @@ func (c *ContactStage) Run(ctx context.Context) error {
 
 	// One shared browser for all workers (fallback for JS-heavy sites).
 	// Pool size = worker count so each goroutine can acquire a pre-warmed tab.
-	var sharedBrowser *fetch.CamoufoxFetcher
 	browser, err := internalScraper.NewBrowserWithPool(c.cfg, numWorkers)
 	if err != nil {
 		slog.Warn("contact: shared browser init failed, stealth-only mode", "error", err)
 	} else {
-		sharedBrowser = browser
-		defer sharedBrowser.Close()
+		c.browserMu.Lock()
+		c.sharedBrowser = browser
+		c.browserMu.Unlock()
+		defer func() {
+			c.browserMu.Lock()
+			if c.sharedBrowser != nil {
+				c.sharedBrowser.Close()
+			}
+			c.browserMu.Unlock()
+		}()
 		slog.Info("contact: shared browser ready", "pool_size", numWorkers)
 	}
 
@@ -83,7 +101,7 @@ func (c *ContactStage) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			c.worker(ctx, workerID, sharedBrowser)
+			c.worker(ctx, workerID)
 		}(i)
 	}
 
@@ -100,7 +118,7 @@ func (c *ContactStage) Run(ctx context.Context) error {
 // time; recycling creates a fresh fetcher with a new identity.
 const stealthRecycleAfter = 500
 
-func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *fetch.CamoufoxFetcher) {
+func (c *ContactStage) worker(ctx context.Context, workerID int) {
 	workerIDStr := fmt.Sprintf("enrich-worker-%d", workerID)
 	slog.Info("contact: worker starting", "worker", workerID)
 
@@ -190,13 +208,36 @@ func (c *ContactStage) worker(ctx context.Context, workerID int, sharedBrowser *
 		timeout := time.Duration(c.cfg.Contact.TimeoutMs) * time.Millisecond
 		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
+		// Snapshot the shared browser pointer for this fetch (the browser itself
+		// is goroutine-safe for concurrent Fetch calls).
+		c.browserMu.Lock()
+		currentBrowser := c.sharedBrowser
+		c.browserMu.Unlock()
+
 		var body string
-		if sharedBrowser != nil {
-			body, err = internalScraper.FetchPage(fetchCtx, stealth, sharedBrowser, pageURL, job.ID)
+		if currentBrowser != nil {
+			body, err = internalScraper.FetchPage(fetchCtx, stealth, currentBrowser, pageURL, job.ID)
 		} else {
 			body, err = fetchStealthOnly(fetchCtx, stealth, pageURL, job.ID)
 		}
 		cancel()
+
+		// Check lifecycle after every fetch attempt (success or failure).
+		// Only one goroutine wins the restart; others continue with the new browser.
+		if currentBrowser != nil && c.lifecycle.IncrementAndCheck() {
+			slog.Info("enrich: page reuse limit reached, restarting browser", "worker", workerID)
+			c.browserMu.Lock()
+			// Re-check: another worker may have already restarted.
+			if c.sharedBrowser == currentBrowser {
+				newBrowser, restartErr := c.lifecycle.Restart(c.sharedBrowser)
+				if restartErr != nil {
+					slog.Error("enrich: lifecycle restart failed", "error", restartErr)
+				} else {
+					c.sharedBrowser = newBrowser
+				}
+			}
+			c.browserMu.Unlock()
+		}
 
 		if err != nil {
 			slog.Debug("contact: fetch failed", "url", pageURL, "error", err)

@@ -70,6 +70,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/pipeline/stats", RequireRole(RoleViewer, s.handlePipelineStats))
 	s.mux.HandleFunc("POST /api/pipeline/reset", RequireRole(RoleAdmin, s.handlePipelineReset))
 
+	// Debug.
+	s.mux.HandleFunc("GET /api/debug/serp-jobs", RequireRole(RoleViewer, s.handleDebugSerpJobs))
+	s.mux.HandleFunc("GET /api/debug/enrich-jobs", RequireRole(RoleViewer, s.handleDebugEnrichJobs))
+
 	// Workers (Dokploy-managed).
 	s.mux.HandleFunc("POST /api/workers/deploy", RequireRole(RoleAdmin, s.handleDeployWorker))
 	s.mux.HandleFunc("GET /api/workers", RequireRole(RoleViewer, s.handleListWorkers))
@@ -702,6 +706,108 @@ func (s *Server) handleDeleteWorker(w http.ResponseWriter, r *http.Request) {
 
 	delete(s.workers, composeID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ── Debug ──
+
+func (s *Server) handleDebugSerpJobs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	parentID := q.Get("query_id")
+	limit := queryInt(q, "limit", 50)
+
+	where := "WHERE 1=1"
+	args := []any{}
+	argIdx := 1
+
+	if parentID != "" {
+		where += fmt.Sprintf(" AND parent_job_id = $%d", argIdx)
+		args = append(args, parentID)
+		argIdx++
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, parent_job_id, search_url, page_num, status,
+		       attempt_count, max_attempts, COALESCE(error_msg,''),
+		       result_count, created_at, updated_at
+		FROM serp_jobs %s
+		ORDER BY parent_job_id, page_num
+		LIMIT $%d
+	`, where, argIdx)
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var jobs []map[string]any
+	for rows.Next() {
+		var id string
+		var parentJobID int64
+		var searchURL, status, errorMsg string
+		var pageNum, attemptCount, maxAttempts, resultCount int
+		var createdAt, updatedAt time.Time
+		rows.Scan(&id, &parentJobID, &searchURL, &pageNum, &status,
+			&attemptCount, &maxAttempts, &errorMsg, &resultCount, &createdAt, &updatedAt)
+		jobs = append(jobs, map[string]any{
+			"id": id, "parent_job_id": parentJobID, "search_url": searchURL,
+			"page_num": pageNum, "status": status, "attempt_count": attemptCount,
+			"max_attempts": maxAttempts, "error": errorMsg, "result_count": resultCount,
+			"created_at": createdAt, "updated_at": updatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, jobs)
+}
+
+func (s *Server) handleDebugEnrichJobs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	status := q.Get("status")
+	limit := queryInt(q, "limit", 50)
+
+	where := "WHERE 1=1"
+	args := []any{}
+	argIdx := 1
+
+	if status != "" {
+		where += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, status)
+		argIdx++
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, domain, url, status, attempt_count, max_attempts,
+		       COALESCE(error_msg,''), emails, phones, created_at, updated_at
+		FROM enrich_jobs %s
+		ORDER BY created_at DESC
+		LIMIT $%d
+	`, where, argIdx)
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var jobs []map[string]any
+	for rows.Next() {
+		var id, domain, url, jobStatus, errorMsg string
+		var attemptCount, maxAttempts int
+		var emails, phones []string
+		var createdAt, updatedAt time.Time
+		rows.Scan(&id, &domain, &url, &jobStatus, &attemptCount, &maxAttempts,
+			&errorMsg, pq.Array(&emails), pq.Array(&phones), &createdAt, &updatedAt)
+		jobs = append(jobs, map[string]any{
+			"id": id, "domain": domain, "url": url, "status": jobStatus,
+			"attempt_count": attemptCount, "max_attempts": maxAttempts,
+			"error": errorMsg, "emails": emails, "phones": phones,
+			"created_at": createdAt, "updated_at": updatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, jobs)
 }
 
 // ── Health ──
