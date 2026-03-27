@@ -69,6 +69,7 @@ services:
       API_KEY: "${API_KEY:-}"
       DOKPLOY_URL: "${DOKPLOY_URL:-}"
       DOKPLOY_API_KEY: "${DOKPLOY_API_KEY:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TZ: "${TZ:-Asia/Jakarta}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]

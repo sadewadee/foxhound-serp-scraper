@@ -17,6 +17,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/monitor"
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
+	"github.com/sadewadee/serp-scraper/internal/telegram"
 )
 
 // RunPipeline starts the API server and scraping pipeline.
@@ -132,6 +133,12 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 			slog.Error("api: server error", "error", err)
 		}
 	}()
+
+	// Start Telegram bot (optional — only if token is set).
+	if cfg.Telegram.BotToken != "" {
+		tgBot := telegram.New(cfg.Telegram.BotToken, database, dd.Client())
+		go tgBot.Run(ctx)
+	}
 
 	// Block until shutdown signal.
 	<-ctx.Done()

@@ -21,6 +21,7 @@ type Config struct {
 	Mordibouncer MordibouncerConfig `yaml:"mordibouncer"`
 	API          APIConfig          `yaml:"api"`
 	Dokploy      DokployConfig      `yaml:"dokploy"`
+	Telegram     TelegramConfig     `yaml:"telegram"`
 }
 
 type APIConfig struct {
@@ -32,6 +33,10 @@ type APIConfig struct {
 type DokployConfig struct {
 	URL    string `yaml:"url"`
 	APIKey string `yaml:"api_key"`
+}
+
+type TelegramConfig struct {
+	BotToken string `yaml:"bot_token"`
 }
 
 type APIUser struct {
@@ -167,6 +172,9 @@ func LoadFromEnv() (*Config, error) {
 		Dokploy: DokployConfig{
 			URL:    os.Getenv("DOKPLOY_URL"),
 			APIKey: os.Getenv("DOKPLOY_API_KEY"),
+		},
+		Telegram: TelegramConfig{
+			BotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		},
 		Monitor: MonitorConfig{
 			Enabled: true,

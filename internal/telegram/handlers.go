@@ -1,0 +1,241 @@
+//go:build playwright
+
+package telegram
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+)
+
+func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
+	text := strings.TrimSpace(msg.Text)
+
+	// Extract command and args.
+	cmd := text
+	args := ""
+	if i := strings.Index(text, " "); i > 0 {
+		cmd = text[:i]
+		args = strings.TrimSpace(text[i+1:])
+	}
+	// Strip @botname suffix from command.
+	if i := strings.Index(cmd, "@"); i > 0 {
+		cmd = cmd[:i]
+	}
+
+	switch cmd {
+	case "/start", "/help":
+		b.handleStart(msg)
+	case "/scrape":
+		b.handleScrape(msg, args)
+	case "/status":
+		b.handleStatus(ctx, msg)
+	case "/queries":
+		b.handleQueries(msg)
+	case "/contacts":
+		b.handleContacts(msg)
+	case "/export":
+		b.handleExport(msg)
+	case "/retry":
+		b.handleRetry(msg)
+	case "/reset":
+		b.handleReset(ctx, msg)
+	}
+}
+
+func (b *Bot) handleStart(msg *Message) {
+	text := `*SERP Scraper Bot*
+
+Available commands:
+
+/scrape <keywords> — Submit keywords (one per line)
+/status — Pipeline stats (queues, dedup)
+/queries — Query status breakdown
+/contacts — Contact stats
+/export — Export contacts as CSV
+/retry — Retry failed queries
+/reset — Reset dedup sets`
+
+	b.sendMessage(msg.Chat.ID, text)
+}
+
+func (b *Bot) handleScrape(msg *Message, args string) {
+	if args == "" {
+		b.sendMessage(msg.Chat.ID, "Usage: /scrape keyword1\nkeyword2\nkeyword3")
+		return
+	}
+
+	var keywords []string
+	for _, line := range strings.Split(args, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			keywords = append(keywords, line)
+		}
+	}
+	if len(keywords) == 0 {
+		b.sendMessage(msg.Chat.ID, "No keywords provided.")
+		return
+	}
+	if len(keywords) > 500 {
+		b.sendMessage(msg.Chat.ID, "Max 500 keywords per request.")
+		return
+	}
+
+	inserted, err := b.queryRepo.InsertBatch(keywords, "")
+	if err != nil {
+		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
+		return
+	}
+
+	dupes := len(keywords) - inserted
+	text := fmt.Sprintf("Inserted *%d* keywords", inserted)
+	if dupes > 0 {
+		text += fmt.Sprintf(" (%d duplicates skipped)", dupes)
+	}
+	b.sendMessage(msg.Chat.ID, text)
+}
+
+func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
+	// Table counts.
+	tables := []struct{ label, table string }{
+		{"Queries", "queries"},
+		{"Seeds", "serp_seeds"},
+		{"Websites", "websites"},
+		{"Contacts", "contacts"},
+	}
+	lines := []string{"*Pipeline Status*", ""}
+	for _, t := range tables {
+		var count int
+		b.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", t.table)).Scan(&count)
+		lines = append(lines, fmt.Sprintf("%s: *%d*", t.label, count))
+	}
+
+	// Queue depths.
+	lines = append(lines, "", "_Queues:_")
+	for _, q := range []string{"serp:queue:websites", "serp:queue:contacts"} {
+		depth, _ := b.redis.ZCard(ctx, q).Result()
+		short := q[len("serp:queue:"):]
+		lines = append(lines, fmt.Sprintf("  %s: %d", short, depth))
+	}
+
+	// Dedup sizes.
+	lines = append(lines, "", "_Dedup:_")
+	for _, d := range []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"} {
+		size, _ := b.redis.SCard(ctx, d).Result()
+		short := d[len("serp:dedup:"):]
+		lines = append(lines, fmt.Sprintf("  %s: %d", short, size))
+	}
+
+	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
+}
+
+func (b *Bot) handleQueries(msg *Message) {
+	counts, err := b.queryRepo.CountByStatus()
+	if err != nil {
+		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
+		return
+	}
+
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+
+	text := fmt.Sprintf("*Query Stats*\n\nTotal: *%d*\nPending: %d\nProcessing: %d\nDone: %d\nError: %d",
+		total,
+		counts["pending"],
+		counts["processing"],
+		counts["done"],
+		counts["error"],
+	)
+	b.sendMessage(msg.Chat.ID, text)
+}
+
+func (b *Bot) handleContacts(msg *Message) {
+	var total, withEmail, uniqueDomains, lastHour, last24h int
+
+	b.db.QueryRow("SELECT COUNT(*) FROM contacts").Scan(&total)
+	b.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE email IS NOT NULL AND email != ''").Scan(&withEmail)
+	b.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM contacts").Scan(&uniqueDomains)
+	b.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
+	b.db.QueryRow("SELECT COUNT(*) FROM contacts WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
+
+	text := fmt.Sprintf("*Contact Stats*\n\nTotal: *%d*\nWith email: %d\nDomains: %d\nLast hour: %d\nLast 24h: %d",
+		total, withEmail, uniqueDomains, lastHour, last24h)
+	b.sendMessage(msg.Chat.ID, text)
+}
+
+func (b *Bot) handleExport(msg *Message) {
+	b.sendMessage(msg.Chat.ID, "Generating CSV export...")
+
+	rows, err := b.db.Query(`
+		SELECT COALESCE(email,''), COALESCE(phone,''), domain, source_url,
+		       COALESCE(instagram,''), COALESCE(facebook,''), COALESCE(twitter,''),
+		       COALESCE(linkedin,''), COALESCE(whatsapp,''), COALESCE(address,'')
+		FROM contacts
+		WHERE email IS NOT NULL AND email != ''
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var buf strings.Builder
+	buf.WriteString("email,phone,domain,source_url,instagram,facebook,twitter,linkedin,whatsapp,address\n")
+
+	count := 0
+	for rows.Next() {
+		var email, phone, domain, sourceURL string
+		var ig, fb, tw, li, wa, addr string
+		rows.Scan(&email, &phone, &domain, &sourceURL, &ig, &fb, &tw, &li, &wa, &addr)
+		fmt.Fprintf(&buf, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+			csvEscape(email), csvEscape(phone), csvEscape(domain), csvEscape(sourceURL),
+			csvEscape(ig), csvEscape(fb), csvEscape(tw), csvEscape(li), csvEscape(wa), csvEscape(addr))
+		count++
+	}
+
+	if count == 0 {
+		b.sendMessage(msg.Chat.ID, "No contacts with email found.")
+		return
+	}
+
+	filename := fmt.Sprintf("contacts_%s.csv", time.Now().Format("2006-01-02"))
+	b.sendDocument(msg.Chat.ID, filename, []byte(buf.String()))
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Exported *%d* contacts.", count))
+}
+
+func (b *Bot) handleRetry(msg *Message) {
+	retried, err := b.queryRepo.RetryErrors()
+	if err != nil {
+		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
+		return
+	}
+	if retried == 0 {
+		b.sendMessage(msg.Chat.ID, "No failed queries to retry.")
+		return
+	}
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Retried *%d* queries.", retried))
+}
+
+func (b *Bot) handleReset(ctx context.Context, msg *Message) {
+	lines := []string{"*Dedup Reset*", ""}
+
+	for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains", "serp:dedup:emails"} {
+		n, _ := b.redis.SCard(ctx, key).Result()
+		b.redis.Del(ctx, key)
+		short := key[len("serp:dedup:"):]
+		lines = append(lines, fmt.Sprintf("%s: %d cleared", short, n))
+	}
+
+	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
+}
+
+func csvEscape(s string) string {
+	if strings.ContainsAny(s, ",\"\n") {
+		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
+	}
+	return s
+}
