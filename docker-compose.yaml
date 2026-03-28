@@ -133,7 +133,7 @@ services:
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
-    command: ["run", "-stage", "enrich", "-workers", "${ENRICH_WORKERS:-20}"]
+    command: ["run", "-stage", "enrich", "-workers", "${ENRICH_CONCURRENCY:-20}"]
     networks:
       - internal
     deploy:

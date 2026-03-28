@@ -23,12 +23,12 @@ services:
       REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
 
       # ── Worker config ──
-      PROXY_URL: "${PROXY_URL:-http://zafmahoi-rotate:uodfmly6phrl@p.webshar}"
+      PROXY_URL: "${PROXY_URL:-}"
       TZ: "${TZ:-Asia/Jakarta}"
 
       # ── Email validation (optional) ──
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
-      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-5b0231c5941b821b}"
+      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
 
     shm_size: "${SHM_SIZE:-512mb}"
     command: ["run", "-stage", "${WORKER_STAGE:-enrich}", "-workers", "${WORKER_CONCURRENCY:-4}"]
