@@ -81,7 +81,6 @@ services:
     command: ["run", "-stage", "none"]
     networks:
       - internal
-      - dokploy-network
     deploy:
       resources:
         limits:
@@ -150,6 +149,3 @@ volumes:
 networks:
   internal:
     driver: bridge
-  dokploy-network:
-    external: true
-    name: dokploy-network
