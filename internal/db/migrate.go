@@ -6,6 +6,15 @@ import (
 )
 
 const schema = `
+-- Drop old tables from pre-refactor schema (safe: data is regenerable by re-scraping).
+DROP TABLE IF EXISTS contacts CASCADE;
+DROP TABLE IF EXISTS serp_seeds CASCADE;
+
+-- Drop and recreate refactored tables if schema changed.
+DROP TABLE IF EXISTS enrich_jobs CASCADE;
+DROP TABLE IF EXISTS websites CASCADE;
+DROP TABLE IF EXISTS serp_jobs CASCADE;
+
 CREATE TABLE IF NOT EXISTS queries (
     id              BIGSERIAL PRIMARY KEY,
     text            TEXT NOT NULL,
