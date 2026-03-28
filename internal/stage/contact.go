@@ -77,6 +77,9 @@ func (c *ContactStage) Run(ctx context.Context) error {
 	numWorkers := c.cfg.Contact.Workers
 	slog.Info("contact: starting workers", "count", numWorkers)
 
+	// Start healthcheck heartbeat.
+	go touchHealthFile(ctx, "/tmp/worker-healthy")
+
 	// One shared browser for all workers (fallback for JS-heavy sites).
 	// Pool size = worker count so each goroutine can acquire a pre-warmed tab.
 	browser, err := internalScraper.NewBrowserWithPool(c.cfg, numWorkers)

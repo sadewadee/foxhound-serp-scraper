@@ -2,11 +2,11 @@
 #
 # Full stack: PostgreSQL + Redis + Manager (API) + Workers
 #
-# Quick start:
-#   cp .env.example .env   # fill in secrets
-#   docker compose up -d
-#
-# Dokploy: set compose file to docker-compose.yaml, env vars via panel.
+# Scaling:
+#   SERP_WORKER_COUNT=2     → 2 SERP containers (each with SERP_CONCURRENCY tabs)
+#   ENRICH_WORKER_COUNT=4   → 4 Enrich containers (each with ENRICH_CONCURRENCY fetchers)
+#   SERP_CONCURRENCY=4      → 4 browser tabs per SERP container
+#   ENRICH_CONCURRENCY=20   → 20 concurrent fetchers per Enrich container
 
 services:
 
@@ -38,7 +38,7 @@ services:
       --requirepass "${REDIS_PASSWORD}"
       --save 60 1
       --loglevel warning
-      --maxmemory ${REDIS_MAXMEM:-256mb}
+      --maxmemory ${REDIS_MAXMEM:-512mb}
       --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
@@ -51,8 +51,9 @@ services:
     networks:
       - internal
 
-  # ── Manager (API only, no scraping) ──
+  # ── Manager (API + Telegram bot, no scraping) ──
   manager:
+    init: true
     build: .
     image: foxhound-serp-scraper:local
     restart: unless-stopped
@@ -71,6 +72,7 @@ services:
       DOKPLOY_URL: "${DOKPLOY_URL:-}"
       DOKPLOY_API_KEY: "${DOKPLOY_API_KEY:-}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
       TZ: "${TZ:-Asia/Jakarta}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
@@ -87,8 +89,9 @@ services:
           cpus: "1"
           memory: ${MANAGER_MEMORY:-1g}
 
-  # ── SERP Worker (Google search via Camoufox browser) ──
+  # ── SERP Worker Pool (Google search via Camoufox browser) ──
   serp:
+    init: true
     build: .
     image: foxhound-serp-scraper:local
     restart: unless-stopped
@@ -106,16 +109,27 @@ services:
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
     command: ["run", "-stage", "serp", "-workers", "${SERP_CONCURRENCY:-4}"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     networks:
       - internal
     deploy:
+      mode: replicated
+      replicas: ${SERP_WORKER_COUNT:-2}
       resources:
         limits:
           cpus: "2"
           memory: 2g
+        reservations:
+          memory: 512m
 
-  # ── Enrich Worker (website crawl + contact extraction) ──
+  # ── Enrich Worker Pool (website crawl + contact extraction) ──
   enrich:
+    init: true
     build: .
     image: foxhound-serp-scraper:local
     restart: unless-stopped
@@ -134,13 +148,23 @@ services:
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
     command: ["run", "-stage", "enrich", "-workers", "${ENRICH_CONCURRENCY:-20}"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     networks:
       - internal
     deploy:
+      mode: replicated
+      replicas: ${ENRICH_WORKER_COUNT:-4}
       resources:
         limits:
-          cpus: "2"
+          cpus: "1"
           memory: 2g
+        reservations:
+          memory: 512m
 
 volumes:
   pg_data:

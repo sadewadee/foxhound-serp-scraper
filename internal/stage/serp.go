@@ -92,6 +92,9 @@ func (s *SERPStage) Run(ctx context.Context) error {
 
 	slog.Info("serp: starting", "concurrency", concurrency)
 
+	// Start healthcheck heartbeat.
+	go touchHealthFile(ctx, "/tmp/worker-healthy")
+
 	// Start reconciler.
 	go s.reconciler(ctx)
 
