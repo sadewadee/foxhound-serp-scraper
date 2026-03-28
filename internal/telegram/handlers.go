@@ -167,27 +167,35 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 
 	// ── SERP ──
 	var serpTotal, serpPending, serpCompleted, serpFailed, serpURLs int
+	var serpHour, serpToday int
 	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs`).Scan(&serpTotal)
 	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'new'`).Scan(&serpPending)
 	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpCompleted)
 	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'failed'`).Scan(&serpFailed)
 	b.db.QueryRow(`SELECT COALESCE(SUM(result_count), 0) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpURLs)
+	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'`).Scan(&serpHour)
+	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours'`).Scan(&serpToday)
 	lines = append(lines, "",
 		"_SERP:_",
 		fmt.Sprintf("  Pages: *%d*  Pending: %d  Done: %d  Failed: %d", serpTotal, serpPending, serpCompleted, serpFailed),
-		fmt.Sprintf("  URLs found: *%d*", serpURLs))
+		fmt.Sprintf("  URLs found: *%d*", serpURLs),
+		fmt.Sprintf("  Rate: %d/hour  Today: %d", serpHour, serpToday))
 
 	// ── Enrich ──
 	var enTotal, enPending, enCompleted, enFailed, enDead int
+	var enHour, enToday int
 	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs`).Scan(&enTotal)
 	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'pending'`).Scan(&enPending)
 	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'`).Scan(&enCompleted)
 	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'failed'`).Scan(&enFailed)
 	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'dead'`).Scan(&enDead)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&enHour)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&enToday)
 	lines = append(lines, "",
 		"_Enrich:_",
 		fmt.Sprintf("  Total: *%d*  Pending: %d  Done: %d", enTotal, enPending, enCompleted),
-		fmt.Sprintf("  Failed: %d  Dead: %d", enFailed, enDead))
+		fmt.Sprintf("  Failed: %d  Dead: %d", enFailed, enDead),
+		fmt.Sprintf("  Rate: %d/hour  Today: %d", enHour, enToday))
 
 	// ── Contacts ──
 	var uniqueEmails, emailsToday, emailsHour, uniqueDomains int
@@ -198,7 +206,7 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 	lines = append(lines, "",
 		"_Contacts:_",
 		fmt.Sprintf("  Unique emails: *%d*", uniqueEmails),
-		fmt.Sprintf("  Today: %d  /hour: %d", emailsToday, emailsHour),
+		fmt.Sprintf("  Emails: %d/hour  Today: %d", emailsHour, emailsToday),
 		fmt.Sprintf("  Domains: %d", uniqueDomains))
 
 	// ── Top providers ──

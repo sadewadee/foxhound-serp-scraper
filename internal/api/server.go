@@ -711,10 +711,14 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	serp["completed"] = serpCompleted
 	serp["failed"] = serpFailed
 
-	// SERP results summary.
-	var serpURLsFound int
+	// SERP results + rates.
+	var serpURLsFound, serpPerHour, serpToday int
 	s.db.QueryRow(`SELECT COALESCE(SUM(result_count), 0) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpURLsFound)
+	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'`).Scan(&serpPerHour)
+	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours'`).Scan(&serpToday)
 	serp["urls_found"] = serpURLsFound
+	serp["rate_per_hour"] = serpPerHour
+	serp["today"] = serpToday
 
 	// ── Websites ──
 	var webTotal, webPending, webCompleted int
@@ -739,6 +743,13 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	enrich["processing"] = enrichProcessing
 	enrich["completed"] = enrichCompleted
 	enrich["failed"] = enrichFailed
+
+	// Enrich rates.
+	var enrichPerHour, enrichToday int
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&enrichPerHour)
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&enrichToday)
+	enrich["rate_per_hour"] = enrichPerHour
+	enrich["today"] = enrichToday
 	enrich["dead"] = enrichDead
 
 	// ── Contacts (from completed enrich_jobs) ──
