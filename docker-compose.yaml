@@ -1,40 +1,57 @@
-# docker-compose.yaml — Dokploy / Single-server deployment
-#
-# Full stack: PostgreSQL + Redis + Manager (API) + Workers
+# docker-compose.yaml — Production deployment
 #
 # Scaling:
-#   SERP_WORKER_COUNT=2     → 2 SERP containers (each with SERP_CONCURRENCY tabs)
-#   ENRICH_WORKER_COUNT=4   → 4 Enrich containers (each with ENRICH_CONCURRENCY fetchers)
+#   SERP_WORKER_COUNT=2     → 2 SERP containers
+#   ENRICH_WORKER_COUNT=4   → 4 Enrich containers
 #   SERP_CONCURRENCY=4      → 4 browser tabs per SERP container
 #   ENRICH_CONCURRENCY=20   → 20 concurrent fetchers per Enrich container
 
 services:
 
-  # ── PostgreSQL ──
+  # ===========================================
+  # PostgreSQL Database
+  # ===========================================
   db:
     image: postgres:15-alpine
     restart: unless-stopped
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=512MB
+      -c effective_cache_size=2GB
+      -c work_mem=8MB
+      -c maintenance_work_mem=256MB
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_wal_size=2GB
+      -c checkpoint_completion_target=0.9
+      -c autovacuum_vacuum_scale_factor=0.05
+      -c autovacuum_analyze_scale_factor=0.02
+      -c statement_timeout=60000
+    shm_size: "1gb"
     environment:
-      POSTGRES_USER: serp
+      POSTGRES_USER: ${POSTGRES_USER:-serp}
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
       POSTGRES_DB: "${POSTGRES_DB:-serp_scraper}"
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U serp -d ${POSTGRES_DB:-serp_scraper}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-serp}"]
+      interval: 5s
       timeout: 5s
       retries: 5
-      start_period: 10s
     networks:
-      - internal
+      - scraper-network
 
-  # ── Redis ──
+  # ===========================================
+  # Redis - Queue & Deduplication
+  # ===========================================
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     command: >
       redis-server
+      --appendonly yes
       --requirepass "${REDIS_PASSWORD}"
       --save 60 1
       --loglevel warning
@@ -44,14 +61,15 @@ services:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
-      start_period: 5s
     networks:
-      - internal
+      - scraper-network
 
-  # ── Manager (API + Telegram bot, no scraping) ──
+  # ===========================================
+  # Manager (API + Telegram bot, no scraping)
+  # ===========================================
   manager:
     init: true
     build: .
@@ -63,33 +81,36 @@ services:
       redis:
         condition: service_healthy
     environment:
-      POSTGRES_DSN: "postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       API_SECRET: "${API_SECRET}"
-      API_ADMIN_PASSWORD: "${API_ADMIN_PASSWORD:-admin}"
+      API_ADMIN_PASSWORD: "${API_ADMIN_PASSWORD}"
       API_KEY: "${API_KEY:-}"
       DOKPLOY_URL: "${DOKPLOY_URL:-}"
       DOKPLOY_API_KEY: "${DOKPLOY_API_KEY:-}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
       TZ: "${TZ:-Asia/Jakarta}"
+    command: ["run", "-stage", "none"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
-      interval: 30s
-      timeout: 10s
+      interval: 10s
+      timeout: 5s
       retries: 3
       start_period: 30s
-    command: ["run", "-stage", "none"]
     networks:
-      - internal
+      - scraper-network
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: ${MANAGER_MEMORY:-1g}
+          memory: 1g
+        reservations:
+          memory: 256m
 
-  # ── SERP Worker Pool (Google search via Camoufox browser) ──
+  # ===========================================
+  # SERP Worker Pool (Google search via Camoufox)
+  # ===========================================
   serp:
     init: true
     build: .
@@ -101,7 +122,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      POSTGRES_DSN: "postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXY_URL: "${PROXY_URL:-}"
@@ -116,7 +137,7 @@ services:
       retries: 3
       start_period: 120s
     networks:
-      - internal
+      - scraper-network
     deploy:
       mode: replicated
       replicas: ${SERP_WORKER_COUNT:-2}
@@ -127,7 +148,9 @@ services:
         reservations:
           memory: 512m
 
-  # ── Enrich Worker Pool (website crawl + contact extraction) ──
+  # ===========================================
+  # Enrich Worker Pool (website crawl + contact extraction)
+  # ===========================================
   enrich:
     init: true
     build: .
@@ -139,7 +162,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      POSTGRES_DSN: "postgres://serp:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXY_URL: "${PROXY_URL:-}"
@@ -155,7 +178,7 @@ services:
       retries: 3
       start_period: 120s
     networks:
-      - internal
+      - scraper-network
     deploy:
       mode: replicated
       replicas: ${ENRICH_WORKER_COUNT:-4}
@@ -166,10 +189,27 @@ services:
         reservations:
           memory: 512m
 
+  # ===========================================
+  # Autoheal - Auto-restart unhealthy containers
+  # ===========================================
+  autoheal:
+    image: willfarrell/autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=120
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - scraper-network
+
 volumes:
-  pg_data:
+  postgres_data:
+    driver: local
   redis_data:
+    driver: local
 
 networks:
-  internal:
+  scraper-network:
     driver: bridge
