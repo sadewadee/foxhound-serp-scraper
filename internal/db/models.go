@@ -57,13 +57,20 @@ type EnrichJob struct {
 	NextAttemptAt   *time.Time `json:"next_attempt_at,omitempty"`
 	LockedBy        string     `json:"locked_by,omitempty"`
 	LockedAt        *time.Time `json:"locked_at,omitempty"`
-	ErrorMsg        string     `json:"error_msg,omitempty"`
-	Emails          []string   `json:"emails"`
-	Phones          []string   `json:"phones"`
-	SocialLinks     any        `json:"social_links"`
-	Address         string     `json:"address,omitempty"`
-	RawContext      string     `json:"raw_context,omitempty"`
-	MXValid         *bool      `json:"mx_valid,omitempty"`
+	ErrorMsg         string     `json:"error_msg,omitempty"`
+	BusinessName     string     `json:"business_name,omitempty"`
+	BusinessCategory string     `json:"business_category,omitempty"`
+	Description      string     `json:"description,omitempty"`
+	Website          string     `json:"website,omitempty"`
+	Emails           []string   `json:"emails"`
+	Phones           []string   `json:"phones"`
+	SocialLinks      any        `json:"social_links"`
+	Address          string     `json:"address,omitempty"`
+	Location         string     `json:"location,omitempty"`
+	OpeningHours     string     `json:"opening_hours,omitempty"`
+	Rating           string     `json:"rating,omitempty"`
+	PageTitle        string     `json:"page_title,omitempty"`
+	MXValid          *bool      `json:"mx_valid,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	CompletedAt     *time.Time `json:"completed_at,omitempty"`

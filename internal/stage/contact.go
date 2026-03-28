@@ -337,21 +337,33 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 		socialLinks := buildSocialLinks(cd)
 		socialJSON, _ := json.Marshal(socialLinks)
 
-		// Update enrich_job with collected arrays.
+		// Determine website URL (main domain URL, not the specific page).
+		websiteURL := fmt.Sprintf("https://%s", dedup.ExtractDomain(pageURL))
+
+		// Update enrich_job with collected arrays + business info.
 		_, updateErr := c.db.ExecContext(ctx, `
 			UPDATE enrich_jobs SET
-				emails = $1,
-				phones = $2,
-				social_links = $3,
-				address = $4,
-				raw_context = $5,
-				mx_valid = $6,
+				business_name = $1,
+				business_category = $2,
+				description = $3,
+				website = $4,
+				emails = $5,
+				phones = $6,
+				social_links = $7,
+				address = $8,
+				location = $9,
+				opening_hours = $10,
+				rating = $11,
+				page_title = $12,
+				mx_valid = $13,
 				status = 'completed',
 				completed_at = NOW(),
 				updated_at = NOW()
-			WHERE id = $7
-		`, pq.Array(emails), pq.Array(phones), socialJSON,
-			cd.Address, cd.BusinessName, mxValid, enrichJobID)
+			WHERE id = $14
+		`, cd.BusinessName, cd.BusinessCategory, cd.Description, websiteURL,
+			pq.Array(emails), pq.Array(phones), socialJSON,
+			cd.Address, cd.Location, cd.OpeningHours, cd.Rating, cd.PageTitle,
+			mxValid, enrichJobID)
 		if updateErr != nil {
 			slog.Warn("contact: update enrich_job failed", "url", pageURL, "error", updateErr)
 			c.db.ExecContext(ctx, `

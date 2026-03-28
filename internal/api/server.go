@@ -192,7 +192,12 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch rows.
 	dataQuery := fmt.Sprintf(`
-		SELECT id, emails, phones, domain, url, social_links, address, status, created_at
+		SELECT id, COALESCE(business_name,''), COALESCE(business_category,''),
+		       COALESCE(description,''), COALESCE(website,''),
+		       emails, phones, domain, url, social_links,
+		       COALESCE(address,''), COALESCE(location,''),
+		       COALESCE(opening_hours,''), COALESCE(rating,''),
+		       COALESCE(page_title,''), status, created_at
 		FROM enrich_jobs %s
 		ORDER BY id DESC
 		LIMIT $%d OFFSET $%d
@@ -209,17 +214,24 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	var contacts []map[string]any
 	for rows.Next() {
 		var id string
+		var businessName, businessCategory, description, website string
 		var emails, phones []string
-		var domain, url, address, status string
+		var domain, url, address, location, openingHours, rating, pageTitle, status string
 		var socialLinksJSON []byte
 		var createdAt time.Time
 
-		rows.Scan(&id, pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address, &status, &createdAt)
+		rows.Scan(&id, &businessName, &businessCategory, &description, &website,
+			pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON,
+			&address, &location, &openingHours, &rating, &pageTitle, &status, &createdAt)
 
 		contacts = append(contacts, map[string]any{
-			"id": id, "emails": emails, "phones": phones, "domain": domain,
+			"id": id, "business_name": businessName, "business_category": businessCategory,
+			"description": description, "website": website,
+			"emails": emails, "phones": phones, "domain": domain,
 			"url": url, "social_links": json.RawMessage(socialLinksJSON),
-			"address": address, "status": status, "created_at": createdAt,
+			"address": address, "location": location, "opening_hours": openingHours,
+			"rating": rating, "page_title": pageTitle,
+			"status": status, "created_at": createdAt,
 		})
 	}
 
@@ -244,7 +256,9 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	exportQuery := fmt.Sprintf(`
-		SELECT emails, phones, domain, url, social_links, address
+		SELECT COALESCE(business_name,''), COALESCE(business_category,''),
+		       COALESCE(website,''), emails, phones, domain,
+		       social_links, COALESCE(address,''), COALESCE(location,'')
 		FROM enrich_jobs %s ORDER BY id ASC
 	`, where)
 
@@ -258,17 +272,20 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		w.Header().Set("Content-Disposition", "attachment; filename=contacts.csv")
-		fmt.Fprintln(w, "emails,phones,domain,url,social_links,address")
+		fmt.Fprintln(w, "business_name,business_category,website,emails,phones,domain,social_links,address,location")
 		for rows.Next() {
+			var businessName, businessCategory, website string
 			var emails, phones []string
-			var domain, url, address string
+			var domain, address, location string
 			var socialLinksJSON []byte
-			rows.Scan(pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address)
-			emailsStr := strings.Join(emails, ";")
-			phonesStr := strings.Join(phones, ";")
-			fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s\n",
-				csvEscape(emailsStr), csvEscape(phonesStr), csvEscape(domain), csvEscape(url),
-				csvEscape(string(socialLinksJSON)), csvEscape(address))
+			rows.Scan(&businessName, &businessCategory, &website,
+				pq.Array(&emails), pq.Array(&phones), &domain,
+				&socialLinksJSON, &address, &location)
+			fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+				csvEscape(businessName), csvEscape(businessCategory), csvEscape(website),
+				csvEscape(strings.Join(emails, ";")), csvEscape(strings.Join(phones, ";")),
+				csvEscape(domain), csvEscape(string(socialLinksJSON)),
+				csvEscape(address), csvEscape(location))
 		}
 		return
 	}
@@ -276,13 +293,18 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	// JSON export.
 	var contacts []map[string]any
 	for rows.Next() {
+		var businessName, businessCategory, website string
 		var emails, phones []string
-		var domain, url, address string
+		var domain, address, location string
 		var socialLinksJSON []byte
-		rows.Scan(pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address)
+		rows.Scan(&businessName, &businessCategory, &website,
+			pq.Array(&emails), pq.Array(&phones), &domain,
+			&socialLinksJSON, &address, &location)
 		contacts = append(contacts, map[string]any{
-			"emails": emails, "phones": phones, "domain": domain, "url": url,
-			"social_links": json.RawMessage(socialLinksJSON), "address": address,
+			"business_name": businessName, "business_category": businessCategory,
+			"website": website, "emails": emails, "phones": phones, "domain": domain,
+			"social_links": json.RawMessage(socialLinksJSON),
+			"address": address, "location": location,
 		})
 	}
 	writeJSON(w, http.StatusOK, contacts)
