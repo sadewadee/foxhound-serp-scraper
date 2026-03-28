@@ -343,24 +343,25 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 		// Update enrich_job with collected arrays + business info.
 		_, updateErr := c.db.ExecContext(ctx, `
 			UPDATE enrich_jobs SET
-				business_name = $1,
-				business_category = $2,
-				description = $3,
-				website = $4,
-				emails = $5,
-				phones = $6,
-				social_links = $7,
-				address = $8,
-				location = $9,
-				opening_hours = $10,
-				rating = $11,
-				page_title = $12,
-				mx_valid = $13,
+				contact_name = $1,
+				business_name = $2,
+				business_category = $3,
+				description = $4,
+				website = $5,
+				emails = $6,
+				phones = $7,
+				social_links = $8,
+				address = $9,
+				location = $10,
+				opening_hours = $11,
+				rating = $12,
+				page_title = $13,
+				mx_valid = $14,
 				status = 'completed',
 				completed_at = NOW(),
 				updated_at = NOW()
-			WHERE id = $14
-		`, cd.BusinessName, cd.BusinessCategory, cd.Description, websiteURL,
+			WHERE id = $15
+		`, cd.ContactName, cd.BusinessName, cd.BusinessCategory, cd.Description, websiteURL,
 			pq.Array(emails), pq.Array(phones), socialJSON,
 			cd.Address, cd.Location, cd.OpeningHours, cd.Rating, cd.PageTitle,
 			mxValid, enrichJobID)

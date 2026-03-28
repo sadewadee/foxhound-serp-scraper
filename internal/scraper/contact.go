@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/PuerkitoBio/goquery"
+
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/parse"
 )
@@ -52,6 +54,9 @@ type ContactData struct {
 
 	// Address (from HTML selectors + JSON-LD).
 	Address string
+
+	// Contact person name (from JSON-LD author/founder, meta author, vCard).
+	ContactName string
 
 	// Business info (from JSON-LD / OpenGraph / meta tags).
 	BusinessName     string
@@ -145,6 +150,33 @@ func extractJSONLD(resp *foxhound.Response, cd *ContactData) {
 		if cd.BusinessName == "" {
 			if name, ok := ld["name"].(string); ok && name != "" {
 				cd.BusinessName = name
+			}
+		}
+
+		// Extract contact person name from JSON-LD (author, founder, employee, contactPoint).
+		if cd.ContactName == "" {
+			for _, field := range []string{"author", "founder", "employee", "director", "contactPoint"} {
+				if cd.ContactName != "" {
+					break
+				}
+				switch v := ld[field].(type) {
+				case map[string]any:
+					if name, ok := v["name"].(string); ok && name != "" {
+						cd.ContactName = name
+					}
+				case []any:
+					if len(v) > 0 {
+						if person, ok := v[0].(map[string]any); ok {
+							if name, ok := person["name"].(string); ok && name != "" {
+								cd.ContactName = name
+							}
+						}
+					}
+				case string:
+					if v != "" {
+						cd.ContactName = v
+					}
+				}
 			}
 		}
 
@@ -305,6 +337,33 @@ func extractMetadata(resp *foxhound.Response, cd *ContactData) {
 	if cd.BusinessCategory == "" {
 		if kw, ok := meta["keywords"]; ok {
 			cd.BusinessCategory = truncate(kw, 200)
+		}
+	}
+
+	// Meta author → contact name.
+	if cd.ContactName == "" {
+		if author, ok := meta["author"]; ok && author != "" {
+			cd.ContactName = author
+		}
+	}
+
+	// vCard / hCard fallback for contact name.
+	if cd.ContactName == "" {
+		doc, err := parse.NewDocument(resp)
+		if err == nil {
+			for _, sel := range []string{".vcard .fn", ".h-card .p-name", "[itemprop='name'][itemtype*='Person']"} {
+				doc.Each(sel, func(_ int, s *goquery.Selection) {
+					if cd.ContactName == "" {
+						name := strings.TrimSpace(s.Text())
+						if name != "" && len(name) < 100 {
+							cd.ContactName = name
+						}
+					}
+				})
+				if cd.ContactName != "" {
+					break
+				}
+			}
 		}
 	}
 }

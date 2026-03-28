@@ -58,6 +58,7 @@ type EnrichJob struct {
 	LockedBy        string     `json:"locked_by,omitempty"`
 	LockedAt        *time.Time `json:"locked_at,omitempty"`
 	ErrorMsg         string     `json:"error_msg,omitempty"`
+	ContactName      string     `json:"contact_name,omitempty"`
 	BusinessName     string     `json:"business_name,omitempty"`
 	BusinessCategory string     `json:"business_category,omitempty"`
 	Description      string     `json:"description,omitempty"`

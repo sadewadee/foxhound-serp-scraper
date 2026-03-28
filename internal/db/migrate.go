@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS enrich_jobs (
     locked_by           TEXT,
     locked_at           TIMESTAMPTZ,
     error_msg           TEXT,
+    contact_name        TEXT,
     business_name       TEXT,
     business_category   TEXT,
     description         TEXT,
