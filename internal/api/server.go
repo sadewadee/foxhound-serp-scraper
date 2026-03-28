@@ -69,6 +69,7 @@ func (s *Server) registerRoutes() {
 
 	// Pipeline.
 	s.mux.HandleFunc("GET /api/pipeline/stats", RequireRole(RoleViewer, s.handlePipelineStats))
+	s.mux.HandleFunc("GET /api/dashboard", RequireRole(RoleViewer, s.handleDashboard))
 	s.mux.HandleFunc("POST /api/pipeline/reset", RequireRole(RoleAdmin, s.handlePipelineReset))
 
 	// Debug.
@@ -673,6 +674,136 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 	stats["dedup"] = dedupStats
 
 	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+
+	// ── Queries ──
+	queries := map[string]int{}
+	qRows, _ := s.db.Query(`SELECT status, COUNT(*) FROM queries GROUP BY status`)
+	if qRows != nil {
+		for qRows.Next() {
+			var status string
+			var cnt int
+			qRows.Scan(&status, &cnt)
+			queries[status] = cnt
+		}
+		qRows.Close()
+	}
+	qTotal := 0
+	for _, c := range queries {
+		qTotal += c
+	}
+	queries["total"] = qTotal
+
+	// ── SERP Jobs ──
+	serp := map[string]any{}
+	var serpTotal, serpNew, serpProcessing, serpCompleted, serpFailed int
+	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs`).Scan(&serpTotal)
+	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'new'`).Scan(&serpNew)
+	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'processing'`).Scan(&serpProcessing)
+	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpCompleted)
+	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'failed'`).Scan(&serpFailed)
+	serp["total"] = serpTotal
+	serp["pending"] = serpNew
+	serp["processing"] = serpProcessing
+	serp["completed"] = serpCompleted
+	serp["failed"] = serpFailed
+
+	// SERP results summary.
+	var serpURLsFound int
+	s.db.QueryRow(`SELECT COALESCE(SUM(result_count), 0) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpURLsFound)
+	serp["urls_found"] = serpURLsFound
+
+	// ── Websites ──
+	var webTotal, webPending, webCompleted int
+	s.db.QueryRow(`SELECT COUNT(*) FROM websites`).Scan(&webTotal)
+	s.db.QueryRow(`SELECT COUNT(*) FROM websites WHERE status = 'pending'`).Scan(&webPending)
+	s.db.QueryRow(`SELECT COUNT(*) FROM websites WHERE status = 'completed'`).Scan(&webCompleted)
+	websites := map[string]int{
+		"total": webTotal, "pending": webPending, "completed": webCompleted,
+	}
+
+	// ── Enrich Jobs ──
+	enrich := map[string]any{}
+	var enrichTotal, enrichPending, enrichProcessing, enrichCompleted, enrichFailed, enrichDead int
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs`).Scan(&enrichTotal)
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'pending'`).Scan(&enrichPending)
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'processing'`).Scan(&enrichProcessing)
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'`).Scan(&enrichCompleted)
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'failed'`).Scan(&enrichFailed)
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'dead'`).Scan(&enrichDead)
+	enrich["total"] = enrichTotal
+	enrich["pending"] = enrichPending
+	enrich["processing"] = enrichProcessing
+	enrich["completed"] = enrichCompleted
+	enrich["failed"] = enrichFailed
+	enrich["dead"] = enrichDead
+
+	// ── Contacts (from completed enrich_jobs) ──
+	contacts := map[string]any{}
+	var totalEmails, uniqueEmails, totalWithEmail int
+	var emailsToday, emailsLastHour int
+	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0`).Scan(&totalWithEmail)
+	s.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&uniqueEmails)
+	s.db.QueryRow(`SELECT COUNT(e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&totalEmails)
+	s.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
+	s.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsLastHour)
+
+	contacts["total_with_email"] = totalWithEmail
+	contacts["total_emails"] = totalEmails
+	contacts["unique_emails"] = uniqueEmails
+	contacts["emails_today"] = emailsToday
+	contacts["emails_per_hour"] = emailsLastHour
+
+	// Top email providers.
+	providerRows, _ := s.db.Query(`
+		SELECT split_part(e, '@', 2) AS provider, COUNT(*) AS cnt
+		FROM enrich_jobs, unnest(emails) AS e
+		WHERE status = 'completed'
+		GROUP BY provider ORDER BY cnt DESC LIMIT 10
+	`)
+	providers := map[string]int{}
+	if providerRows != nil {
+		for providerRows.Next() {
+			var p string
+			var c int
+			providerRows.Scan(&p, &c)
+			providers[p] = c
+		}
+		providerRows.Close()
+	}
+	contacts["providers"] = providers
+
+	// Unique domains scraped.
+	var uniqueDomains int
+	s.db.QueryRow(`SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'`).Scan(&uniqueDomains)
+	contacts["unique_domains"] = uniqueDomains
+
+	// ── Queues (Redis) ──
+	queues := map[string]int64{}
+	for _, q := range []string{"serp:queue:websites", "serp:queue:enrich"} {
+		depth, _ := s.redis.ZCard(ctx, q).Result()
+		queues[q] = depth
+	}
+
+	// ── Dedup (Redis) ──
+	dedup := map[string]int64{}
+	for _, d := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
+		size, _ := s.redis.SCard(ctx, d).Result()
+		dedup[d] = size
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"queries":  queries,
+		"serp":     serp,
+		"websites": websites,
+		"enrich":   enrich,
+		"contacts": contacts,
+		"queues":   queues,
+		"dedup":    dedup,
+	})
 }
 
 func (s *Server) handlePipelineReset(w http.ResponseWriter, r *http.Request) {
