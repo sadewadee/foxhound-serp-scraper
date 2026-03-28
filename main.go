@@ -117,14 +117,22 @@ func runGenerate(cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	templates := fs.String("templates", "", "Path to templates YAML file")
 	configFile := fs.String("config", "", "Alias for -templates")
+	country := fs.String("country", "", "Generate wellness keywords for a country (name or \"all\")")
+	niche := fs.String("niche", "", "Filter to a specific niche (default: all niches)")
 	fs.Parse(args)
 
+	// Wellness/fitness keyword generator path.
+	if *country != "" {
+		return cmd.RunGenerateWellness(cfg, *country, *niche)
+	}
+
+	// Legacy YAML template path.
 	path := *templates
 	if path == "" {
 		path = *configFile
 	}
 	if path == "" {
-		return fmt.Errorf("generate: -templates is required")
+		return fmt.Errorf("generate: provide -templates <file> or -country <country>")
 	}
 	return cmd.RunGenerate(cfg, path)
 }

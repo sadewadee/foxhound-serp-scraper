@@ -9,6 +9,7 @@ import (
 	"time"
 
 	pq "github.com/lib/pq"
+	"github.com/sadewadee/serp-scraper/internal/query"
 )
 
 func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
@@ -43,6 +44,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
 		b.handleRetry(msg)
 	case "/reset":
 		b.handleReset(ctx, msg)
+	case "/generate":
+		b.handleGenerate(msg, args)
 	}
 }
 
@@ -52,6 +55,7 @@ func (b *Bot) handleStart(msg *Message) {
 Available commands:
 
 /scrape <keywords> — Submit keywords (one per line)
+/generate <country> — Generate wellness/fitness keywords (or "all")
 /status — Pipeline stats (queues, dedup)
 /queries — Query status breakdown
 /contacts — Contact stats
@@ -95,6 +99,54 @@ func (b *Bot) handleScrape(msg *Message, args string) {
 	if dupes > 0 {
 		text += fmt.Sprintf(" (%d duplicates skipped)", dupes)
 	}
+	b.sendMessage(msg.Chat.ID, text)
+}
+
+func (b *Bot) handleGenerate(msg *Message, args string) {
+	country := strings.TrimSpace(args)
+	if country == "" {
+		// List available countries.
+		countries := query.CountryList()
+		text := "*Available countries:*\n\n"
+		for _, c := range countries {
+			cities := query.Cities[c]
+			text += fmt.Sprintf("• %s (%d cities)\n", c, len(cities))
+		}
+		text += "\nUsage: /generate <country> or /generate all"
+		b.sendMessage(msg.Chat.ID, text)
+		return
+	}
+
+	var keywords []string
+	if strings.ToLower(country) == "all" {
+		keywords = query.GenerateAllKeywords()
+	} else {
+		keywords = query.GenerateKeywordsForCountry(country)
+		if keywords == nil {
+			b.sendMessage(msg.Chat.ID, fmt.Sprintf("Country '%s' not found. Send /generate to see available countries.", country))
+			return
+		}
+	}
+
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Generating *%d* keywords for %s...", len(keywords), country))
+
+	const batchSize = 500
+	totalInserted := 0
+	for i := 0; i < len(keywords); i += batchSize {
+		end := i + batchSize
+		if end > len(keywords) {
+			end = len(keywords)
+		}
+		inserted, err := b.queryRepo.InsertBatch(keywords[i:end])
+		if err != nil {
+			b.sendMessage(msg.Chat.ID, fmt.Sprintf("Error at batch %d: %s", i/batchSize, err.Error()))
+			return
+		}
+		totalInserted += inserted
+	}
+
+	dupes := len(keywords) - totalInserted
+	text := fmt.Sprintf("*Done!*\nGenerated: %d\nInserted: %d\nDuplicates: %d", len(keywords), totalInserted, dupes)
 	b.sendMessage(msg.Chat.ID, text)
 }
 
@@ -163,9 +215,35 @@ func (b *Bot) handleContacts(msg *Message) {
 	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
 	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
 
-	text := fmt.Sprintf("*Contact Stats*\n\nTotal: *%d*\nWith email: %d\nDomains: %d\nLast hour: %d\nLast 24h: %d",
-		total, withEmail, uniqueDomains, lastHour, last24h)
-	b.sendMessage(msg.Chat.ID, text)
+	lines := []string{
+		"*Contact Stats*",
+		"",
+		fmt.Sprintf("Total: *%d*", total),
+		fmt.Sprintf("With email: %d", withEmail),
+		fmt.Sprintf("Domains: %d", uniqueDomains),
+		fmt.Sprintf("Last hour: %d", lastHour),
+		fmt.Sprintf("Last 24h: %d", last24h),
+	}
+
+	// Top email providers.
+	providerRows, _ := b.db.Query(`
+		SELECT split_part(e, '@', 2) AS provider, COUNT(*) AS cnt
+		FROM enrich_jobs, unnest(emails) AS e
+		WHERE status = 'completed'
+		GROUP BY provider ORDER BY cnt DESC LIMIT 5
+	`)
+	if providerRows != nil {
+		defer providerRows.Close()
+		lines = append(lines, "", "_Top providers:_")
+		for providerRows.Next() {
+			var provider string
+			var cnt int
+			providerRows.Scan(&provider, &cnt)
+			lines = append(lines, fmt.Sprintf("  %s: %d", provider, cnt))
+		}
+	}
+
+	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
 func (b *Bot) handleExport(msg *Message) {

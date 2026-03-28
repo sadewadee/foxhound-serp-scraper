@@ -1,18 +1,20 @@
-# docker-compose.worker.yaml — Server B/C/D (Remote Worker)
+# docker-compose.worker.yaml — Standalone Worker
 #
-# Connects to REMOTE PostgreSQL + Redis on Server A.
-# No local database — stateless, all state lives in PG + Redis.
+# Connects to REMOTE PostgreSQL + Redis. No local database.
+# Deploy on any server, set env vars, done.
 #
 # Usage:
-#   cp .env.worker.example .env
+#   POSTGRES_DSN=postgres://serp:pass@main-server:5432/serp_scraper \
+#   REDIS_ADDR=main-server:6379 \
+#   REDIS_PASSWORD=pass \
+#   WORKER_STAGE=serp \
+#   WORKER_CONCURRENCY=2 \
 #   docker compose -f docker-compose.worker.yaml up -d
-#
-# Scale by running on multiple servers with different WORKER_STAGE/WORKER_COUNT.
 
 services:
-
   worker:
-    image: ghcr.io/sadewadee/foxhound-serp-scraper:${IMAGE_TAG:-main}
+    build: .
+    image: foxhound-serp-scraper:local
     restart: unless-stopped
     environment:
       # ── Required: remote PG + Redis ──
@@ -29,21 +31,8 @@ services:
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
 
     shm_size: "${SHM_SIZE:-512mb}"
-    ports:
-      - "${METRICS_PORT:-9091}:9090"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9090/metrics"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    command:
-      - "run"
-      - "-stage"
-      - "${WORKER_STAGE:-contact}"
-      - "-workers"
-      - "${WORKER_COUNT:-20}"
+    command: ["run", "-stage", "${WORKER_STAGE:-enrich}", "-workers", "${WORKER_CONCURRENCY:-4}"]
     deploy:
       resources:
         limits:
-          memory: ${WORKER_MEMORY:-1g}
+          memory: ${WORKER_MEMORY:-2g}

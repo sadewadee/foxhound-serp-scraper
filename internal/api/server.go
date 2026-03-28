@@ -63,6 +63,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/queries", RequireRole(RoleViewer, s.handleListQueries))
 	s.mux.HandleFunc("POST /api/queries", RequireRole(RoleAdmin, s.handleCreateQueries))
 	s.mux.HandleFunc("DELETE /api/queries", RequireRole(RoleAdmin, s.handleDeleteQueries))
+	s.mux.HandleFunc("POST /api/queries/generate", RequireRole(RoleAdmin, s.handleGenerateQueries))
 	s.mux.HandleFunc("POST /api/queries/retry", RequireRole(RoleAdmin, s.handleRetryQueries))
 	s.mux.HandleFunc("GET /api/queries/stats", RequireRole(RoleViewer, s.handleQueryStats))
 
@@ -184,6 +185,11 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 		args = append(args, email)
 		argIdx++
 	}
+	if provider := q.Get("email_provider"); provider != "" {
+		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM unnest(emails) AS e WHERE e LIKE $%d)", argIdx)
+		args = append(args, "%@"+provider)
+		argIdx++
+	}
 
 	// Count total.
 	var total int
@@ -255,6 +261,19 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	if q.Get("has_email") == "true" {
 		where += " AND array_length(emails, 1) > 0"
 	}
+	if provider := q.Get("email_provider"); provider != "" {
+		// Only allow alphanumeric + dots to prevent SQL injection (no bind params in string-built query).
+		safe := true
+		for _, c := range provider {
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.') {
+				safe = false
+				break
+			}
+		}
+		if safe {
+			where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM unnest(emails) AS e WHERE e LIKE '%%@%s')", provider)
+		}
+	}
 
 	exportQuery := fmt.Sprintf(`
 		SELECT COALESCE(contact_name,''), COALESCE(business_name,''),
@@ -323,13 +342,34 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
 	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
 
-	writeJSON(w, http.StatusOK, map[string]int{
+	// Top email providers.
+	providers := map[string]int{}
+	providerRows, _ := s.db.Query(`
+		SELECT split_part(e, '@', 2) AS provider, COUNT(*) AS cnt
+		FROM enrich_jobs, unnest(emails) AS e
+		WHERE status = 'completed'
+		GROUP BY provider
+		ORDER BY cnt DESC
+		LIMIT 10
+	`)
+	if providerRows != nil {
+		defer providerRows.Close()
+		for providerRows.Next() {
+			var provider string
+			var cnt int
+			providerRows.Scan(&provider, &cnt)
+			providers[provider] = cnt
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
 		"total":          total,
 		"with_email":     withEmail,
 		"unique_domains": uniqueDomains,
 		"unique_emails":  uniqueEmails,
 		"last_hour":      lastHour,
 		"last_24h":       last24h,
+		"providers":      providers,
 	})
 }
 
@@ -548,6 +588,53 @@ func (s *Server) handleQueryStats(w http.ResponseWriter, r *http.Request) {
 	}
 	counts["total"] = total
 	writeJSON(w, http.StatusOK, counts)
+}
+
+func (s *Server) handleGenerateQueries(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Country string `json:"country"` // country name or "all"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Country == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "country is required (name or \"all\")"})
+		return
+	}
+
+	var keywords []string
+	if strings.ToLower(req.Country) == "all" {
+		keywords = query.GenerateAllKeywords()
+	} else {
+		keywords = query.GenerateKeywordsForCountry(req.Country)
+		if keywords == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "country not found"})
+			return
+		}
+	}
+
+	const batchSize = 500
+	totalInserted := 0
+	for i := 0; i < len(keywords); i += batchSize {
+		end := i + batchSize
+		if end > len(keywords) {
+			end = len(keywords)
+		}
+		inserted, err := s.queryRepo.InsertBatch(keywords[i:end])
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		totalInserted += inserted
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"country":    req.Country,
+		"generated":  len(keywords),
+		"inserted":   totalInserted,
+		"duplicates": len(keywords) - totalInserted,
+	})
 }
 
 // ── Pipeline stats ──
