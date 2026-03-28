@@ -275,15 +275,19 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 			}
 
 			// Collect all emails and phones from directory listings.
-			var allEmails, allPhones []string
+			var rawEmails, rawPhones []string
 			for _, l := range listings {
 				if l.Email != "" {
-					allEmails = append(allEmails, l.Email)
+					rawEmails = append(rawEmails, l.Email)
 				}
 				if l.Phone != "" {
-					allPhones = append(allPhones, l.Phone)
+					rawPhones = append(rawPhones, l.Phone)
 				}
 			}
+
+			// Apply post-extraction filters to remove noise.
+			allEmails := internalScraper.FilterEmails(rawEmails)
+			allPhones := internalScraper.FilterPhones(rawPhones)
 
 			socialLinks := buildSocialLinks(nil)
 			socialJSON, _ := json.Marshal(socialLinks)
@@ -313,8 +317,11 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 		// Extract contacts.
 		cd := internalScraper.ExtractContacts([]byte(body))
 
+		// Apply post-extraction filters before any further processing.
+		emails := internalScraper.FilterEmails(cd.Emails)
+		phones := internalScraper.FilterPhones(cd.Phones)
+
 		// Optional MX validation — filter emails that fail MX check.
-		emails := cd.Emails
 		var mxValid *bool
 		if c.cfg.Contact.ValidateMX && len(emails) > 0 {
 			// Validate MX for the first email's domain (representative for the site).
@@ -343,7 +350,7 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 				completed_at = NOW(),
 				updated_at = NOW()
 			WHERE id = $7
-		`, pq.Array(emails), pq.Array(cd.Phones), socialJSON,
+		`, pq.Array(emails), pq.Array(phones), socialJSON,
 			cd.Address, cd.BusinessName, mxValid, enrichJobID)
 		if updateErr != nil {
 			slog.Warn("contact: update enrich_job failed", "url", pageURL, "error", updateErr)
@@ -361,12 +368,12 @@ func (c *ContactStage) worker(ctx context.Context, workerID int) {
 		}
 
 		c.emailsFound.Add(int64(len(emails)))
-		c.phonesFound.Add(int64(len(cd.Phones)))
+		c.phonesFound.Add(int64(len(phones)))
 
 		slog.Debug("contact: page done",
 			"url", pageURL,
 			"emails", len(emails),
-			"phones", len(cd.Phones),
+			"phones", len(phones),
 			"worker", workerID)
 	}
 }
