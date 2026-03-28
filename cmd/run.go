@@ -28,6 +28,7 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		switch stageName {
 		case "serp":
 			cfg.SERP.Workers = workers
+			cfg.SERP.Concurrency = workers
 		case "website":
 			cfg.Website.Workers = workers
 		case "contact":

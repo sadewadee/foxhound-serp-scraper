@@ -58,6 +58,42 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 	return browser, nil
 }
 
+// NewSERPBrowserWithPool creates a Camoufox browser for SERP scraping with a
+// pre-warmed tab pool sized to match the concurrency level. All tab workers
+// share a single browser process — each goroutine acquires a pool slot, fetches,
+// then releases. MaxBrowserRequests is set to 200 to match the lifecycle limit.
+func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetcher, error) {
+	idOpts := []identity.Option{identity.WithBrowser(identity.BrowserFirefox)}
+	if cfg.Proxy.URL != "" {
+		idOpts = append(idOpts, identity.WithCountry("ID"))
+	}
+	profile := identity.Generate(idOpts...)
+
+	headless := "virtual"
+	if !cfg.Fetch.Headless {
+		headless = "false"
+	}
+
+	opts := []fetch.CamoufoxOption{
+		fetch.WithBrowserIdentity(profile),
+		fetch.WithHeadless(headless),
+		fetch.WithBlockImages(cfg.Fetch.BlockImages),
+		fetch.WithBrowserTimeout(60 * time.Second),
+		fetch.WithPersistSession(true),
+		fetch.WithMaxBrowserRequests(200), // PageReuseLimit
+		fetch.WithPoolSize(poolSize),      // N tabs
+	}
+	if cfg.Proxy.URL != "" {
+		opts = append(opts, fetch.WithBrowserProxy(cfg.Proxy.URL))
+	}
+
+	browser, err := fetch.NewCamoufox(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("fetcher: creating serp browser with pool: %w", err)
+	}
+	return browser, nil
+}
+
 // NewBrowser creates a Camoufox browser for website scraping fallback.
 // poolSize controls concurrent tabs (0 = create/destroy context per request).
 // For shared use by multiple goroutines, set poolSize >= number of goroutines.

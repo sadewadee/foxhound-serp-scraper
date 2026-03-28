@@ -5,6 +5,7 @@ package stage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -24,31 +25,45 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
-// SERPStage runs Stage 2: SERP discovery workers.
+// SERPStage runs Stage 2: SERP discovery with a shared browser pool.
+// One browser process hosts N tabs (pool). N goroutines pop jobs from
+// a Redis sorted-set queue, each acquiring a tab independently. A query
+// feeder goroutine converts pending queries into per-page serp_jobs and
+// pushes them to the queue. A reconciler resets stuck jobs every 60 s.
 type SERPStage struct {
 	cfg       *config.Config
 	db        *sql.DB
+	redis     *redis.Client
 	dedup     *dedup.Store
 	queryRepo *query.Repository
 	timing    *behavior.Timing
+	lifecycle *scraper.BrowserLifecycle
+
+	// Shared browser — protected by mutex for rotation.
+	browser   *fetch.CamoufoxFetcher
+	browserMu sync.Mutex
 
 	// Metrics.
 	queriesProcessed atomic.Int64
 	urlsFound        atomic.Int64
+	pagesProcessed   atomic.Int64
 }
 
 // NewSERPStage creates a new SERP discovery stage.
 func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPStage {
-	return &SERPStage{
+	s := &SERPStage{
 		cfg:       cfg,
 		db:        database,
+		redis:     dd.Client(),
 		dedup:     dd,
 		queryRepo: query.NewRepository(database),
 		timing:    behavior.NewTiming(behavior.CarefulProfile().Timing),
 	}
+	s.lifecycle = scraper.NewBrowserLifecycle(cfg, scraper.NewSERPBrowser, "serp")
+	return s
 }
 
-// Run starts SERP discovery workers. Blocks until ctx is cancelled or work is done.
+// Run starts SERP discovery. Blocks until ctx is cancelled.
 func (s *SERPStage) Run(ctx context.Context) error {
 	// Requeue any queries stuck in 'processing' from previous run.
 	if n, err := s.queryRepo.RequeueProcessing(); err != nil {
@@ -56,61 +71,73 @@ func (s *SERPStage) Run(ctx context.Context) error {
 	} else if n > 0 {
 		slog.Info("serp: requeued processing queries", "count", n)
 	}
+	s.requeueStuckJobs()
 
-	numWorkers := s.cfg.SERP.Workers
-	slog.Info("serp: starting workers", "count", numWorkers)
+	concurrency := s.cfg.SERP.Concurrency
+	browser, err := scraper.NewSERPBrowserWithPool(s.cfg, concurrency)
+	if err != nil {
+		return fmt.Errorf("serp: browser init failed: %w", err)
+	}
+	s.browserMu.Lock()
+	s.browser = browser
+	s.browserMu.Unlock()
 
+	defer func() {
+		s.browserMu.Lock()
+		if s.browser != nil {
+			s.browser.Close()
+		}
+		s.browserMu.Unlock()
+	}()
+
+	slog.Info("serp: starting", "concurrency", concurrency)
+
+	// Start reconciler.
+	go s.reconciler(ctx)
+
+	// Start query feeder — watches for pending queries and generates serp_jobs.
+	go s.queryFeeder(ctx)
+
+	// Start N concurrent tab workers.
 	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
+	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(tabID int) {
 			defer wg.Done()
-			s.worker(ctx, workerID)
-		}(w)
+			s.tabWorker(ctx, tabID)
+		}(i)
 	}
 
 	wg.Wait()
-	slog.Info("serp: all workers done",
+	slog.Info("serp: all tab workers done",
 		"queries", s.queriesProcessed.Load(),
-		"urls", s.urlsFound.Load())
+		"urls", s.urlsFound.Load(),
+		"pages", s.pagesProcessed.Load())
 	return nil
 }
 
-func (s *SERPStage) worker(ctx context.Context, workerID int) {
-	workerIDStr := fmt.Sprintf("serp-worker-%d", workerID)
-	slog.Info("serp: worker starting", "worker", workerID)
-
-	// Each worker gets its own browser instance with persistent session + page pooling.
-	browser, err := scraper.NewSERPBrowser(s.cfg)
-	if err != nil {
-		slog.Error("serp: worker browser init failed", "worker", workerID, "error", err)
-		return
-	}
-	defer func() {
-		if browser != nil {
-			browser.Close()
-		}
-	}()
-
-	// Each worker tracks its own browser lifecycle independently — each has its
-	// own browser process so counters must not be shared across workers.
-	lifecycle := scraper.NewBrowserLifecycle(s.cfg, scraper.NewSERPBrowser, fmt.Sprintf("serp-worker-%d", workerID))
-
+// queryFeeder watches for pending queries, generates per-page serp_jobs, and
+// pushes each job onto the Redis sorted-set queue for tab workers to consume.
+func (s *SERPStage) queryFeeder(ctx context.Context) {
 	for {
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return
+		default:
 		}
 
-		// Get next pending query from PG (atomic claim).
 		q, err := s.queryRepo.MarkProcessing()
 		if err != nil {
-			slog.Error("serp: mark processing failed", "worker", workerID, "error", err)
-			time.Sleep(5 * time.Second)
-			continue
+			slog.Error("serp: mark processing failed", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
 		}
 		if q == nil {
-			// No more pending queries — check periodically.
-			slog.Debug("serp: no pending queries, waiting", "worker", workerID)
+			// No pending queries — wait before polling again.
 			select {
 			case <-ctx.Done():
 				return
@@ -119,139 +146,140 @@ func (s *SERPStage) worker(ctx context.Context, workerID int) {
 			}
 		}
 
-		slog.Info("serp: processing query", "worker", workerID, "query", q.Text, "id", q.ID)
-		resultCount := s.processQuery(ctx, &browser, q, workerIDStr, lifecycle)
+		slog.Info("serp: generating jobs for query", "query", q.Text, "id", q.ID)
 
-		status := "completed"
-		errMsg := ""
-		if err := s.queryRepo.UpdateStatus(q.ID, status, resultCount, errMsg); err != nil {
-			slog.Error("serp: update status failed", "error", err)
-		}
+		for page := 0; page < s.cfg.SERP.PagesPerQuery; page++ {
+			jobID := fmt.Sprintf("serp-%d-p%d", q.ID, page)
+			serpURL := scraper.BuildSERPURL(q.Text, page, s.cfg.SERP.ResultsPerPage)
 
-		s.queriesProcessed.Add(1)
+			s.db.Exec(`
+				INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, status)
+				VALUES ($1, $2, $3, $4, 'new')
+				ON CONFLICT (id) DO NOTHING
+			`, jobID, q.ID, serpURL, page)
 
-		// Delay between queries.
-		delay := s.timing.SearchDelay()
-		slog.Debug("serp: delay between queries", "delay", delay, "worker", workerID)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(delay):
+			s.pushSerpJob(ctx, jobID, serpURL, q.ID, page)
 		}
 	}
 }
 
-func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.CamoufoxFetcher, q *db.Query, workerID string, lifecycle *scraper.BrowserLifecycle) int {
-	totalURLs := 0
-	queueKey := "serp:queue:websites"
-
-	// Step 1: Generate all serp_jobs upfront for pages 0 to PagesPerQuery-1.
-	for pageNum := 0; pageNum < s.cfg.SERP.PagesPerQuery; pageNum++ {
-		serpURL := scraper.BuildSERPURL(q.Text, pageNum, s.cfg.SERP.ResultsPerPage)
-		jobID := fmt.Sprintf("serp-%d-p%d", q.ID, pageNum)
-
-		_, err := s.db.Exec(`
-			INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, status)
-			VALUES ($1, $2, $3, $4, 'new')
-			ON CONFLICT (id) DO NOTHING
-		`, jobID, q.ID, serpURL, pageNum)
-		if err != nil {
-			slog.Error("serp: insert serp_job failed", "job", jobID, "error", err)
-		}
+// pushSerpJob enqueues a serp_job onto the Redis sorted-set queue.
+// Score is the current time in microseconds — FIFO within the queue.
+func (s *SERPStage) pushSerpJob(ctx context.Context, jobID, serpURL string, queryID int64, pageNum int) {
+	data := fmt.Sprintf(`{"id":"%s","url":"%s","query_id":%d,"page_num":%d}`,
+		jobID, serpURL, queryID, pageNum)
+	score := float64(time.Now().UnixMicro())
+	if err := s.redis.ZAdd(ctx, "serp:queue:serp", redis.Z{Score: score, Member: data}).Err(); err != nil {
+		slog.Warn("serp: push to queue failed", "job", jobID, "error", err)
 	}
+}
 
-	// Step 2: Process serp_jobs with retry loop.
+// tabWorker is one of N goroutines that pops jobs from the Redis queue and
+// fetches SERP pages. All workers share the single pooled browser.
+func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
+	workerID := fmt.Sprintf("serp-tab-%d", tabID)
+	slog.Info("serp: tab worker starting", "tab", tabID)
+
 	for {
-		if ctx.Err() != nil {
-			break
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
 
-		// Atomically claim the next unprocessed job for this query.
-		var job db.SERPJob
-		err := s.db.QueryRow(`
-			UPDATE serp_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
-			WHERE id = (
-				SELECT id FROM serp_jobs
-				WHERE parent_job_id = $2 AND status = 'new'
-				ORDER BY page_num ASC
-				LIMIT 1
-				FOR UPDATE SKIP LOCKED
-			)
-			RETURNING id, search_url, page_num, attempt_count, max_attempts
-		`, workerID, q.ID).Scan(&job.ID, &job.SearchURL, &job.PageNum, &job.AttemptCount, &job.MaxAttempts)
-		if err == sql.ErrNoRows {
-			break // All jobs for this query are done (completed, failed, or still processing).
+		// Pop the highest-priority (lowest score = oldest) job from the queue.
+		results, err := s.redis.ZPopMin(ctx, "serp:queue:serp", 1).Result()
+		if err != nil || len(results) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+				continue
+			}
 		}
+
+		// Parse job payload.
+		var job struct {
+			ID      string `json:"id"`
+			URL     string `json:"url"`
+			QueryID int64  `json:"query_id"`
+			PageNum int    `json:"page_num"`
+		}
+		if err := json.Unmarshal([]byte(results[0].Member.(string)), &job); err != nil {
+			slog.Warn("serp: invalid job in queue", "raw", results[0].Member, "error", err)
+			continue
+		}
+
+		// Load attempt metadata from DB.
+		var attemptCount, maxAttempts int
+		err = s.db.QueryRow(`
+			SELECT attempt_count, max_attempts FROM serp_jobs WHERE id = $1
+		`, job.ID).Scan(&attemptCount, &maxAttempts)
 		if err != nil {
-			slog.Error("serp: query serp_jobs failed", "query_id", q.ID, "error", err)
-			break
+			slog.Warn("serp: job not found in DB", "job", job.ID)
+			continue
 		}
 
-		browser := *browserPtr
+		// Lock the job so the reconciler skips it.
+		s.db.Exec(`
+			UPDATE serp_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
+			WHERE id = $2
+		`, workerID, job.ID)
 
-		// Fetch SERP.
-		slog.Debug("serp: fetching page", "query", q.Text, "page", job.PageNum, "url", job.SearchURL)
-		body, fetchErr := scraper.FetchSERP(ctx, browser, job.SearchURL, job.ID)
+		// Snapshot the browser reference under lock.
+		s.browserMu.Lock()
+		browser := s.browser
+		s.browserMu.Unlock()
 
-		// Check for captcha even on successful fetch.
+		if browser == nil {
+			slog.Warn("serp: browser is nil, re-queuing job", "tab", tabID, "job", job.ID)
+			s.pushSerpJob(ctx, job.ID, job.URL, job.QueryID, job.PageNum)
+			s.db.Exec(`UPDATE serp_jobs SET status = 'new', locked_by = NULL, updated_at = NOW() WHERE id = $1`, job.ID)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Fetch SERP page.
+		body, fetchErr := scraper.FetchSERP(ctx, browser, job.URL, job.ID)
+
+		// Treat captcha pages as a fetch error.
 		if fetchErr == nil && scraper.IsCaptchaPage(body) {
 			fetchErr = fmt.Errorf("captcha detected")
 		}
 
 		if fetchErr != nil {
-			newAttempt := job.AttemptCount + 1
-			slog.Warn("serp: fetch failed", "job", job.ID, "attempt", newAttempt, "error", fetchErr)
+			newAttempt := attemptCount + 1
+			slog.Warn("serp: fetch failed", "job", job.ID, "attempt", newAttempt, "tab", tabID, "error", fetchErr)
 
-			if newAttempt >= job.MaxAttempts {
+			if newAttempt >= maxAttempts {
 				s.db.Exec(`
 					UPDATE serp_jobs SET status = 'failed', attempt_count = $1, error_msg = $2, updated_at = NOW()
 					WHERE id = $3
 				`, newAttempt, fetchErr.Error(), job.ID)
 			} else {
-				// Backoff: 30s, 60s, 120s, ...
-				backoffSeconds := 30 * (1 << (newAttempt - 1))
+				backoffSec := 30 * (1 << (newAttempt - 1)) // 30 s, 60 s, 120 s, …
 				s.db.Exec(`
 					UPDATE serp_jobs SET status = 'new', attempt_count = $1,
 						next_attempt_at = NOW() + interval '1 second' * $2,
 						error_msg = $3, updated_at = NOW()
 					WHERE id = $4
-				`, newAttempt, backoffSeconds, fetchErr.Error(), job.ID)
-
-				// Restart browser for fresh fingerprint on captcha/block.
-				// Use lifecycle.Restart so temp dirs are cleaned and orphan
-				// processes are reaped (counts as a lifecycle-triggered restart).
-				slog.Warn("serp: captcha/block detected, restarting browser", "job", job.ID, "attempt", newAttempt)
-				newBrowser, restartErr := lifecycle.Restart(*browserPtr)
-				if restartErr != nil {
-					slog.Error("serp: browser restart failed", "error", restartErr)
-					*browserPtr = nil
-					return totalURLs
-				}
-				*browserPtr = newBrowser
-
-				// Wait for backoff.
-				backoff := time.Duration(backoffSeconds) * time.Second
-				select {
-				case <-ctx.Done():
-					return totalURLs
-				case <-time.After(backoff):
-				}
+				`, newAttempt, backoffSec, fetchErr.Error(), job.ID)
+				// Re-queue after the backoff window so the reconciler picks it up,
+				// but also schedule it here to avoid relying solely on the reconciler.
+				go func(id, url string, qID int64, pNum, delay int) {
+					time.Sleep(time.Duration(delay) * time.Second)
+					s.pushSerpJob(ctx, id, url, qID, pNum)
+				}(job.ID, job.URL, job.QueryID, job.PageNum, backoffSec)
 			}
-			// Count this fetch attempt for lifecycle tracking.
-			if lifecycle.IncrementAndCheck() {
-				slog.Info("serp: page reuse limit reached, restarting browser", "worker", workerID)
-				newBrowser, restartErr := lifecycle.Restart(*browserPtr)
-				if restartErr != nil {
-					slog.Error("serp: lifecycle restart failed", "error", restartErr)
-					*browserPtr = nil
-					return totalURLs
-				}
-				*browserPtr = newBrowser
+
+			// Rotate browser after captcha/block regardless of lifecycle counter.
+			if s.lifecycle.IncrementAndCheck() {
+				s.restartBrowser()
 			}
 			continue
 		}
 
-		// Parse results.
+		// Parse SERP results.
 		urls, parseErr := scraper.ParseSERPResults(body)
 		if parseErr != nil {
 			slog.Warn("serp: parse failed", "job", job.ID, "error", parseErr)
@@ -262,75 +290,176 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 			continue
 		}
 
-		// Insert websites (no URL dedup — every unique URL must be enriched).
+		// Insert websites and push to website queue.
 		inserted := 0
 		for _, u := range urls {
 			urlHash := dedup.HashURL(u)
-
 			domain := dedup.ExtractDomain(u)
 			if domain == "" {
 				continue
 			}
-
-			// Insert website — source_serp_id is now TEXT (serp_jobs.id).
 			_, insertErr := s.db.Exec(`
 				INSERT INTO websites (domain, url, url_hash, source_query_id, source_serp_id, page_type, status)
 				VALUES ($1, $2, $3, $4, $5, 'serp_result', 'pending')
 				ON CONFLICT (url_hash) DO NOTHING
-			`, domain, u, urlHash, q.ID, job.ID)
+			`, domain, u, urlHash, job.QueryID, job.ID)
 			if insertErr != nil {
 				slog.Warn("serp: insert website failed", "url", u, "error", insertErr)
 				continue
 			}
-
-			// Push to Redis queue for website stage.
-			if err := pushToQueue(ctx, s.dedup.Client(), queueKey, u, q.ID, job.ID); err != nil {
-				slog.Warn("serp: push to queue failed", "url", u, "error", err)
+			if err := pushToQueue(ctx, s.redis, "serp:queue:websites", u, job.QueryID, job.ID); err != nil {
+				slog.Warn("serp: push website to queue failed", "url", u, "error", err)
 			}
-
 			inserted++
 		}
 
-		totalURLs += inserted
 		s.urlsFound.Add(int64(inserted))
+		s.pagesProcessed.Add(1)
 
-		// Mark completed.
 		s.db.Exec(`
 			UPDATE serp_jobs SET status = 'completed', result_count = $1, updated_at = NOW()
 			WHERE id = $2
 		`, len(urls), job.ID)
 
-		slog.Info("serp: page done",
-			"query", q.Text, "page", job.PageNum,
-			"found", len(urls), "new", inserted)
+		slog.Info("serp: page done", "job", job.ID, "found", len(urls), "new", inserted, "tab", tabID)
 
-		// Count this successful fetch for lifecycle tracking.
-		if lifecycle.IncrementAndCheck() {
-			slog.Info("serp: page reuse limit reached, restarting browser", "worker", workerID)
-			newBrowser, restartErr := lifecycle.Restart(*browserPtr)
-			if restartErr != nil {
-				slog.Error("serp: lifecycle restart failed", "error", restartErr)
-				*browserPtr = nil
-				return totalURLs
-			}
-			*browserPtr = newBrowser
+		// Check lifecycle — rotate browser when page-reuse limit is reached.
+		if s.lifecycle.IncrementAndCheck() {
+			slog.Info("serp: page reuse limit reached, rotating browser", "tab", tabID)
+			s.restartBrowser()
 		}
 
-		// Delay between pages.
-		if job.PageNum < s.cfg.SERP.PagesPerQuery-1 {
-			delay := s.timing.PaginationDelay()
-			select {
-			case <-ctx.Done():
-				return totalURLs
-			case <-time.After(delay):
-			}
+		// Small inter-page delay to avoid hammering Google from the same browser.
+		delay := s.timing.PaginationDelay()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
 		}
 	}
-
-	return totalURLs
 }
 
-// pushToQueue pushes a URL job to a Redis sorted set queue.
+// restartBrowser performs a thread-safe browser rotation. While the new browser
+// is being created, s.browser is set to nil so tab workers re-queue their jobs
+// rather than fetching with a dead browser.
+func (s *SERPStage) restartBrowser() {
+	s.browserMu.Lock()
+	defer s.browserMu.Unlock()
+
+	old := s.browser
+	s.browser = nil // tabs will detect nil and wait
+
+	newBrowser, err := s.lifecycle.Restart(old)
+	if err != nil {
+		slog.Error("serp: browser restart failed, attempting fresh create", "error", err)
+		newBrowser, err = scraper.NewSERPBrowserWithPool(s.cfg, s.cfg.SERP.Concurrency)
+		if err != nil {
+			slog.Error("serp: fresh browser create failed", "error", err)
+			return
+		}
+	}
+	s.browser = newBrowser
+	slog.Info("serp: browser rotated successfully")
+}
+
+// reconciler runs every 60 s to:
+//  1. Reset stuck processing jobs (locked >5 min) and re-queue them.
+//  2. Re-queue new jobs whose next_attempt_at has elapsed.
+//  3. Mark queries completed when all their serp_jobs are done.
+func (s *SERPStage) reconciler(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		// 1. Reset stuck processing jobs (>5 min without progress).
+		res, err := s.db.Exec(`
+			UPDATE serp_jobs SET status = 'new', locked_by = NULL, locked_at = NULL, updated_at = NOW()
+			WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
+		`)
+		if err == nil {
+			if n, _ := res.RowsAffected(); n > 0 {
+				slog.Info("serp: reconciler reset stuck jobs", "count", n)
+				// Re-queue the jobs that were just unblocked.
+				rows, _ := s.db.Query(`
+					SELECT id, search_url, parent_job_id, page_num FROM serp_jobs
+					WHERE status = 'new' AND locked_by IS NULL
+					  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+					LIMIT 100
+				`)
+				if rows != nil {
+					for rows.Next() {
+						var id, url string
+						var queryID int64
+						var pageNum int
+						if err := rows.Scan(&id, &url, &queryID, &pageNum); err == nil {
+							s.pushSerpJob(ctx, id, url, queryID, pageNum)
+						}
+					}
+					rows.Close()
+				}
+			}
+		}
+
+		// 2. Re-queue new retry-eligible jobs.
+		retryRows, _ := s.db.Query(`
+			SELECT id, search_url, parent_job_id, page_num FROM serp_jobs
+			WHERE status = 'new' AND attempt_count > 0
+			  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+			LIMIT 100
+		`)
+		if retryRows != nil {
+			requeued := 0
+			for retryRows.Next() {
+				var id, url string
+				var queryID int64
+				var pageNum int
+				if err := retryRows.Scan(&id, &url, &queryID, &pageNum); err == nil {
+					s.pushSerpJob(ctx, id, url, queryID, pageNum)
+					requeued++
+				}
+			}
+			retryRows.Close()
+			if requeued > 0 {
+				slog.Info("serp: reconciler re-queued retry jobs", "count", requeued)
+			}
+		}
+
+		// 3. Mark queries completed when all their serp_jobs are done.
+		s.db.Exec(`
+			UPDATE queries SET status = 'completed', updated_at = NOW()
+			WHERE status = 'processing'
+			AND NOT EXISTS (
+				SELECT 1 FROM serp_jobs
+				WHERE parent_job_id = queries.id
+				  AND status IN ('new', 'processing')
+			)
+		`)
+	}
+}
+
+// requeueStuckJobs is called at startup to reset any jobs left in 'processing'
+// state by the previous process run.
+func (s *SERPStage) requeueStuckJobs() {
+	res, err := s.db.Exec(`
+		UPDATE serp_jobs SET status = 'new', locked_by = NULL, locked_at = NULL, updated_at = NOW()
+		WHERE status = 'processing'
+	`)
+	if err != nil {
+		slog.Warn("serp: requeueStuckJobs failed", "error", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		slog.Info("serp: requeued stuck serp_jobs from previous run", "count", n)
+	}
+}
+
+// pushToQueue pushes a URL job to a Redis sorted set queue used by website/enrich workers.
 func pushToQueue(ctx context.Context, client *redis.Client, queueKey, urlStr string, queryID int64, serpID string) error {
 	job := &foxhound.Job{
 		ID:        fmt.Sprintf("web-%d-%s", queryID, dedup.HashURL(urlStr)[:8]),
@@ -365,3 +494,11 @@ func (s *SERPStage) QueriesProcessed() int64 {
 func (s *SERPStage) URLsFound() int64 {
 	return s.urlsFound.Load()
 }
+
+// PagesProcessed returns the count of SERP pages fetched.
+func (s *SERPStage) PagesProcessed() int64 {
+	return s.pagesProcessed.Load()
+}
+
+// Ensure db import is used (models.go SERPJob type is referenced indirectly via DB queries).
+var _ = db.SERPJob{}

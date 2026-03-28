@@ -61,11 +61,12 @@ type RedisConfig struct {
 }
 
 type SERPConfig struct {
-	PagesPerQuery        int `yaml:"pages_per_query"`
-	ResultsPerPage       int `yaml:"results_per_page"`
-	DelayBetweenPagesMs  int `yaml:"delay_between_pages_ms"`
+	PagesPerQuery         int `yaml:"pages_per_query"`
+	ResultsPerPage        int `yaml:"results_per_page"`
+	DelayBetweenPagesMs   int `yaml:"delay_between_pages_ms"`
 	DelayBetweenQueriesMs int `yaml:"delay_between_queries_ms"`
-	Workers              int `yaml:"workers"`
+	Workers               int `yaml:"workers"`      // kept for backward compat but now means concurrency
+	Concurrency           int `yaml:"concurrency"`  // number of tabs (goroutines)
 }
 
 type WebsiteConfig struct {
@@ -223,6 +224,13 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.SERP.Workers == 0 {
 		cfg.SERP.Workers = 2
+	}
+	if cfg.SERP.Concurrency == 0 {
+		if cfg.SERP.Workers > 0 {
+			cfg.SERP.Concurrency = cfg.SERP.Workers // backward compat
+		} else {
+			cfg.SERP.Concurrency = 4
+		}
 	}
 	if cfg.Website.Workers == 0 {
 		cfg.Website.Workers = 5
