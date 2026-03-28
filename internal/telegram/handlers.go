@@ -55,11 +55,11 @@ func (b *Bot) handleStart(msg *Message) {
 Available commands:
 
 /scrape <keywords> — Submit keywords (one per line)
-/generate <country> — Generate wellness/fitness keywords (or "all")
-/status — Pipeline stats (queues, dedup)
+/generate <country> — Generate wellness keywords ("all" for global)
+/status — Full dashboard (queries, SERP, enrich, emails, providers)
 /queries — Query status breakdown
-/contacts — Contact stats
-/export — Export contacts as CSV
+/contacts — Contact stats + top email providers
+/export — Export contacts as CSV file
 /retry — Retry failed queries
 /reset — Reset dedup sets`
 
@@ -151,34 +151,82 @@ func (b *Bot) handleGenerate(msg *Message, args string) {
 }
 
 func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
-	// Table counts.
-	tables := []struct{ label, table string }{
-		{"Queries", "queries"},
-		{"SERP Jobs", "serp_jobs"},
-		{"Websites", "websites"},
-		{"Enrich Jobs", "enrich_jobs"},
-	}
-	lines := []string{"*Pipeline Status*", ""}
-	for _, t := range tables {
-		var count int
-		b.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", t.table)).Scan(&count)
-		lines = append(lines, fmt.Sprintf("%s: *%d*", t.label, count))
+	lines := []string{"*Dashboard*"}
+
+	// ── Queries ──
+	var qTotal, qPending, qProcessing, qCompleted, qError int
+	b.db.QueryRow(`SELECT COUNT(*) FROM queries`).Scan(&qTotal)
+	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'pending'`).Scan(&qPending)
+	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'processing'`).Scan(&qProcessing)
+	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'completed'`).Scan(&qCompleted)
+	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'error'`).Scan(&qError)
+	lines = append(lines, "",
+		"_Queries:_",
+		fmt.Sprintf("  Total: *%d*  Pending: %d", qTotal, qPending),
+		fmt.Sprintf("  Processing: %d  Done: %d  Error: %d", qProcessing, qCompleted, qError))
+
+	// ── SERP ──
+	var serpTotal, serpPending, serpCompleted, serpFailed, serpURLs int
+	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs`).Scan(&serpTotal)
+	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'new'`).Scan(&serpPending)
+	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpCompleted)
+	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'failed'`).Scan(&serpFailed)
+	b.db.QueryRow(`SELECT COALESCE(SUM(result_count), 0) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpURLs)
+	lines = append(lines, "",
+		"_SERP:_",
+		fmt.Sprintf("  Pages: *%d*  Pending: %d  Done: %d  Failed: %d", serpTotal, serpPending, serpCompleted, serpFailed),
+		fmt.Sprintf("  URLs found: *%d*", serpURLs))
+
+	// ── Enrich ──
+	var enTotal, enPending, enCompleted, enFailed, enDead int
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs`).Scan(&enTotal)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'pending'`).Scan(&enPending)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'`).Scan(&enCompleted)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'failed'`).Scan(&enFailed)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'dead'`).Scan(&enDead)
+	lines = append(lines, "",
+		"_Enrich:_",
+		fmt.Sprintf("  Total: *%d*  Pending: %d  Done: %d", enTotal, enPending, enCompleted),
+		fmt.Sprintf("  Failed: %d  Dead: %d", enFailed, enDead))
+
+	// ── Contacts ──
+	var uniqueEmails, emailsToday, emailsHour, uniqueDomains int
+	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&uniqueEmails)
+	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
+	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsHour)
+	b.db.QueryRow(`SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'`).Scan(&uniqueDomains)
+	lines = append(lines, "",
+		"_Contacts:_",
+		fmt.Sprintf("  Unique emails: *%d*", uniqueEmails),
+		fmt.Sprintf("  Today: %d  /hour: %d", emailsToday, emailsHour),
+		fmt.Sprintf("  Domains: %d", uniqueDomains))
+
+	// ── Top providers ──
+	providerRows, _ := b.db.Query(`
+		SELECT split_part(e, '@', 2), COUNT(*)
+		FROM enrich_jobs, unnest(emails) AS e
+		WHERE status = 'completed'
+		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+	`)
+	if providerRows != nil {
+		lines = append(lines, "", "_Top providers:_")
+		for providerRows.Next() {
+			var p string
+			var c int
+			providerRows.Scan(&p, &c)
+			lines = append(lines, fmt.Sprintf("  %s: %d", p, c))
+		}
+		providerRows.Close()
 	}
 
-	// Queue depths.
-	lines = append(lines, "", "_Queues:_")
-	for _, q := range []string{"serp:queue:websites", "serp:queue:enrich"} {
-		depth, _ := b.redis.ZCard(ctx, q).Result()
-		short := q[len("serp:queue:"):]
-		lines = append(lines, fmt.Sprintf("  %s: %d", short, depth))
-	}
-
-	// Dedup sizes.
-	lines = append(lines, "", "_Dedup:_")
-	for _, d := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
-		size, _ := b.redis.SCard(ctx, d).Result()
-		short := d[len("serp:dedup:"):]
-		lines = append(lines, fmt.Sprintf("  %s: %d", short, size))
+	// ── Queues ──
+	var qWeb, qEnrich int64
+	qWeb, _ = b.redis.ZCard(ctx, "serp:queue:websites").Result()
+	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
+	if qWeb > 0 || qEnrich > 0 {
+		lines = append(lines, "",
+			"_Queues:_",
+			fmt.Sprintf("  websites: %d  enrich: %d", qWeb, qEnrich))
 	}
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
