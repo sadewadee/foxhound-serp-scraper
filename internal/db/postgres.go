@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "github.com/lib/pq"
 
@@ -23,6 +24,8 @@ func Open(cfg *config.Config) (*sql.DB, error) {
 
 	db.SetMaxOpenConns(cfg.Postgres.MaxOpenConns)
 	db.SetMaxIdleConns(cfg.Postgres.MaxIdleConns)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(1 * time.Minute)
 
 	if err := db.Ping(); err != nil {
 		db.Close()

@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS enrich_jobs (
 CREATE INDEX IF NOT EXISTS idx_enrich_claim ON enrich_jobs(status, next_attempt_at, created_at) WHERE status IN ('pending', 'failed');
 CREATE INDEX IF NOT EXISTS idx_enrich_domain ON enrich_jobs(domain);
 CREATE INDEX IF NOT EXISTS idx_enrich_parent ON enrich_jobs(parent_job_id);
+CREATE INDEX IF NOT EXISTS idx_enrich_status_domain ON enrich_jobs(status, domain);
+CREATE INDEX IF NOT EXISTS idx_enrich_completed_at ON enrich_jobs(completed_at) WHERE status = 'completed';
+CREATE INDEX IF NOT EXISTS idx_serp_jobs_updated_at ON serp_jobs(updated_at) WHERE status = 'completed';
 
 CREATE TABLE IF NOT EXISTS pipeline_state (
     key        TEXT PRIMARY KEY,

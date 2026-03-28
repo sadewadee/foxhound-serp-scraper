@@ -13,6 +13,12 @@ import (
 )
 
 func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
+	// Access control: if allowedChatIDs is configured, reject unauthorized users.
+	if len(b.allowedChatIDs) > 0 && !b.allowedChatIDs[msg.Chat.ID] {
+		b.sendMessage(msg.Chat.ID, "Unauthorized. Your chat ID: "+fmt.Sprintf("%d", msg.Chat.ID))
+		return
+	}
+
 	text := strings.TrimSpace(msg.Text)
 
 	// Extract command and args.
@@ -153,56 +159,73 @@ func (b *Bot) handleGenerate(msg *Message, args string) {
 func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 	lines := []string{"*Dashboard*"}
 
-	// ── Queries ──
+	// ── Queries ── (single query)
 	var qTotal, qPending, qProcessing, qCompleted, qError int
-	b.db.QueryRow(`SELECT COUNT(*) FROM queries`).Scan(&qTotal)
-	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'pending'`).Scan(&qPending)
-	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'processing'`).Scan(&qProcessing)
-	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'completed'`).Scan(&qCompleted)
-	b.db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'error'`).Scan(&qError)
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'pending'),
+			COUNT(*) FILTER (WHERE status = 'processing'),
+			COUNT(*) FILTER (WHERE status = 'completed'),
+			COUNT(*) FILTER (WHERE status = 'error')
+		FROM queries
+	`).Scan(&qTotal, &qPending, &qProcessing, &qCompleted, &qError)
 	lines = append(lines, "",
 		"_Queries:_",
 		fmt.Sprintf("  Total: *%d*  Pending: %d", qTotal, qPending),
 		fmt.Sprintf("  Processing: %d  Done: %d  Error: %d", qProcessing, qCompleted, qError))
 
-	// ── SERP ──
+	// ── SERP ── (single query)
 	var serpTotal, serpPending, serpCompleted, serpFailed, serpURLs int
 	var serpHour, serpToday int
-	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs`).Scan(&serpTotal)
-	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'new'`).Scan(&serpPending)
-	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpCompleted)
-	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'failed'`).Scan(&serpFailed)
-	b.db.QueryRow(`SELECT COALESCE(SUM(result_count), 0) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpURLs)
-	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'`).Scan(&serpHour)
-	b.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours'`).Scan(&serpToday)
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'new'),
+			COUNT(*) FILTER (WHERE status = 'completed'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COALESCE(SUM(result_count) FILTER (WHERE status = 'completed'), 0),
+			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
+			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours')
+		FROM serp_jobs
+	`).Scan(&serpTotal, &serpPending, &serpCompleted, &serpFailed, &serpURLs, &serpHour, &serpToday)
 	lines = append(lines, "",
 		"_SERP:_",
 		fmt.Sprintf("  Pages: *%d*  Pending: %d  Done: %d  Failed: %d", serpTotal, serpPending, serpCompleted, serpFailed),
 		fmt.Sprintf("  URLs found: *%d*", serpURLs),
 		fmt.Sprintf("  Rate: %d/hour  Today: %d", serpHour, serpToday))
 
-	// ── Enrich ──
+	// ── Enrich ── (single query)
 	var enTotal, enPending, enCompleted, enFailed, enDead int
 	var enHour, enToday int
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs`).Scan(&enTotal)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'pending'`).Scan(&enPending)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'`).Scan(&enCompleted)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'failed'`).Scan(&enFailed)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'dead'`).Scan(&enDead)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&enHour)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&enToday)
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'pending'),
+			COUNT(*) FILTER (WHERE status = 'completed'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE status = 'dead'),
+			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
+		FROM enrich_jobs
+	`).Scan(&enTotal, &enPending, &enCompleted, &enFailed, &enDead, &enHour, &enToday)
 	lines = append(lines, "",
 		"_Enrich:_",
 		fmt.Sprintf("  Total: *%d*  Pending: %d  Done: %d", enTotal, enPending, enCompleted),
 		fmt.Sprintf("  Failed: %d  Dead: %d", enFailed, enDead),
 		fmt.Sprintf("  Rate: %d/hour  Today: %d", enHour, enToday))
 
-	// ── Contacts ──
+	// ── Contacts ── (single query)
 	var uniqueEmails, emailsToday, emailsHour, uniqueDomains int
-	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&uniqueEmails)
-	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
-	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsHour)
-	b.db.QueryRow(`SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'`).Scan(&uniqueDomains)
+	b.db.QueryRow(`
+		SELECT
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+			COUNT(DISTINCT domain)
+		FROM enrich_jobs
+		WHERE status = 'completed'
+	`).Scan(&uniqueEmails, &emailsToday, &emailsHour, &uniqueDomains)
 	lines = append(lines, "",
 		"_Contacts:_",
 		fmt.Sprintf("  Unique emails: *%d*", uniqueEmails),
@@ -309,7 +332,7 @@ func (b *Bot) handleExport(msg *Message) {
 		SELECT emails, phones, domain, url, social_links, address
 		FROM enrich_jobs
 		WHERE status = 'completed' AND array_length(emails, 1) > 0
-		ORDER BY id ASC
+		ORDER BY id ASC LIMIT 50000
 	`)
 	if err != nil {
 		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
@@ -341,7 +364,11 @@ func (b *Bot) handleExport(msg *Message) {
 
 	filename := fmt.Sprintf("contacts_%s.csv", time.Now().Format("2006-01-02"))
 	b.sendDocument(msg.Chat.ID, filename, []byte(buf.String()))
-	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Exported *%d* contacts.", count))
+	if count >= 50000 {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Exported *%d* contacts (truncated at 50K). Use API for full export.", count))
+	} else {
+		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Exported *%d* contacts.", count))
+	}
 }
 
 func (b *Bot) handleRetry(msg *Message) {

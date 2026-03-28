@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -52,7 +53,8 @@ type AuthConfig struct {
 func NewAuth(cfg AuthConfig) *Auth {
 	secret := cfg.Secret
 	if secret == "" {
-		secret = "serp-scraper-default-secret-change-me"
+		slog.Error("auth: API_SECRET is not set — tokens will not be secure")
+		secret = fmt.Sprintf("insecure-%d", time.Now().UnixNano())
 	}
 
 	a := &Auth{
@@ -69,9 +71,10 @@ func NewAuth(cfg AuthConfig) *Auth {
 		}
 	}
 
-	// Default admin if no users configured.
+	slog.Warn("auth: passwords are stored in plaintext — consider using bcrypt in production")
+
 	if len(a.users) == 0 {
-		a.users["admin"] = &User{Username: "admin", Password: "admin", Role: RoleAdmin}
+		slog.Warn("auth: NO USERS CONFIGURED — API will reject all requests until users are added to config")
 	}
 
 	return a
@@ -186,7 +189,11 @@ func (a *Auth) AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		user := &User{Username: claims.Username, Role: claims.Role}
+		user, exists := a.users[claims.Username]
+		if !exists {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user no longer exists"})
+			return
+		}
 		r = r.WithContext(withUser(r.Context(), user))
 		next.ServeHTTP(w, r)
 	})

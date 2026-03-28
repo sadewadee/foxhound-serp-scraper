@@ -166,15 +166,19 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 			break
 		}
 
-		// Get next unprocessed job for this query.
+		// Atomically claim the next unprocessed job for this query.
 		var job db.SERPJob
 		err := s.db.QueryRow(`
-			SELECT id, search_url, page_num, attempt_count, max_attempts
-			FROM serp_jobs
-			WHERE parent_job_id = $1 AND status = 'new'
-			ORDER BY page_num ASC
-			LIMIT 1
-		`, q.ID).Scan(&job.ID, &job.SearchURL, &job.PageNum, &job.AttemptCount, &job.MaxAttempts)
+			UPDATE serp_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
+			WHERE id = (
+				SELECT id FROM serp_jobs
+				WHERE parent_job_id = $2 AND status = 'new'
+				ORDER BY page_num ASC
+				LIMIT 1
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING id, search_url, page_num, attempt_count, max_attempts
+		`, workerID, q.ID).Scan(&job.ID, &job.SearchURL, &job.PageNum, &job.AttemptCount, &job.MaxAttempts)
 		if err == sql.ErrNoRows {
 			break // All jobs for this query are done (completed, failed, or still processing).
 		}
@@ -182,12 +186,6 @@ func (s *SERPStage) processQuery(ctx context.Context, browserPtr **fetch.Camoufo
 			slog.Error("serp: query serp_jobs failed", "query_id", q.ID, "error", err)
 			break
 		}
-
-		// Lock it.
-		s.db.Exec(`
-			UPDATE serp_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
-			WHERE id = $2
-		`, workerID, job.ID)
 
 		browser := *browserPtr
 

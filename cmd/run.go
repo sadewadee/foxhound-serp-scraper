@@ -136,7 +136,7 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 
 	// Start Telegram bot (optional — only if token is set).
 	if cfg.Telegram.BotToken != "" {
-		tgBot := telegram.New(cfg.Telegram.BotToken, database, dd.Client())
+		tgBot := telegram.New(cfg.Telegram.BotToken, database, dd.Client(), cfg.Telegram.AllowedChatIDs)
 		go tgBot.Run(ctx)
 	}
 

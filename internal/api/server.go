@@ -213,7 +213,8 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.Query(dataQuery, args...)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -286,7 +287,8 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.Query(exportQuery)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -312,8 +314,12 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// JSON export.
-	var contacts []map[string]any
+	// JSON export — stream to avoid accumulating the full result set in memory.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("["))
+	enc := json.NewEncoder(w)
+	first := true
 	for rows.Next() {
 		var contactName, businessName, businessCategory, website string
 		var emails, phones []string
@@ -322,7 +328,11 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 		rows.Scan(&contactName, &businessName, &businessCategory, &website,
 			pq.Array(&emails), pq.Array(&phones), &domain, &socialLinksJSON,
 			&address, &location)
-		contacts = append(contacts, map[string]any{
+		if !first {
+			w.Write([]byte(","))
+		}
+		first = false
+		enc.Encode(map[string]any{
 			"contact_name": contactName, "business_name": businessName,
 			"business_category": businessCategory, "website": website,
 			"emails": emails, "phones": phones, "domain": domain,
@@ -330,7 +340,7 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 			"address": address, "location": location,
 		})
 	}
-	writeJSON(w, http.StatusOK, contacts)
+	w.Write([]byte("]"))
 }
 
 func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
@@ -403,7 +413,8 @@ func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 		res, err = s.db.Exec("DELETE FROM enrich_jobs WHERE id = ANY($1)", pq.Array(req.IDs))
 	}
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	n, _ := res.RowsAffected()
@@ -423,7 +434,8 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 		LIMIT 500
 	`)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -487,7 +499,8 @@ func (s *Server) handleListQueries(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.Query(dataQuery, args...)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -538,7 +551,8 @@ func (s *Server) handleCreateQueries(w http.ResponseWriter, r *http.Request) {
 	}
 	inserted, err := s.queryRepo.InsertBatch(cleaned)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -562,7 +576,8 @@ func (s *Server) handleDeleteQueries(w http.ResponseWriter, r *http.Request) {
 	}
 	deleted, err := s.queryRepo.DeleteByIDs(req.IDs)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
@@ -571,7 +586,8 @@ func (s *Server) handleDeleteQueries(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRetryQueries(w http.ResponseWriter, r *http.Request) {
 	retried, err := s.queryRepo.RetryErrors()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"retried": retried})
@@ -580,7 +596,8 @@ func (s *Server) handleRetryQueries(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleQueryStats(w http.ResponseWriter, r *http.Request) {
 	counts, err := s.queryRepo.CountByStatus()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	total := 0
@@ -624,7 +641,8 @@ func (s *Server) handleGenerateQueries(w http.ResponseWriter, r *http.Request) {
 		}
 		inserted, err := s.queryRepo.InsertBatch(keywords[i:end])
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 			return
 		}
 		totalInserted += inserted
@@ -697,70 +715,82 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	queries["total"] = qTotal
 
-	// ── SERP Jobs ──
+	// ── SERP Jobs ── (single query)
 	serp := map[string]any{}
 	var serpTotal, serpNew, serpProcessing, serpCompleted, serpFailed int
-	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs`).Scan(&serpTotal)
-	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'new'`).Scan(&serpNew)
-	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'processing'`).Scan(&serpProcessing)
-	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpCompleted)
-	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'failed'`).Scan(&serpFailed)
+	var serpURLsFound, serpPerHour, serpToday int
+	s.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'new'),
+			COUNT(*) FILTER (WHERE status = 'processing'),
+			COUNT(*) FILTER (WHERE status = 'completed'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COALESCE(SUM(result_count) FILTER (WHERE status = 'completed'), 0),
+			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
+			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours')
+		FROM serp_jobs
+	`).Scan(&serpTotal, &serpNew, &serpProcessing, &serpCompleted, &serpFailed, &serpURLsFound, &serpPerHour, &serpToday)
 	serp["total"] = serpTotal
 	serp["pending"] = serpNew
 	serp["processing"] = serpProcessing
 	serp["completed"] = serpCompleted
 	serp["failed"] = serpFailed
-
-	// SERP results + rates.
-	var serpURLsFound, serpPerHour, serpToday int
-	s.db.QueryRow(`SELECT COALESCE(SUM(result_count), 0) FROM serp_jobs WHERE status = 'completed'`).Scan(&serpURLsFound)
-	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'`).Scan(&serpPerHour)
-	s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours'`).Scan(&serpToday)
 	serp["urls_found"] = serpURLsFound
 	serp["rate_per_hour"] = serpPerHour
 	serp["today"] = serpToday
 
-	// ── Websites ──
+	// ── Websites ── (single query)
 	var webTotal, webPending, webCompleted int
-	s.db.QueryRow(`SELECT COUNT(*) FROM websites`).Scan(&webTotal)
-	s.db.QueryRow(`SELECT COUNT(*) FROM websites WHERE status = 'pending'`).Scan(&webPending)
-	s.db.QueryRow(`SELECT COUNT(*) FROM websites WHERE status = 'completed'`).Scan(&webCompleted)
+	s.db.QueryRow(`
+		SELECT COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'pending'),
+			COUNT(*) FILTER (WHERE status = 'completed')
+		FROM websites
+	`).Scan(&webTotal, &webPending, &webCompleted)
 	websites := map[string]int{
 		"total": webTotal, "pending": webPending, "completed": webCompleted,
 	}
 
-	// ── Enrich Jobs ──
+	// ── Enrich Jobs ── (single query)
 	enrich := map[string]any{}
 	var enrichTotal, enrichPending, enrichProcessing, enrichCompleted, enrichFailed, enrichDead int
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs`).Scan(&enrichTotal)
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'pending'`).Scan(&enrichPending)
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'processing'`).Scan(&enrichProcessing)
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'`).Scan(&enrichCompleted)
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'failed'`).Scan(&enrichFailed)
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'dead'`).Scan(&enrichDead)
+	var enrichPerHour, enrichToday int
+	s.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'pending'),
+			COUNT(*) FILTER (WHERE status = 'processing'),
+			COUNT(*) FILTER (WHERE status = 'completed'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE status = 'dead'),
+			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
+		FROM enrich_jobs
+	`).Scan(&enrichTotal, &enrichPending, &enrichProcessing, &enrichCompleted, &enrichFailed, &enrichDead, &enrichPerHour, &enrichToday)
 	enrich["total"] = enrichTotal
 	enrich["pending"] = enrichPending
 	enrich["processing"] = enrichProcessing
 	enrich["completed"] = enrichCompleted
 	enrich["failed"] = enrichFailed
-
-	// Enrich rates.
-	var enrichPerHour, enrichToday int
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&enrichPerHour)
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&enrichToday)
+	enrich["dead"] = enrichDead
 	enrich["rate_per_hour"] = enrichPerHour
 	enrich["today"] = enrichToday
-	enrich["dead"] = enrichDead
 
-	// ── Contacts (from completed enrich_jobs) ──
+	// ── Contacts (from completed enrich_jobs) ── (single query)
 	contacts := map[string]any{}
-	var totalEmails, uniqueEmails, totalWithEmail int
-	var emailsToday, emailsLastHour int
-	s.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0`).Scan(&totalWithEmail)
-	s.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&uniqueEmails)
-	s.db.QueryRow(`SELECT COUNT(e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&totalEmails)
-	s.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
-	s.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsLastHour)
+	var totalWithEmail, totalEmails, uniqueEmails, emailsToday, emailsLastHour, uniqueDomains int
+	s.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE array_length(emails, 1) > 0),
+			(SELECT COUNT(e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+			COUNT(DISTINCT domain) FILTER (WHERE status = 'completed')
+		FROM enrich_jobs
+		WHERE status = 'completed'
+	`).Scan(&totalWithEmail, &totalEmails, &uniqueEmails, &emailsToday, &emailsLastHour, &uniqueDomains)
 
 	contacts["total_with_email"] = totalWithEmail
 	contacts["total_emails"] = totalEmails
@@ -787,9 +817,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	contacts["providers"] = providers
 
-	// Unique domains scraped.
-	var uniqueDomains int
-	s.db.QueryRow(`SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'`).Scan(&uniqueDomains)
+	// Unique domains scraped (already computed in the combined contacts query above).
 	contacts["unique_domains"] = uniqueDomains
 
 	// ── Queues (Redis) ──
@@ -875,7 +903,8 @@ func (s *Server) handleDeployWorker(w http.ResponseWriter, r *http.Request) {
 
 	info, err := s.dokploy.DeployWorker(req)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 
@@ -906,7 +935,8 @@ func (s *Server) handleStopWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.dokploy.StopWorker(req.ComposeID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 
@@ -931,7 +961,8 @@ func (s *Server) handleStartWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.dokploy.StartWorker(req.ComposeID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 
@@ -954,7 +985,8 @@ func (s *Server) handleDeleteWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.dokploy.DeleteWorker(composeID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 
@@ -991,7 +1023,8 @@ func (s *Server) handleDebugSerpJobs(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -1041,7 +1074,8 @@ func (s *Server) handleDebugEnrichJobs(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 	defer rows.Close()
@@ -1070,14 +1104,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	health := map[string]string{"status": "ok"}
 
 	if err := s.db.Ping(); err != nil {
-		health["postgres"] = "error: " + err.Error()
+		slog.Warn("health: postgres error", "error", err)
+		health["postgres"] = "error"
 		health["status"] = "degraded"
 	} else {
 		health["postgres"] = "ok"
 	}
 
 	if err := s.redis.Ping(context.Background()).Err(); err != nil {
-		health["redis"] = "error: " + err.Error()
+		slog.Warn("health: redis error", "error", err)
+		health["redis"] = "error"
 		health["status"] = "degraded"
 	} else {
 		health["redis"] = "ok"

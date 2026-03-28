@@ -19,13 +19,14 @@ import (
 )
 
 type Bot struct {
-	token     string
-	apiURL    string
-	db        *sql.DB
-	redis     *redis.Client
-	queryRepo *query.Repository
-	client    *http.Client
-	offset    int64
+	token          string
+	apiURL         string
+	db             *sql.DB
+	redis          *redis.Client
+	queryRepo      *query.Repository
+	client         *http.Client
+	offset         int64
+	allowedChatIDs map[int64]bool
 }
 
 type Update struct {
@@ -43,14 +44,19 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-func New(token string, db *sql.DB, redisClient *redis.Client) *Bot {
+func New(token string, db *sql.DB, redisClient *redis.Client, allowedChatIDs []int64) *Bot {
+	allowed := make(map[int64]bool)
+	for _, id := range allowedChatIDs {
+		allowed[id] = true
+	}
 	return &Bot{
-		token:     token,
-		apiURL:    "https://api.telegram.org/bot" + token,
-		db:        db,
-		redis:     redisClient,
-		queryRepo: query.NewRepository(db),
-		client:    &http.Client{Timeout: 60 * time.Second},
+		token:          token,
+		apiURL:         "https://api.telegram.org/bot" + token,
+		db:             db,
+		redis:          redisClient,
+		queryRepo:      query.NewRepository(db),
+		client:         &http.Client{Timeout: 60 * time.Second},
+		allowedChatIDs: allowed,
 	}
 }
 

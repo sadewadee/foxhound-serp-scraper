@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -36,7 +37,8 @@ type DokployConfig struct {
 }
 
 type TelegramConfig struct {
-	BotToken string `yaml:"bot_token"`
+	BotToken       string  `yaml:"bot_token"`
+	AllowedChatIDs []int64 `yaml:"allowed_chat_ids"`
 }
 
 type APIUser struct {
@@ -174,7 +176,8 @@ func LoadFromEnv() (*Config, error) {
 			APIKey: os.Getenv("DOKPLOY_API_KEY"),
 		},
 		Telegram: TelegramConfig{
-			BotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
+			BotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+			AllowedChatIDs: parseIntList(os.Getenv("TELEGRAM_ALLOWED_USERS")),
 		},
 		Monitor: MonitorConfig{
 			Enabled: true,
@@ -239,6 +242,25 @@ func setDefaults(cfg *Config) {
 	// Default contact_pages and social_extraction to true.
 	// YAML unmarshals missing bools as false, so we check string presence.
 	// For simplicity, just default these in the config example.
+}
+
+// parseIntList parses a comma-separated string of int64 values.
+func parseIntList(s string) []int64 {
+	if s == "" {
+		return nil
+	}
+	var result []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(part, 10, 64)
+		if err == nil {
+			result = append(result, n)
+		}
+	}
+	return result
 }
 
 // DSN returns the Postgres DSN, trying env var POSTGRES_DSN if config is empty.
