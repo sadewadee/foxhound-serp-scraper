@@ -31,18 +31,21 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		headless = "false"
 	}
 
+	browserTimeout := time.Duration(cfg.Fetch.BrowserTimeoutSec) * time.Second
+
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
 		fetch.WithBlockImages(cfg.Fetch.BlockImages),
-		fetch.WithBrowserTimeout(60 * time.Second),
+		fetch.WithBrowserTimeout(browserTimeout),
 
 		// Session persistence — maintain cookies across requests.
 		// Google won't re-captcha every page if session persists.
 		fetch.WithPersistSession(true),
 
-		// Rotate browser after 100 requests to avoid fingerprint accumulation.
-		fetch.WithMaxBrowserRequests(100),
+		// Rotate browser after N requests to avoid fingerprint accumulation.
+		// Uses half of SERP max since single-browser mode is more conservative.
+		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests / 2),
 
 		// Page pooling — reuse warm pages, eliminates ~3s overhead per request.
 		fetch.WithPoolSize(3),
@@ -74,14 +77,16 @@ func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFe
 		headless = "false"
 	}
 
+	browserTimeout := time.Duration(cfg.Fetch.BrowserTimeoutSec) * time.Second
+
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
 		fetch.WithBlockImages(cfg.Fetch.BlockImages),
-		fetch.WithBrowserTimeout(60 * time.Second),
+		fetch.WithBrowserTimeout(browserTimeout),
 		fetch.WithPersistSession(true),
-		fetch.WithMaxBrowserRequests(200), // PageReuseLimit
-		fetch.WithPoolSize(poolSize),      // N tabs
+		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests),
+		fetch.WithPoolSize(poolSize),
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithBrowserProxy(cfg.Proxy.URL))
@@ -118,12 +123,18 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 		headless = "false"
 	}
 
+	// Enrich browser uses half the SERP timeout — pages are simpler than Google SERPs.
+	enrichTimeout := time.Duration(cfg.Fetch.BrowserTimeoutSec/2) * time.Second
+	if enrichTimeout < 15*time.Second {
+		enrichTimeout = 15 * time.Second
+	}
+
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
 		fetch.WithBlockImages(cfg.Fetch.BlockImages),
-		fetch.WithBrowserTimeout(30 * time.Second),
-		fetch.WithMaxBrowserRequests(300),
+		fetch.WithBrowserTimeout(enrichTimeout),
+		fetch.WithMaxBrowserRequests(cfg.Fetch.EnrichMaxRequests),
 	}
 	if poolSize > 0 {
 		opts = append(opts, fetch.WithPoolSize(poolSize))
@@ -145,7 +156,7 @@ func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
 
 	opts := []fetch.StealthOption{
 		fetch.WithIdentity(profile),
-		fetch.WithTimeout(time.Duration(cfg.Contact.TimeoutMs) * time.Millisecond),
+		fetch.WithTimeout(time.Duration(cfg.Enrich.TimeoutMs) * time.Millisecond),
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithProxy(cfg.Proxy.URL))

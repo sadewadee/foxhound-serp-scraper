@@ -13,11 +13,14 @@ CREATE TABLE IF NOT EXISTS queries (
     status          TEXT NOT NULL DEFAULT 'pending',
     result_count    INTEGER DEFAULT 0,
     error_msg       TEXT,
+    expanded_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(text_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_queries_status ON queries(status);
+-- For auto-expansion: find completed queries not yet expanded.
+CREATE INDEX IF NOT EXISTS idx_queries_expand ON queries(status, expanded_at) WHERE status = 'completed' AND expanded_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS serp_jobs (
     id              TEXT PRIMARY KEY,
@@ -96,17 +99,28 @@ CREATE INDEX IF NOT EXISTS idx_enrich_status_domain ON enrich_jobs(status, domai
 CREATE INDEX IF NOT EXISTS idx_enrich_completed_at ON enrich_jobs(completed_at) WHERE status = 'completed';
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_updated_at ON serp_jobs(updated_at) WHERE status = 'completed';
 
-CREATE TABLE IF NOT EXISTS pipeline_state (
-    key        TEXT PRIMARY KEY,
-    value      TEXT NOT NULL,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
 `
 
-// Migrate creates all tables if they don't exist.
+// migrations are ALTER TABLE statements for evolving existing databases.
+// Each uses IF NOT EXISTS or equivalent to be idempotent.
+const migrations = `
+-- v2: query auto-expansion tracking
+ALTER TABLE queries ADD COLUMN IF NOT EXISTS expanded_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_queries_expand ON queries(status, expanded_at) WHERE status = 'completed' AND expanded_at IS NULL;
+
+-- v2: indexes for reconciler performance (find stuck locked jobs fast)
+CREATE INDEX IF NOT EXISTS idx_enrich_locked ON enrich_jobs(locked_at) WHERE status = 'processing';
+CREATE INDEX IF NOT EXISTS idx_serp_locked ON serp_jobs(locked_at) WHERE status = 'processing';
+`
+
+// Migrate creates all tables if they don't exist, then runs incremental migrations.
 func Migrate(db *sql.DB) error {
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("db: migration failed: %w", err)
+	}
+	// Incremental migrations — safe to re-run (idempotent).
+	if _, err := db.Exec(migrations); err != nil {
+		return fmt.Errorf("db: incremental migration failed: %w", err)
 	}
 	return nil
 }

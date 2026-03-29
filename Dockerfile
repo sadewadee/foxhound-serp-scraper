@@ -8,7 +8,7 @@
 #   docker run --shm-size=256m \
 #     -e POSTGRES_DSN="postgres://..." \
 #     -e REDIS_ADDR="100.x.x.1:6379" \
-#     ghcr.io/sadewadee/foxhound-serp-scraper run -stage contact -workers 20
+#     ghcr.io/sadewadee/foxhound-serp-scraper run -stage enrich -workers 20
 
 # ---------------------------------------------------------------------------
 # Stage 1: builder

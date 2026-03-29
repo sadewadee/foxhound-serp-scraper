@@ -23,8 +23,7 @@ const (
 // User represents an API user.
 type User struct {
 	Username string `json:"username" yaml:"username"`
-	Password string `json:"-" yaml:"password"`       // bcrypt or plaintext (for config simplicity)
-	APIKey   string `json:"api_key" yaml:"api_key"`  // static API key alternative
+	APIKey   string `json:"api_key" yaml:"api_key"` // static API key for auth
 	Role     Role   `json:"role" yaml:"role"`
 }
 
@@ -70,8 +69,6 @@ func NewAuth(cfg AuthConfig) *Auth {
 			a.apiKeys[u.APIKey] = u
 		}
 	}
-
-	slog.Warn("auth: passwords are stored in plaintext — consider using bcrypt in production")
 
 	if len(a.users) == 0 {
 		slog.Warn("auth: NO USERS CONFIGURED — API will reject all requests until users are added to config")
@@ -136,14 +133,11 @@ func (a *Auth) ValidateToken(token string) (*TokenClaims, error) {
 	return &claims, nil
 }
 
-// Authenticate checks credentials and returns the user.
-func (a *Auth) Authenticate(username, password string) (*User, error) {
-	user, ok := a.users[username]
+// AuthenticateByKey checks an API key and returns the user.
+func (a *Auth) AuthenticateByKey(apiKey string) (*User, error) {
+	user, ok := a.apiKeys[apiKey]
 	if !ok {
-		return nil, fmt.Errorf("invalid credentials")
-	}
-	if user.Password != password {
-		return nil, fmt.Errorf("invalid credentials")
+		return nil, fmt.Errorf("invalid API key")
 	}
 	return user, nil
 }

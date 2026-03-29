@@ -54,7 +54,7 @@ func New(token string, db *sql.DB, redisClient *redis.Client, allowedChatIDs []i
 		apiURL:         "https://api.telegram.org/bot" + token,
 		db:             db,
 		redis:          redisClient,
-		queryRepo:      query.NewRepository(db),
+		queryRepo:      query.NewRepositoryWithRedis(db, redisClient),
 		client:         &http.Client{Timeout: 60 * time.Second},
 		allowedChatIDs: allowed,
 	}

@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
     command: >
       postgres
-      -c max_connections=200
+      -c max_connections=${PG_MAX_CONNECTIONS:-50}
       -c shared_buffers=512MB
       -c effective_cache_size=2GB
       -c work_mem=8MB
@@ -85,10 +85,7 @@ services:
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       API_SECRET: "${API_SECRET}"
-      API_ADMIN_PASSWORD: "${API_ADMIN_PASSWORD}"
-      API_KEY: "${API_KEY:-}"
-      DOKPLOY_URL: "${DOKPLOY_URL:-}"
-      DOKPLOY_API_KEY: "${DOKPLOY_API_KEY:-}"
+      API_KEY: "${API_KEY}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
       TZ: "${TZ:-Asia/Jakarta}"
@@ -127,6 +124,15 @@ services:
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXY_URL: "${PROXY_URL:-}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
+      # ── DB pool (low — persistence only, jobs via Redis) ──
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-5}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-2}"
+      # ── Browser lifecycle tuning (optional) ──
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-200}"
+      BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
     command: ["run", "-stage", "serp", "-workers", "${SERP_CONCURRENCY:-4}"]
@@ -149,7 +155,7 @@ services:
           memory: 512m
 
   # ===========================================
-  # Enrich Worker Pool (website crawl + contact extraction)
+  # Enrich Worker Pool (contact page discovery + extraction)
   # ===========================================
   enrich:
     init: true
@@ -168,6 +174,15 @@ services:
       PROXY_URL: "${PROXY_URL:-}"
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
+      # ── DB pool (low — persistence only, jobs via Redis) ──
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-5}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-2}"
+      # ── Browser lifecycle tuning (optional) ──
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
+      ENRICH_MAX_REQUESTS: "${ENRICH_MAX_REQUESTS:-300}"
+      BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
     command: ["run", "-stage", "enrich", "-workers", "${ENRICH_CONCURRENCY:-20}"]

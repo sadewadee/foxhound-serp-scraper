@@ -251,13 +251,14 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 	}
 
 	// ── Queues ──
-	var qWeb, qEnrich int64
-	qWeb, _ = b.redis.ZCard(ctx, "serp:queue:websites").Result()
+	var qQueries, qSerp, qEnrich int64
+	qQueries, _ = b.redis.ZCard(ctx, "serp:queue:queries").Result()
+	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
 	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
-	if qWeb > 0 || qEnrich > 0 {
+	if qQueries > 0 || qSerp > 0 || qEnrich > 0 {
 		lines = append(lines, "",
 			"_Queues:_",
-			fmt.Sprintf("  websites: %d  enrich: %d", qWeb, qEnrich))
+			fmt.Sprintf("  queries: %d  serp: %d  enrich: %d", qQueries, qSerp, qEnrich))
 	}
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))

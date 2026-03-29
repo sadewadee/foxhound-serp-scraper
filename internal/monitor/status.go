@@ -48,7 +48,7 @@ func GetStatus(db *sql.DB, redisClient *redis.Client) (*Status, error) {
 	s.Contacts = getTableStatus(db, "enrich_jobs")
 
 	// Queue depths.
-	queues := []string{"serp:queue:queries", "serp:queue:websites", "serp:queue:enrich"}
+	queues := []string{"serp:queue:queries", "serp:queue:serp", "serp:queue:enrich"}
 	for _, q := range queues {
 		depth, _ := redisClient.ZCard(ctx, q).Result()
 		s.Queues = append(s.Queues, QueueStatus{Name: q, Depth: depth})

@@ -27,17 +27,9 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	if workers > 0 {
 		switch stageName {
 		case "serp":
-			cfg.SERP.Workers = workers
 			cfg.SERP.Concurrency = workers
-		case "website":
-			cfg.Website.Workers = workers
-		case "contact":
-			cfg.Contact.Workers = workers
-		case "enrich":
-			cfg.Website.Workers = workers
-			cfg.Contact.Workers = workers
 		default:
-			cfg.Contact.Workers = workers
+			cfg.Enrich.Concurrency = workers
 		}
 	}
 
@@ -115,18 +107,12 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	for _, u := range cfg.API.Users {
 		authCfg.Users = append(authCfg.Users, api.User{
 			Username: u.Username,
-			Password: u.Password,
 			APIKey:   u.APIKey,
 			Role:     api.Role(u.Role),
 		})
 	}
 
-	dokployCfg := api.DokployConfig{
-		URL:    cfg.Dokploy.URL,
-		APIKey: cfg.Dokploy.APIKey,
-	}
-
-	apiServer := api.NewServer(database, dd.Client(), authCfg, dokployCfg)
+	apiServer := api.NewServer(database, dd.Client(), authCfg)
 
 	slog.Info("api: server starting", "addr", apiAddr)
 	go func() {

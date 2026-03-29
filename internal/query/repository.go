@@ -1,25 +1,40 @@
 package query
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 )
 
+// QueueKey is the Redis sorted-set queue for pending queries.
+const QueueKey = "serp:queue:queries"
+
 // Repository handles PostgreSQL CRUD for the queries table.
 type Repository struct {
-	db *sql.DB
+	db    *sql.DB
+	redis *redis.Client
 }
 
-// NewRepository creates a query repository.
+// NewRepository creates a query repository (DB only, no Redis queue push).
 func NewRepository(database *sql.DB) *Repository {
 	return &Repository{db: database}
 }
 
+// NewRepositoryWithRedis creates a query repository with Redis queue support.
+func NewRepositoryWithRedis(database *sql.DB, redisClient *redis.Client) *Repository {
+	return &Repository{db: database, redis: redisClient}
+}
+
 // InsertBatch bulk-inserts queries, skipping duplicates by text_hash.
+// If Redis is configured, newly inserted queries are pushed to the query queue.
 // Returns the number of new queries inserted.
 func (r *Repository) InsertBatch(queries []string) (int, error) {
 	tx, err := r.db.Begin()
@@ -32,27 +47,56 @@ func (r *Repository) InsertBatch(queries []string) (int, error) {
 		INSERT INTO queries (text, text_hash, status, created_at, updated_at)
 		VALUES ($1, $2, 'pending', NOW(), NOW())
 		ON CONFLICT (text_hash) DO NOTHING
+		RETURNING id, text
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("query: prepare insert: %w", err)
 	}
 	defer stmt.Close()
 
-	inserted := 0
+	type inserted struct {
+		ID   int64
+		Text string
+	}
+	var newQueries []inserted
+
 	for _, q := range queries {
 		hash := dedup.HashQuery(q)
-		res, err := stmt.Exec(q, hash)
-		if err != nil {
-			return inserted, fmt.Errorf("query: insert %q: %w", q, err)
+		var id int64
+		var text string
+		err := stmt.QueryRow(q, hash).Scan(&id, &text)
+		if err == sql.ErrNoRows {
+			continue // duplicate, skipped
 		}
-		n, _ := res.RowsAffected()
-		inserted += int(n)
+		if err != nil {
+			return len(newQueries), fmt.Errorf("query: insert %q: %w", q, err)
+		}
+		newQueries = append(newQueries, inserted{ID: id, Text: text})
 	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("query: commit: %w", err)
 	}
-	return inserted, nil
+
+	// Push newly inserted queries to Redis queue for workers to consume.
+	if r.redis != nil && len(newQueries) > 0 {
+		ctx := context.Background()
+		for _, q := range newQueries {
+			r.pushQueryToQueue(ctx, q.ID, q.Text)
+		}
+	}
+
+	return len(newQueries), nil
+}
+
+// pushQueryToQueue enqueues a query onto the Redis sorted-set queue.
+func (r *Repository) pushQueryToQueue(ctx context.Context, queryID int64, text string) {
+	data, _ := json.Marshal(map[string]any{
+		"id":   queryID,
+		"text": text,
+	})
+	score := float64(time.Now().UnixMicro())
+	r.redis.ZAdd(ctx, QueueKey, redis.Z{Score: score, Member: string(data)})
 }
 
 // GetPending returns all queries with status='pending'.
@@ -154,17 +198,58 @@ func (r *Repository) DeleteByIDs(ids []int64) (int, error) {
 	return int(n), nil
 }
 
-// RetryErrors resets all error-status queries back to pending for reprocessing.
+// RetryErrors resets all error-status queries back to pending and pushes to Redis queue.
 func (r *Repository) RetryErrors() (int, error) {
-	res, err := r.db.Exec(`
+	rows, err := r.db.Query(`
 		UPDATE queries SET status = 'pending', error_msg = '', updated_at = NOW()
 		WHERE status = 'error'
+		RETURNING id, text
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("query: retry errors: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	defer rows.Close()
+
+	ctx := context.Background()
+	count := 0
+	for rows.Next() {
+		var id int64
+		var text string
+		if err := rows.Scan(&id, &text); err != nil {
+			continue
+		}
+		if r.redis != nil {
+			r.pushQueryToQueue(ctx, id, text)
+		}
+		count++
+	}
+	return count, rows.Err()
+}
+
+// RequeuePendingToRedis pushes all pending queries to the Redis queue.
+// Called at startup to ensure workers can pick up queries after a restart.
+func (r *Repository) RequeuePendingToRedis() (int, error) {
+	if r.redis == nil {
+		return 0, nil
+	}
+	rows, err := r.db.Query(`SELECT id, text FROM queries WHERE status = 'pending' ORDER BY id ASC`)
+	if err != nil {
+		return 0, fmt.Errorf("query: requeue pending to redis: %w", err)
+	}
+	defer rows.Close()
+
+	ctx := context.Background()
+	count := 0
+	for rows.Next() {
+		var id int64
+		var text string
+		if err := rows.Scan(&id, &text); err != nil {
+			continue
+		}
+		r.pushQueryToQueue(ctx, id, text)
+		count++
+	}
+	return count, rows.Err()
 }
 
 // MarkProcessing atomically marks a pending query as processing and returns it.

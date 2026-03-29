@@ -21,7 +21,7 @@ func RunStandalone(cfg *config.Config, query, output string, workers int) error 
 	}
 
 	if workers > 0 {
-		cfg.Contact.Workers = workers
+		cfg.Enrich.Concurrency = workers
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -15,25 +15,19 @@ type Config struct {
 	Redis        RedisConfig        `yaml:"redis"`
 	SERP         SERPConfig         `yaml:"serp"`
 	Website      WebsiteConfig      `yaml:"website"`
-	Contact      ContactConfig      `yaml:"contact"`
+	Enrich       EnrichConfig       `yaml:"enrich"`
 	Proxy        ProxyConfig        `yaml:"proxy"`
 	Fetch        FetchConfig        `yaml:"fetch"`
 	Monitor      MonitorConfig      `yaml:"monitor"`
 	Mordibouncer MordibouncerConfig `yaml:"mordibouncer"`
 	API          APIConfig          `yaml:"api"`
-	Dokploy      DokployConfig      `yaml:"dokploy"`
 	Telegram     TelegramConfig     `yaml:"telegram"`
 }
 
 type APIConfig struct {
-	Addr   string     `yaml:"addr"`
-	Secret string     `yaml:"secret"`
-	Users  []APIUser  `yaml:"users"`
-}
-
-type DokployConfig struct {
-	URL    string `yaml:"url"`
-	APIKey string `yaml:"api_key"`
+	Addr   string    `yaml:"addr"`
+	Secret string    `yaml:"secret"`
+	Users  []APIUser `yaml:"users"`
 }
 
 type TelegramConfig struct {
@@ -43,7 +37,6 @@ type TelegramConfig struct {
 
 type APIUser struct {
 	Username string `yaml:"username"`
-	Password string `yaml:"password"`
 	APIKey   string `yaml:"api_key"`
 	Role     string `yaml:"role"`
 }
@@ -65,22 +58,22 @@ type SERPConfig struct {
 	ResultsPerPage        int `yaml:"results_per_page"`
 	DelayBetweenPagesMs   int `yaml:"delay_between_pages_ms"`
 	DelayBetweenQueriesMs int `yaml:"delay_between_queries_ms"`
-	Workers               int `yaml:"workers"`      // kept for backward compat but now means concurrency
-	Concurrency           int `yaml:"concurrency"`  // number of tabs (goroutines)
+	Concurrency           int `yaml:"concurrency"` // number of tabs (goroutines)
 }
 
 type WebsiteConfig struct {
-	Workers      int  `yaml:"workers"`
+	Concurrency  int  `yaml:"concurrency"`
 	ContactPages bool `yaml:"contact_pages"`
 	TimeoutMs    int  `yaml:"timeout_ms"`
 }
 
-type ContactConfig struct {
-	Workers          int  `yaml:"workers"`
+type EnrichConfig struct {
+	Concurrency      int  `yaml:"concurrency"`
 	TimeoutMs        int  `yaml:"timeout_ms"`
 	ValidateMX       bool `yaml:"validate_mx"`
 	SocialExtraction bool `yaml:"social_extraction"`
 	ValidateEmail    bool `yaml:"validate_email"`
+	ContactPages     bool `yaml:"contact_pages"`
 }
 
 type MordibouncerConfig struct {
@@ -95,6 +88,15 @@ type ProxyConfig struct {
 type FetchConfig struct {
 	Headless    bool `yaml:"headless"`
 	BlockImages bool `yaml:"block_images"`
+
+	// Browser lifecycle tuning — controls memory usage vs restart overhead.
+	PageReuseLimit       int `yaml:"page_reuse_limit"`       // requests before browser page recycle (default 200)
+	BrowserReuseLimit    int `yaml:"browser_reuse_limit"`    // page recycles before full browser restart (default 2)
+	StealthRecycleAfter  int `yaml:"stealth_recycle_after"`  // requests before stealth fetcher recycle (default 500)
+	SERPMaxRequests      int `yaml:"serp_max_requests"`      // MaxBrowserRequests for SERP browser (default 200)
+	EnrichMaxRequests    int `yaml:"enrich_max_requests"`    // MaxBrowserRequests for enrich browser (default 300)
+	BrowserTimeoutSec    int `yaml:"browser_timeout_sec"`    // browser-level timeout in seconds (default 60)
+	ReconcilerIntervalMs int `yaml:"reconciler_interval_ms"` // reconciler tick interval in ms (default 60000)
 }
 
 type MonitorConfig struct {
@@ -145,7 +147,9 @@ func Load(path string) (*Config, error) {
 func LoadFromEnv() (*Config, error) {
 	cfg := &Config{
 		Postgres: PostgresConfig{
-			DSN: os.Getenv("POSTGRES_DSN"),
+			DSN:          os.Getenv("POSTGRES_DSN"),
+			MaxOpenConns: parseEnvInt("PG_MAX_OPEN_CONNS", 0),
+			MaxIdleConns: parseEnvInt("PG_MAX_IDLE_CONNS", 0),
 		},
 		Redis: RedisConfig{
 			Addr:     os.Getenv("REDIS_ADDR"),
@@ -155,8 +159,15 @@ func LoadFromEnv() (*Config, error) {
 			URL: os.Getenv("PROXY_URL"),
 		},
 		Fetch: FetchConfig{
-			Headless:    true,
-			BlockImages: true,
+			Headless:             true,
+			BlockImages:          true,
+			PageReuseLimit:       parseEnvInt("PAGE_REUSE_LIMIT", 0),
+			BrowserReuseLimit:    parseEnvInt("BROWSER_REUSE_LIMIT", 0),
+			StealthRecycleAfter:  parseEnvInt("STEALTH_RECYCLE_AFTER", 0),
+			SERPMaxRequests:      parseEnvInt("SERP_MAX_REQUESTS", 0),
+			EnrichMaxRequests:    parseEnvInt("ENRICH_MAX_REQUESTS", 0),
+			BrowserTimeoutSec:    parseEnvInt("BROWSER_TIMEOUT_SEC", 0),
+			ReconcilerIntervalMs: parseEnvInt("RECONCILER_INTERVAL_MS", 0),
 		},
 		Mordibouncer: MordibouncerConfig{
 			APIURL: os.Getenv("MORDIBOUNCER_API_URL"),
@@ -167,14 +178,9 @@ func LoadFromEnv() (*Config, error) {
 			Secret: os.Getenv("API_SECRET"),
 			Users: []APIUser{{
 				Username: "admin",
-				Password: os.Getenv("API_ADMIN_PASSWORD"),
 				APIKey:   os.Getenv("API_KEY"),
 				Role:     "admin",
 			}},
-		},
-		Dokploy: DokployConfig{
-			URL:    os.Getenv("DOKPLOY_URL"),
-			APIKey: os.Getenv("DOKPLOY_API_KEY"),
 		},
 		Telegram: TelegramConfig{
 			BotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
@@ -205,10 +211,10 @@ func setDefaults(cfg *Config) {
 		cfg.Redis.Addr = "localhost:6379"
 	}
 	if cfg.Postgres.MaxOpenConns == 0 {
-		cfg.Postgres.MaxOpenConns = 50
+		cfg.Postgres.MaxOpenConns = 5
 	}
 	if cfg.Postgres.MaxIdleConns == 0 {
-		cfg.Postgres.MaxIdleConns = 10
+		cfg.Postgres.MaxIdleConns = 2
 	}
 	if cfg.SERP.PagesPerQuery == 0 {
 		cfg.SERP.PagesPerQuery = 10
@@ -222,34 +228,66 @@ func setDefaults(cfg *Config) {
 	if cfg.SERP.DelayBetweenQueriesMs == 0 {
 		cfg.SERP.DelayBetweenQueriesMs = 30000
 	}
-	if cfg.SERP.Workers == 0 {
-		cfg.SERP.Workers = 2
-	}
 	if cfg.SERP.Concurrency == 0 {
-		if cfg.SERP.Workers > 0 {
-			cfg.SERP.Concurrency = cfg.SERP.Workers // backward compat
-		} else {
-			cfg.SERP.Concurrency = 4
-		}
+		cfg.SERP.Concurrency = 4
 	}
-	if cfg.Website.Workers == 0 {
-		cfg.Website.Workers = 5
+	if cfg.Website.Concurrency == 0 {
+		cfg.Website.Concurrency = 5
 	}
 	if cfg.Website.TimeoutMs == 0 {
 		cfg.Website.TimeoutMs = 20000
 	}
-	if cfg.Contact.Workers == 0 {
-		cfg.Contact.Workers = 10
+	if cfg.Enrich.Concurrency == 0 {
+		cfg.Enrich.Concurrency = 10
 	}
-	if cfg.Contact.TimeoutMs == 0 {
-		cfg.Contact.TimeoutMs = 15000
+	if cfg.Enrich.TimeoutMs == 0 {
+		cfg.Enrich.TimeoutMs = 15000
 	}
 	if cfg.Monitor.Port == 0 {
 		cfg.Monitor.Port = 9090
 	}
-	// Default contact_pages and social_extraction to true.
-	// YAML unmarshals missing bools as false, so we check string presence.
-	// For simplicity, just default these in the config example.
+	if cfg.Fetch.PageReuseLimit == 0 {
+		cfg.Fetch.PageReuseLimit = 200
+	}
+	if cfg.Fetch.BrowserReuseLimit == 0 {
+		cfg.Fetch.BrowserReuseLimit = 2
+	}
+	if cfg.Fetch.StealthRecycleAfter == 0 {
+		cfg.Fetch.StealthRecycleAfter = 500
+	}
+	if cfg.Fetch.SERPMaxRequests == 0 {
+		cfg.Fetch.SERPMaxRequests = 200
+	}
+	if cfg.Fetch.EnrichMaxRequests == 0 {
+		cfg.Fetch.EnrichMaxRequests = 300
+	}
+	if cfg.Fetch.BrowserTimeoutSec == 0 {
+		cfg.Fetch.BrowserTimeoutSec = 60
+	}
+	if cfg.Fetch.ReconcilerIntervalMs == 0 {
+		cfg.Fetch.ReconcilerIntervalMs = 60000
+	}
+	// Default bools that YAML unmarshals as false when missing.
+	// We use a separate "defaults applied" check via Concurrency > 0 above.
+	if cfg.Enrich.Concurrency > 0 && !cfg.Enrich.ContactPages {
+		cfg.Enrich.ContactPages = true
+	}
+	if cfg.Enrich.Concurrency > 0 && !cfg.Enrich.SocialExtraction {
+		cfg.Enrich.SocialExtraction = true
+	}
+}
+
+// parseEnvInt reads an integer from an environment variable, returning defaultVal if unset or invalid.
+func parseEnvInt(key string, defaultVal int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return defaultVal
+	}
+	return v
 }
 
 // parseIntList parses a comma-separated string of int64 values.

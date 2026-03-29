@@ -13,15 +13,15 @@ serp:
   results_per_page: 10
   delay_between_pages_ms: 5000
   delay_between_queries_ms: 30000
-  workers: 2
+  concurrency: 4
 
 website:
-  workers: 5
+  concurrency: 5
   contact_pages: true
   timeout_ms: 20000
 
-contact:
-  workers: 10
+enrich:
+  concurrency: 10
   timeout_ms: 15000
   validate_mx: false
   validate_email: false
@@ -33,6 +33,13 @@ proxy:
 fetch:
   headless: true
   block_images: true
+  page_reuse_limit: ${PAGE_REUSE_LIMIT:-200}
+  browser_reuse_limit: ${BROWSER_REUSE_LIMIT:-2}
+  stealth_recycle_after: ${STEALTH_RECYCLE_AFTER:-500}
+  serp_max_requests: ${SERP_MAX_REQUESTS:-200}
+  enrich_max_requests: ${ENRICH_MAX_REQUESTS:-300}
+  browser_timeout_sec: ${BROWSER_TIMEOUT_SEC:-60}
+  reconciler_interval_ms: ${RECONCILER_INTERVAL_MS:-60000}
 
 mordibouncer:
   api_url: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
@@ -43,13 +50,8 @@ api:
   secret: "${API_SECRET:-serp-scraper-secret}"
   users:
     - username: admin
-      password: "${API_ADMIN_PASSWORD:-admin}"
       api_key: "${API_KEY}"
       role: admin
-
-dokploy:
-  url: "${DOKPLOY_URL}"
-  api_key: "${DOKPLOY_API_KEY}"
 
 monitor:
   enabled: true

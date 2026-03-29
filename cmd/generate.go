@@ -8,6 +8,7 @@ import (
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/db"
+	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/query"
 )
 
@@ -27,7 +28,14 @@ func RunGenerate(cfg *config.Config, templatePath string) error {
 		return fmt.Errorf("generate: %w", err)
 	}
 
-	repo := query.NewRepository(database)
+	// Connect to Redis.
+	dd, err := dedup.New(&cfg.Redis)
+	if err != nil {
+		return fmt.Errorf("generate: redis: %w", err)
+	}
+	defer dd.Close()
+
+	repo := query.NewRepositoryWithRedis(database, dd.Client())
 
 	// Load templates from YAML file.
 	tmplCfg, err := query.LoadTemplates(templatePath)
@@ -72,7 +80,13 @@ func RunGenerateWellness(cfg *config.Config, country, niche string) error {
 		return fmt.Errorf("generate: %w", err)
 	}
 
-	repo := query.NewRepository(database)
+	dd, err := dedup.New(&cfg.Redis)
+	if err != nil {
+		return fmt.Errorf("generate: redis: %w", err)
+	}
+	defer dd.Close()
+
+	repo := query.NewRepositoryWithRedis(database, dd.Client())
 
 	niches := query.Niches
 	if niche != "" && strings.ToLower(niche) != "all" {

@@ -1,26 +1,31 @@
-# docker-compose.worker.yaml — Standalone Worker
+# docker-compose.worker.yaml — Remote Worker
 #
 # Connects to REMOTE PostgreSQL + Redis. No local database.
-# Deploy on any server, set env vars, done.
+# Watchtower auto-redeploys when a new image is pushed to GHCR.
 #
 # Usage:
 #   POSTGRES_DSN=postgres://serp:pass@main-server:5432/serp_scraper \
 #   REDIS_ADDR=main-server:6379 \
 #   REDIS_PASSWORD=pass \
-#   WORKER_STAGE=serp \
-#   WORKER_CONCURRENCY=2 \
+#   WORKER_STAGE=enrich \
+#   WORKER_CONCURRENCY=20 \
 #   docker compose -f docker-compose.worker.yaml up -d
 
 services:
   worker:
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:${IMAGE_TAG:-main}
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     environment:
       # ── Required: remote PG + Redis ──
       POSTGRES_DSN: "${POSTGRES_DSN}"
       REDIS_ADDR: "${REDIS_ADDR}"
       REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+
+      # ── DB pool (low — persistence only, jobs via Redis) ──
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-5}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-2}"
 
       # ── Worker config ──
       PROXY_URL: "${PROXY_URL:-}"
@@ -30,9 +35,43 @@ services:
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
 
+      # ── Browser lifecycle tuning (optional) ──
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
+      SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-200}"
+      ENRICH_MAX_REQUESTS: "${ENRICH_MAX_REQUESTS:-300}"
+      BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
+
     shm_size: "${SHM_SIZE:-512mb}"
     command: ["run", "-stage", "${WORKER_STAGE:-enrich}", "-workers", "${WORKER_CONCURRENCY:-4}"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     deploy:
       resources:
         limits:
           memory: ${WORKER_MEMORY:-2g}
+
+  # ===========================================
+  # Watchtower — auto-redeploy on new image
+  # ===========================================
+  watchtower:
+    image: containrrr/watchtower
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_POLL_INTERVAL: "${WATCHTOWER_INTERVAL:-300}"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_ROLLING_RESTART: "true"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      WATCHTOWER_LIFECYCLE_HOOKS: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # GHCR auth — mount docker config with ghcr.io credentials
+      - ${DOCKER_CONFIG:-~/.docker/config.json}:/config.json:ro
+    command: --interval ${WATCHTOWER_INTERVAL:-300}

@@ -16,11 +16,6 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
 
-const (
-	DefaultPageReuseLimit    = 200
-	DefaultBrowserReuseLimit = 2
-)
-
 // BrowserLifecycle tracks request counts and manages browser restarts
 // with temp file cleanup and zombie process prevention.
 type BrowserLifecycle struct {
@@ -35,11 +30,12 @@ type BrowserLifecycle struct {
 
 // NewBrowserLifecycle creates a lifecycle manager.
 // factory is the function to create a new browser (e.g. NewSERPBrowser or NewBrowserWithPool).
+// PageReuseLimit and BrowserReuseLimit are read from cfg.Fetch.
 func NewBrowserLifecycle(cfg *config.Config, factory func(*config.Config) (*fetch.CamoufoxFetcher, error), label string) *BrowserLifecycle {
 	return &BrowserLifecycle{
 		cfg:               cfg,
-		pageReuseLimit:    DefaultPageReuseLimit,
-		browserReuseLimit: DefaultBrowserReuseLimit,
+		pageReuseLimit:    cfg.Fetch.PageReuseLimit,
+		browserReuseLimit: cfg.Fetch.BrowserReuseLimit,
 		browserFactory:    factory,
 		label:             label,
 	}

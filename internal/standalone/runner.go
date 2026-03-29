@@ -25,19 +25,6 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/validate"
 )
 
-// contactPagePaths are common paths that contain contact information.
-var contactPagePaths = []string{
-	"/contact",
-	"/contact-us",
-	"/kontakt",
-	"/about",
-	"/about-us",
-	"/hubungi-kami",
-	"/team",
-	"/impressum",
-	"/contact.html",
-}
-
 // Result holds a single contact result for CSV export.
 type Result struct {
 	Email            string
@@ -75,8 +62,7 @@ type Runner struct {
 	results    []Result
 	resultsMu  sync.Mutex
 
-	// Channels as queues.
-	websiteQueue chan string
+	// Channel as queue.
 	contactQueue chan string
 
 	// Metrics.
@@ -96,12 +82,11 @@ func New(cfg *config.Config, query, output string) *Runner {
 		query:        query,
 		output:       output,
 		validator:    validate.NewMordibouncer(&cfg.Mordibouncer),
-		websiteQueue: make(chan string, 10000),
 		contactQueue: make(chan string, 50000),
 	}
 }
 
-// Run executes the full pipeline: SERP → Discovery → Enrichment → CSV.
+// Run executes the full pipeline: SERP → Enrichment → CSV.
 func (r *Runner) Run(ctx context.Context) error {
 	r.startTime = time.Now()
 	ctx, cancel := context.WithCancel(ctx)
@@ -114,32 +99,17 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 
-	// Stage 2: SERP discovery (1 worker, sequential pages).
+	// SERP discovery (1 worker, sequential pages) → pushes directly to contactQueue.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(r.websiteQueue)
+		defer close(r.contactQueue)
 		r.runSERP(ctx)
 	}()
 
-	// Stage 3: Website discovery workers.
-	var discoveryWg sync.WaitGroup
-	for i := 0; i < r.cfg.Website.Workers; i++ {
-		discoveryWg.Add(1)
-		go func(id int) {
-			defer discoveryWg.Done()
-			r.runDiscovery(ctx, id)
-		}(i)
-	}
-	// Close contact queue when all discovery workers are done.
-	go func() {
-		discoveryWg.Wait()
-		close(r.contactQueue)
-	}()
-
-	// Stage 4: Contact enrichment workers.
+	// Enrichment workers (handle domain dedup, contact page gen, and extraction).
 	var enrichWg sync.WaitGroup
-	for i := 0; i < r.cfg.Contact.Workers; i++ {
+	for i := 0; i < r.cfg.Enrich.Concurrency; i++ {
 		enrichWg.Add(1)
 		go func(id int) {
 			defer enrichWg.Done()
@@ -152,7 +122,6 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	// Wait for all work to complete, then cancel to stop ticker.
 	wg.Wait()
-	discoveryWg.Wait()
 	enrichWg.Wait()
 	cancel() // Stop the ticker
 
@@ -212,7 +181,7 @@ func (r *Runner) runSERP(ctx context.Context) {
 			if _, loaded := r.urlSeen.LoadOrStore(hash, true); loaded {
 				continue
 			}
-			r.websiteQueue <- u
+			r.contactQueue <- u
 			newCount++
 		}
 
@@ -234,49 +203,21 @@ func (r *Runner) runSERP(ctx context.Context) {
 	slog.Info("serp: all pages done", "total_urls", r.serpURLs.Load())
 }
 
-// runDiscovery reads URLs from websiteQueue, discovers contact pages, pushes to contactQueue.
-func (r *Runner) runDiscovery(ctx context.Context, workerID int) {
-	for siteURL := range r.websiteQueue {
-		if ctx.Err() != nil {
-			return
-		}
-
-		domain := dedup.ExtractDomain(siteURL)
-		if domain == "" {
-			continue
-		}
-
-		// Domain-level dedup.
-		if _, loaded := r.domainSeen.LoadOrStore(domain, true); loaded {
-			continue
-		}
-
-		r.domainsFound.Add(1)
-
-		// Push original URL to contact queue.
-		r.contactQueue <- siteURL
-
-		// Generate contact page candidates.
-		if r.cfg.Website.ContactPages {
-			u, err := url.Parse(siteURL)
-			if err != nil {
-				continue
-			}
-			for _, path := range contactPagePaths {
-				contactURL := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, path)
-				hash := dedup.HashURL(contactURL)
-				if _, loaded := r.urlSeen.LoadOrStore(hash, true); loaded {
-					continue
-				}
-				r.contactQueue <- contactURL
-			}
-		}
-
-		slog.Debug("discovery: domain processed", "domain", domain, "worker", workerID)
-	}
+// contactPagePaths are common paths that contain contact information.
+var contactPagePaths = []string{
+	"/contact",
+	"/contact-us",
+	"/kontakt",
+	"/about",
+	"/about-us",
+	"/hubungi-kami",
+	"/team",
+	"/impressum",
+	"/contact.html",
 }
 
-// runEnrichment reads URLs from contactQueue, fetches pages, extracts contacts.
+// runEnrichment reads URLs from contactQueue, handles domain dedup + contact page
+// generation, fetches pages, and extracts contacts.
 // Standalone mode uses stealth HTTP only (no browser) for speed and clean shutdown.
 // Stealth fetcher is recycled every 500 requests to prevent memory growth.
 func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
@@ -289,6 +230,31 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 			return
 		}
 
+		domain := dedup.ExtractDomain(pageURL)
+		if domain == "" {
+			continue
+		}
+
+		// Domain-level dedup: first time seeing this domain, generate contact page URLs.
+		if _, loaded := r.domainSeen.LoadOrStore(domain, true); !loaded {
+			r.domainsFound.Add(1)
+			if r.cfg.Enrich.ContactPages {
+				u, parseErr := url.Parse(pageURL)
+				if parseErr == nil {
+					for _, path := range contactPagePaths {
+						contactURL := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, path)
+						hash := dedup.HashURL(contactURL)
+						if _, seen := r.urlSeen.LoadOrStore(hash, true); !seen {
+							select {
+							case r.contactQueue <- contactURL:
+							default:
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Recycle stealth fetcher periodically.
 		requestCount++
 		if requestCount >= 500 {
@@ -297,7 +263,7 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 			requestCount = 0
 		}
 
-		timeout := time.Duration(r.cfg.Contact.TimeoutMs) * time.Millisecond
+		timeout := time.Duration(r.cfg.Enrich.TimeoutMs) * time.Millisecond
 		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
 		body, err := fetchStealth(fetchCtx, stealth, pageURL, fmt.Sprintf("enrich-%d", workerID))
@@ -351,7 +317,6 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 
 		// Regular page — extract contacts.
 		cd := scraper.ExtractContacts([]byte(body))
-		domain := dedup.ExtractDomain(pageURL)
 
 		// Store results.
 		for _, email := range cd.Emails {
@@ -361,13 +326,13 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 			}
 
 			// Optional MX validation (local DNS check).
-			if r.cfg.Contact.ValidateMX && !scraper.ValidateMX(email) {
+			if r.cfg.Enrich.ValidateMX && !scraper.ValidateMX(email) {
 				continue
 			}
 
 			// Optional Mordibouncer email validation (SMTP-level check).
 			emailStatus := ""
-			if r.cfg.Contact.ValidateEmail && r.validator != nil {
+			if r.cfg.Enrich.ValidateEmail && r.validator != nil {
 				result, err := r.validator.Check(ctx, email)
 				if err != nil {
 					slog.Debug("enrichment: mordibouncer check failed", "email", email, "error", err)
@@ -522,7 +487,7 @@ func (r *Runner) metricsTicker(ctx context.Context) {
 			}
 
 			fmt.Fprintf(os.Stderr,
-				"\r[%s] serp: %d urls | disc: %d domains | enrich: %d pages, %d emails (%.0f/hr), %d phones | queue: web=%d contact=%d",
+				"\r[%s] serp: %d urls | domains: %d | enrich: %d pages, %d emails (%.0f/hr), %d phones | queue: %d",
 				time.Since(r.startTime).Round(time.Second),
 				r.serpURLs.Load(),
 				r.domainsFound.Load(),
@@ -530,7 +495,6 @@ func (r *Runner) metricsTicker(ctx context.Context) {
 				r.emailsFound.Load(),
 				emailRate,
 				r.phonesFound.Load(),
-				len(r.websiteQueue),
 				len(r.contactQueue),
 			)
 		}

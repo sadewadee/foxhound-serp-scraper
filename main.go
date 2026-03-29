@@ -38,7 +38,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  serp-scraper scrape -q \"dentist jakarta\" -pages 5 -workers 20\n")
 		fmt.Fprintf(os.Stderr, "  serp-scraper import -file queries.csv\n")
 		fmt.Fprintf(os.Stderr, "  serp-scraper run\n")
-		fmt.Fprintf(os.Stderr, "  serp-scraper run -stage contact -workers 20\n")
+		fmt.Fprintf(os.Stderr, "  serp-scraper run -stage enrich -workers 20\n")
 		fmt.Fprintf(os.Stderr, "  serp-scraper status\n")
 		fmt.Fprintf(os.Stderr, "  serp-scraper export -format csv -output contacts.csv -email-only\n")
 	}
@@ -139,7 +139,7 @@ func runGenerate(cfg *config.Config, args []string) error {
 
 func runPipeline(cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	stage := fs.String("stage", "all", "Stage to run: all|serp|website|contact")
+	stage := fs.String("stage", "all", "Stage to run: all|serp|enrich")
 	workers := fs.Int("workers", 0, "Override worker count for the stage")
 	fs.Parse(args)
 
@@ -157,7 +157,7 @@ func runScrape(cfg *config.Config, args []string) error {
 	fs.Parse(args)
 
 	if *validateEmail {
-		cfg.Contact.ValidateEmail = true
+		cfg.Enrich.ValidateEmail = true
 	}
 	if *query == "" {
 		return fmt.Errorf("scrape: -q is required")
@@ -165,7 +165,7 @@ func runScrape(cfg *config.Config, args []string) error {
 	if *pages > 0 {
 		cfg.SERP.PagesPerQuery = *pages
 	}
-	cfg.Website.ContactPages = *contactPages
+	cfg.Enrich.ContactPages = *contactPages
 	return cmd.RunStandalone(cfg, *query, *output, *workers)
 }
 
