@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -62,8 +63,11 @@ func New(token string, db *sql.DB, redisClient *redis.Client, allowedChatIDs []i
 
 func (b *Bot) Run(ctx context.Context) {
 	slog.Info("telegram: bot starting")
-	backoff := time.Second
 
+	// Start hourly auto-report in background.
+	go b.hourlyReport(ctx)
+
+	backoff := time.Second
 	for {
 		select {
 		case <-ctx.Done():
@@ -94,6 +98,120 @@ func (b *Bot) Run(ctx context.Context) {
 			b.offset = u.UpdateID + 1
 		}
 	}
+}
+
+// hourlyReport sends a pipeline rate summary to all allowed chat IDs every hour.
+func (b *Bot) hourlyReport(ctx context.Context) {
+	// Wait until the next full hour to align reports.
+	now := time.Now()
+	nextHour := now.Truncate(time.Hour).Add(time.Hour)
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(time.Until(nextHour)):
+	}
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		b.broadcastReport(ctx)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// broadcastReport builds the rate report and sends to all allowed chats.
+func (b *Bot) broadcastReport(ctx context.Context) {
+	report := b.buildRateReport(ctx)
+	if report == "" {
+		return
+	}
+	for chatID := range b.allowedChatIDs {
+		b.sendMessage(chatID, report)
+	}
+}
+
+// buildRateReport generates the hourly rate summary.
+func (b *Bot) buildRateReport(ctx context.Context) string {
+	// ── Rates (last hour) ──
+	var serpHour, serpTotal int
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
+			COUNT(*) FILTER (WHERE status = 'completed')
+		FROM serp_jobs
+	`).Scan(&serpHour, &serpTotal)
+
+	var enrichHour, enrichTotal int
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+			COUNT(*)
+		FROM enrich_jobs WHERE status = 'completed'
+	`).Scan(&enrichHour, &enrichTotal)
+
+	var emailsHour, emailsTotal, emailsToday int
+	b.db.QueryRow(`
+		SELECT
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
+	`).Scan(&emailsHour, &emailsTotal, &emailsToday)
+
+	var websitesHour int
+	b.db.QueryRow(`SELECT COUNT(*) FROM websites WHERE created_at > NOW() - INTERVAL '1 hour'`).Scan(&websitesHour)
+
+	// ── Queue depths ──
+	var qPending, qProcessing, qCompleted int
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'pending'),
+			COUNT(*) FILTER (WHERE status = 'processing'),
+			COUNT(*) FILTER (WHERE status = 'completed')
+		FROM queries
+	`).Scan(&qPending, &qProcessing, &qCompleted)
+
+	var enrichPending, enrichFailed, enrichDead int
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'pending'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE status = 'dead')
+		FROM enrich_jobs
+	`).Scan(&enrichPending, &enrichFailed, &enrichDead)
+
+	var qSerp, qEnrich int64
+	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
+	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
+
+	// ── Build message ──
+	ts := time.Now().Format("15:04 MST")
+	lines := []string{
+		fmt.Sprintf("*Hourly Report* (%s)", ts),
+		"",
+		"_Rates (last hour):_",
+		fmt.Sprintf("  SERP pages: *%d*/hr", serpHour),
+		fmt.Sprintf("  Websites discovered: *%d*/hr", websitesHour),
+		fmt.Sprintf("  Enrich processed: *%d*/hr", enrichHour),
+		fmt.Sprintf("  Emails found: *%d*/hr", emailsHour),
+		"",
+		"_Totals:_",
+		fmt.Sprintf("  SERP pages: %d", serpTotal),
+		fmt.Sprintf("  Enrich completed: %d", enrichTotal),
+		fmt.Sprintf("  Emails today: %d  |  Total: *%d*", emailsToday, emailsTotal),
+		"",
+		"_Pipeline:_",
+		fmt.Sprintf("  Queries: %d pending, %d processing, %d done", qPending, qProcessing, qCompleted),
+		fmt.Sprintf("  Enrich: %d pending, %d failed, %d dead", enrichPending, enrichFailed, enrichDead),
+		fmt.Sprintf("  Queues: serp=%d  enrich=%d", qSerp, qEnrich),
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 func (b *Bot) getUpdates(ctx context.Context) ([]Update, error) {
