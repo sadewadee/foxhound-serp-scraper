@@ -449,10 +449,10 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 			}
 		}
 
-		// 3. Mark queries completed FIRST (before stuck check).
-		// Order matters: complete done queries before resetting stuck ones,
-		// otherwise a done query could be wrongly reset to 'pending'.
-		s.db.Exec(`
+		// 3. Mark queries completed — but only check candidates, not all 24K+ processing.
+		// A query can only be "done" if it has serp_jobs AND none are active.
+		// We find candidates via serp_jobs that recently completed/failed.
+		completedRes, _ := s.db.Exec(`
 			UPDATE queries SET
 				status = 'completed',
 				result_count = COALESCE((
@@ -460,30 +460,41 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 				), 0),
 				updated_at = NOW()
 			WHERE status = 'processing'
+			AND id IN (
+				SELECT DISTINCT parent_job_id FROM serp_jobs
+				WHERE status IN ('completed', 'failed')
+				  AND updated_at > NOW() - INTERVAL '2 minutes'
+			)
 			AND NOT EXISTS (
 				SELECT 1 FROM serp_jobs
 				WHERE parent_job_id = queries.id
 				  AND status IN ('new', 'processing')
 			)
 		`)
+		if completedRes != nil {
+			if n, _ := completedRes.RowsAffected(); n > 0 {
+				slog.Info("serp: reconciler marked queries completed", "count", n)
+			}
+		}
 
-		// 4. THEN requeue queries stuck in 'processing' with no active serp_jobs.
-		// These are queries where the container died mid-generation.
-		// The 10-min window ensures we don't race with queryFeeder that just claimed it.
+		// 4. Requeue queries stuck in 'processing' with no serp_jobs at all.
+		// These are queries where the container died before generating serp_jobs.
+		// Only check old ones (>10 min) and LIMIT to avoid scanning all rows.
 		stuckQRes, stuckQErr := s.db.Exec(`
 			UPDATE queries SET status = 'pending', updated_at = NOW()
-			WHERE status = 'processing'
-			AND updated_at < NOW() - INTERVAL '10 minutes'
-			AND NOT EXISTS (
-				SELECT 1 FROM serp_jobs
-				WHERE parent_job_id = queries.id
-				  AND status IN ('new', 'processing')
+			WHERE id IN (
+				SELECT q.id FROM queries q
+				LEFT JOIN serp_jobs s ON s.parent_job_id = q.id
+				WHERE q.status = 'processing'
+				  AND q.updated_at < NOW() - INTERVAL '10 minutes'
+				GROUP BY q.id
+				HAVING COUNT(s.id) FILTER (WHERE s.status IN ('new', 'processing')) = 0
+				LIMIT 100
 			)
 		`)
 		if stuckQErr == nil {
 			if n, _ := stuckQRes.RowsAffected(); n > 0 {
 				slog.Info("serp: reconciler requeued stuck queries", "count", n)
-				// Push requeued queries back to Redis so queryFeeder picks them up.
 				s.requeuePendingQueriesToRedis(ctx)
 			}
 		}
