@@ -58,7 +58,8 @@ type SERPConfig struct {
 	ResultsPerPage        int `yaml:"results_per_page"`
 	DelayBetweenPagesMs   int `yaml:"delay_between_pages_ms"`
 	DelayBetweenQueriesMs int `yaml:"delay_between_queries_ms"`
-	Concurrency           int `yaml:"concurrency"` // number of tabs (goroutines)
+	Concurrency           int `yaml:"concurrency"`    // number of tabs (goroutines)
+	SERPDelayMs           int `yaml:"serp_delay_ms"`   // inter-page delay override (0 = use timing profile)
 }
 
 type WebsiteConfig struct {
@@ -97,6 +98,10 @@ type FetchConfig struct {
 	EnrichMaxRequests    int `yaml:"enrich_max_requests"`    // MaxBrowserRequests for enrich browser (default 300)
 	BrowserTimeoutSec    int `yaml:"browser_timeout_sec"`    // browser-level timeout in seconds (default 60)
 	ReconcilerIntervalMs int `yaml:"reconciler_interval_ms"` // reconciler tick interval in ms (default 60000)
+
+	// Persister — batch flush from Redis result queues to DB.
+	PersistIntervalMs int `yaml:"persist_interval_ms"` // flush interval in ms (default 5000)
+	PersistBatchSize  int `yaml:"persist_batch_size"`  // max items per flush (default 500)
 }
 
 type MonitorConfig struct {
@@ -158,6 +163,9 @@ func LoadFromEnv() (*Config, error) {
 		Proxy: ProxyConfig{
 			URL: os.Getenv("PROXY_URL"),
 		},
+		SERP: SERPConfig{
+			SERPDelayMs: parseEnvInt("SERP_DELAY_MS", 0),
+		},
 		Fetch: FetchConfig{
 			Headless:             true,
 			BlockImages:          true,
@@ -168,6 +176,8 @@ func LoadFromEnv() (*Config, error) {
 			EnrichMaxRequests:    parseEnvInt("ENRICH_MAX_REQUESTS", 0),
 			BrowserTimeoutSec:    parseEnvInt("BROWSER_TIMEOUT_SEC", 0),
 			ReconcilerIntervalMs: parseEnvInt("RECONCILER_INTERVAL_MS", 0),
+			PersistIntervalMs:    parseEnvInt("PERSIST_INTERVAL_MS", 0),
+			PersistBatchSize:     parseEnvInt("PERSIST_BATCH_SIZE", 0),
 		},
 		Mordibouncer: MordibouncerConfig{
 			APIURL: os.Getenv("MORDIBOUNCER_API_URL"),
@@ -266,6 +276,12 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Fetch.ReconcilerIntervalMs == 0 {
 		cfg.Fetch.ReconcilerIntervalMs = 60000
+	}
+	if cfg.Fetch.PersistIntervalMs == 0 {
+		cfg.Fetch.PersistIntervalMs = 5000
+	}
+	if cfg.Fetch.PersistBatchSize == 0 {
+		cfg.Fetch.PersistBatchSize = 500
 	}
 	// Default bools that YAML unmarshals as false when missing.
 	// We use a separate "defaults applied" check via Concurrency > 0 above.

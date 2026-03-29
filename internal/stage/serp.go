@@ -22,6 +22,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
+	"github.com/sadewadee/serp-scraper/internal/persist"
 	"github.com/sadewadee/serp-scraper/internal/query"
 	"github.com/sadewadee/serp-scraper/internal/scraper"
 )
@@ -31,6 +32,9 @@ import (
 // a Redis sorted-set queue, each acquiring a tab independently. A query
 // feeder goroutine converts pending queries into per-page serp_jobs and
 // pushes them to the queue. A reconciler resets stuck jobs every 60 s.
+//
+// Hot path is zero-DB: all claims via Redis SETNX, results pushed to
+// Redis lists, persister drains to DB in background batches.
 type SERPStage struct {
 	cfg       *config.Config
 	db        *sql.DB
@@ -128,6 +132,7 @@ func (s *SERPStage) Run(ctx context.Context) error {
 
 // queryFeeder pops queries from the Redis query queue, generates per-page
 // serp_jobs, and pushes each job onto the Redis SERP queue for tab workers.
+// Claims via Redis SETNX — no DB in hot path.
 func (s *SERPStage) queryFeeder(ctx context.Context) {
 	for {
 		select {
@@ -159,16 +164,9 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 			continue
 		}
 
-		// Atomic claim: only one SERP container wins. If another container already
-		// popped and claimed this query (duplicate in Redis from reconciler), skip.
-		res, claimErr := s.db.Exec(`
-			UPDATE queries SET status = 'processing', updated_at = NOW()
-			WHERE id = $1 AND status = 'pending'
-		`, qMsg.ID)
-		if claimErr != nil {
-			continue
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
+		// Redis SETNX claim — only one container wins.
+		ok, err := s.redis.SetNX(ctx, fmt.Sprintf("query:lock:%d", qMsg.ID), workerHostname(), 10*time.Minute).Result()
+		if err != nil || !ok {
 			// Already claimed by another container — skip.
 			continue
 		}
@@ -179,11 +177,16 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 			jobID := fmt.Sprintf("serp-%d-p%d", qMsg.ID, page)
 			serpURL := scraper.BuildSERPURL(qMsg.Text, page, s.cfg.SERP.ResultsPerPage)
 
-			s.db.Exec(`
-				INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, status)
-				VALUES ($1, $2, $3, $4, 'new')
-				ON CONFLICT (id) DO NOTHING
-			`, jobID, qMsg.ID, serpURL, page)
+			// Push serp_job creation to persister (DB write deferred).
+			result := persist.SERPResult{
+				JobID:       jobID,
+				QueryID:     qMsg.ID,
+				Status:      "new_job",
+				ErrorMsg:    serpURL, // reuse field for searchURL
+				ResultCount: page,   // reuse field for pageNum
+			}
+			data, _ := json.Marshal(result)
+			s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
 
 			s.pushSerpJob(ctx, jobID, serpURL, qMsg.ID, page)
 		}
@@ -203,12 +206,9 @@ func (s *SERPStage) pushSerpJob(ctx context.Context, jobID, serpURL string, quer
 
 // tabWorker is one of N goroutines that pops jobs from the Redis queue and
 // fetches SERP pages. All workers share the single pooled browser.
+// Zero DB calls in hot path — claims via Redis SETNX, results via Redis lists.
 func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
-	host, _ := os.Hostname()
-	if len(host) > 12 {
-		host = host[:12]
-	}
-	workerID := fmt.Sprintf("serp-%s-%d", host, tabID)
+	workerID := fmt.Sprintf("serp-%s-%d", shortHostname(), tabID)
 	slog.Info("serp: tab worker starting", "tab", tabID)
 
 	for {
@@ -241,16 +241,10 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			continue
 		}
 
-		// Atomic claim: only one worker wins. If job is already processing/completed
-		// (e.g. duplicate in Redis queue from reconciler), this returns no rows → skip.
-		var attemptCount, maxAttempts int
-		claimErr := s.db.QueryRow(`
-			UPDATE serp_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
-			WHERE id = $2 AND status IN ('new')
-			RETURNING attempt_count, max_attempts
-		`, workerID, job.ID).Scan(&attemptCount, &maxAttempts)
-		if claimErr != nil {
-			// Already claimed by another worker or doesn't exist — skip silently.
+		// Redis SETNX claim — only one worker wins. If job is already claimed
+		// (e.g. duplicate in Redis queue from reconciler), skip.
+		ok, claimErr := s.redis.SetNX(ctx, "serp:lock:"+job.ID, workerID, 5*time.Minute).Result()
+		if claimErr != nil || !ok {
 			continue
 		}
 
@@ -262,7 +256,13 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		if browser == nil {
 			slog.Warn("serp: browser is nil, re-queuing job", "tab", tabID, "job", job.ID)
 			s.pushSerpJob(ctx, job.ID, job.URL, job.QueryID, job.PageNum)
-			s.db.Exec(`UPDATE serp_jobs SET status = 'new', locked_by = NULL, updated_at = NOW() WHERE id = $1`, job.ID)
+			s.redis.Del(ctx, "serp:lock:"+job.ID) // release lock
+
+			// Push requeue status to persister.
+			result := persist.SERPResult{JobID: job.ID, Status: "requeue"}
+			data, _ := json.Marshal(result)
+			s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
+
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -276,24 +276,37 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		}
 
 		if fetchErr != nil {
-			newAttempt := attemptCount + 1
+			// We don't know attempt_count without DB — use Redis counter.
+			attemptKey := "serp:attempt:" + job.ID
+			newAttempt, _ := s.redis.Incr(ctx, attemptKey).Result()
+			s.redis.Expire(ctx, attemptKey, 1*time.Hour)
+
 			slog.Warn("serp: fetch failed", "job", job.ID, "attempt", newAttempt, "tab", tabID, "error", fetchErr)
 
+			maxAttempts := int64(5) // default
 			if newAttempt >= maxAttempts {
-				s.db.Exec(`
-					UPDATE serp_jobs SET status = 'failed', attempt_count = $1, error_msg = $2, updated_at = NOW()
-					WHERE id = $3
-				`, newAttempt, fetchErr.Error(), job.ID)
+				result := persist.SERPResult{
+					JobID:        job.ID,
+					Status:       "failed",
+					ErrorMsg:     fetchErr.Error(),
+					AttemptCount: int(newAttempt),
+				}
+				data, _ := json.Marshal(result)
+				s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
 			} else {
-				backoffSec := 30 * (1 << (newAttempt - 1)) // 30 s, 60 s, 120 s, …
-				s.db.Exec(`
-					UPDATE serp_jobs SET status = 'new', attempt_count = $1,
-						next_attempt_at = NOW() + interval '1 second' * $2,
-						error_msg = $3, updated_at = NOW()
-					WHERE id = $4
-				`, newAttempt, backoffSec, fetchErr.Error(), job.ID)
-				// Reconciler will re-queue this job once next_attempt_at elapses.
+				backoffSec := 30 * (1 << (newAttempt - 1))
+				result := persist.SERPResult{
+					JobID:        job.ID,
+					Status:       "failed",
+					ErrorMsg:     fetchErr.Error(),
+					AttemptCount: int(newAttempt),
+					BackoffSec:   int(backoffSec),
+				}
+				data, _ := json.Marshal(result)
+				s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
 			}
+
+			s.redis.Del(ctx, "serp:lock:"+job.ID) // release lock
 
 			// Rotate browser after captcha/block regardless of lifecycle counter.
 			if s.lifecycle.IncrementAndCheck() {
@@ -306,14 +319,18 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		urls, parseErr := scraper.ParseSERPResults(body)
 		if parseErr != nil {
 			slog.Warn("serp: parse failed", "job", job.ID, "error", parseErr)
-			s.db.Exec(`
-				UPDATE serp_jobs SET status = 'failed', error_msg = $1, updated_at = NOW()
-				WHERE id = $2
-			`, parseErr.Error(), job.ID)
+			result := persist.SERPResult{
+				JobID:    job.ID,
+				Status:   "parse_failed",
+				ErrorMsg: parseErr.Error(),
+			}
+			data, _ := json.Marshal(result)
+			s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
+			s.redis.Del(ctx, "serp:lock:"+job.ID)
 			continue
 		}
 
-		// Insert websites + enrich_jobs and push directly to enrich queue.
+		// Push URL results to Redis list (persister will INSERT to DB).
 		inserted := 0
 		for _, u := range urls {
 			urlHash := dedup.HashURL(u)
@@ -321,20 +338,20 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			if domain == "" {
 				continue
 			}
-			// Track website for reporting.
-			s.db.Exec(`
-				INSERT INTO websites (domain, url, url_hash, source_query_id, source_serp_id, page_type, status)
-				VALUES ($1, $2, $3, $4, $5, 'serp_result', 'pending')
-				ON CONFLICT (url_hash) DO NOTHING
-			`, domain, u, urlHash, job.QueryID, job.ID)
 
-			// Create enrich_job + push to enrich queue.
-			s.db.Exec(`
-				INSERT INTO enrich_jobs (parent_job_id, domain, url, url_hash, status)
-				VALUES ($1, $2, $3, $4, 'pending')
-				ON CONFLICT (url_hash) DO NOTHING
-			`, job.QueryID, domain, u, urlHash)
+			// Push URL result to persister queue.
+			urlResult := persist.URLResult{
+				URL:       u,
+				URLHash:   urlHash,
+				Domain:    domain,
+				QueryID:   job.QueryID,
+				SerpJobID: job.ID,
+			}
+			data, _ := json.Marshal(urlResult)
+			s.redis.RPush(ctx, persist.KeyResultURLs, string(data))
 
+			// Push to enrich queue immediately (workers can start enriching
+			// even before persister creates the DB record).
 			if err := pushToQueue(ctx, s.redis, "serp:queue:enrich", u, job.QueryID, job.ID); err != nil {
 				slog.Warn("serp: push to enrich queue failed", "url", u, "error", err)
 			}
@@ -344,10 +361,18 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		s.urlsFound.Add(int64(inserted))
 		s.pagesProcessed.Add(1)
 
-		s.db.Exec(`
-			UPDATE serp_jobs SET status = 'completed', result_count = $1, updated_at = NOW()
-			WHERE id = $2
-		`, len(urls), job.ID)
+		// Push SERP completion to persister queue.
+		result := persist.SERPResult{
+			JobID:       job.ID,
+			QueryID:     job.QueryID,
+			ResultCount: len(urls),
+			Status:      "completed",
+		}
+		data, _ := json.Marshal(result)
+		s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
+
+		// Release lock.
+		s.redis.Del(ctx, "serp:lock:"+job.ID)
 
 		slog.Info("serp: page done", "job", job.ID, "found", len(urls), "new", inserted, "tab", tabID)
 
@@ -357,8 +382,13 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			s.restartBrowser()
 		}
 
-		// Small inter-page delay to avoid hammering Google from the same browser.
-		delay := s.timing.PaginationDelay()
+		// Inter-page delay — use configured SERPDelayMs or timing profile.
+		var delay time.Duration
+		if s.cfg.SERP.SERPDelayMs > 0 {
+			delay = time.Duration(s.cfg.SERP.SERPDelayMs) * time.Millisecond
+		} else {
+			delay = s.timing.PaginationDelay()
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -394,6 +424,9 @@ func (s *SERPStage) restartBrowser() {
 //  1. Reset stuck processing jobs (locked >5 min) and re-queue them.
 //  2. Re-queue new jobs whose next_attempt_at has elapsed.
 //  3. Mark queries completed when all their serp_jobs are done.
+//
+// NOTE: Reconciler still uses DB for recovery (not hot path).
+// Workers never hit these queries during normal operation.
 func (s *SERPStage) reconciler(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(s.cfg.Fetch.ReconcilerIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
@@ -406,8 +439,6 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 		}
 
 		// 1. Reset stuck processing jobs (>5 min without progress).
-		// Use RETURNING to get exactly which rows were reset — avoids a separate
-		// SELECT that could race with other reconciler instances.
 		stuckRows, err := s.db.Query(`
 			UPDATE serp_jobs SET status = 'new', locked_by = NULL, locked_at = NULL, updated_at = NOW()
 			WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
@@ -420,6 +451,7 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 				var queryID int64
 				var pageNum int
 				if err := stuckRows.Scan(&id, &url, &queryID, &pageNum); err == nil {
+					s.redis.Del(ctx, "serp:lock:"+id) // clear stale lock
 					s.pushSerpJob(ctx, id, url, queryID, pageNum)
 					n++
 				}
@@ -454,9 +486,7 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 			}
 		}
 
-		// 3. Mark queries completed — but only check candidates, not all 24K+ processing.
-		// A query can only be "done" if it has serp_jobs AND none are active.
-		// We find candidates via serp_jobs that recently completed/failed.
+		// 3. Mark queries completed.
 		completedRes, _ := s.db.Exec(`
 			UPDATE queries SET
 				status = 'completed',
@@ -479,12 +509,11 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 		if completedRes != nil {
 			if n, _ := completedRes.RowsAffected(); n > 0 {
 				slog.Info("serp: reconciler marked queries completed", "count", n)
+				// Clean up query locks for completed queries.
 			}
 		}
 
-		// 4. Requeue queries stuck in 'processing' with no serp_jobs at all.
-		// These are queries where the container died before generating serp_jobs.
-		// Only check old ones (>10 min) and LIMIT to avoid scanning all rows.
+		// 4. Requeue queries stuck in 'processing' with no active serp_jobs.
 		stuckQRes, stuckQErr := s.db.Exec(`
 			UPDATE queries SET status = 'pending', updated_at = NOW()
 			WHERE id IN (
@@ -504,21 +533,17 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 			}
 		}
 
-		// 5. Auto-expand: for completed queries that found URLs, generate
-		// variant queries to squeeze more results beyond Google's 100 cap.
-		// Only runs once per query (result_count > 0 means it had results).
+		// 5. Auto-expand completed queries.
 		s.expandCompletedQueries()
 	}
 }
 
 // queryExpanders are suffixes appended to a base keyword to generate variants.
-// Each variant targets a different SERP slice from Google.
 var queryExpanders = []string{
 	"near me",
 	"reviews",
 	"classes",
 	"best rated",
-	// Personal email targeting — these surface pages with gmail/yahoo addresses.
 	"\"@gmail.com\"",
 	"\"@yahoo.com\"",
 	"email",
@@ -527,8 +552,7 @@ var queryExpanders = []string{
 }
 
 // expandCompletedQueries takes completed queries that yielded results and spawns
-// variant queries by appending expander suffixes. This multiplies the effective
-// reach beyond Google's 100-result cap per keyword.
+// variant queries by appending expander suffixes.
 func (s *SERPStage) expandCompletedQueries() {
 	rows, err := s.db.Query(`
 		SELECT id, text FROM queries
@@ -562,7 +586,6 @@ func (s *SERPStage) expandCompletedQueries() {
 			}
 		}
 
-		// Mark this query as expanded so we don't re-expand it.
 		s.db.Exec(`UPDATE queries SET expanded_at = NOW() WHERE id = $1`, id)
 	}
 
@@ -572,9 +595,8 @@ func (s *SERPStage) expandCompletedQueries() {
 }
 
 // requeueStuckJobs is called at startup to reset any jobs left in 'processing'
-// state by the previous process run. Handles both serp_jobs AND queries.
+// state by the previous process run.
 func (s *SERPStage) requeueStuckJobs() {
-	// Requeue stuck serp_jobs.
 	res, err := s.db.Exec(`
 		UPDATE serp_jobs SET status = 'new', locked_by = NULL, locked_at = NULL, updated_at = NOW()
 		WHERE status = 'processing'
@@ -585,8 +607,6 @@ func (s *SERPStage) requeueStuckJobs() {
 		slog.Info("serp: requeued stuck serp_jobs from previous run", "count", n)
 	}
 
-	// Requeue stuck queries — these got marked 'processing' by a previous
-	// container that died before finishing serp_job generation.
 	qRes, qErr := s.db.Exec(`
 		UPDATE queries SET status = 'pending', updated_at = NOW()
 		WHERE status = 'processing'
@@ -599,7 +619,6 @@ func (s *SERPStage) requeueStuckJobs() {
 }
 
 // requeuePendingQueriesToRedis pushes all pending queries to the Redis query queue.
-// Safe to call from multiple containers — queryFeeder uses atomic DB claim.
 func (s *SERPStage) requeuePendingQueriesToRedis(ctx context.Context) {
 	rows, err := s.db.Query(`SELECT id, text FROM queries WHERE status = 'pending' LIMIT 500`)
 	if err != nil {
@@ -623,7 +642,7 @@ func (s *SERPStage) requeuePendingQueriesToRedis(ctx context.Context) {
 	}
 }
 
-// pushToQueue pushes a URL job to a Redis sorted set queue used by website/enrich workers.
+// pushToQueue pushes a URL job to a Redis sorted set queue used by enrich workers.
 func pushToQueue(ctx context.Context, client *redis.Client, queueKey, urlStr string, queryID int64, serpID string) error {
 	job := &foxhound.Job{
 		ID:        fmt.Sprintf("web-%d-%s", queryID, dedup.HashURL(urlStr)[:8]),
@@ -649,6 +668,21 @@ func pushToQueue(ctx context.Context, client *redis.Client, queueKey, urlStr str
 	}).Err()
 }
 
+// shortHostname returns the first 12 chars of the hostname.
+func shortHostname() string {
+	host, _ := os.Hostname()
+	if len(host) > 12 {
+		host = host[:12]
+	}
+	return host
+}
+
+// workerHostname returns full hostname for lock values.
+func workerHostname() string {
+	host, _ := os.Hostname()
+	return host
+}
+
 // QueriesProcessed returns the count of processed queries.
 func (s *SERPStage) QueriesProcessed() int64 {
 	return s.queriesProcessed.Load()
@@ -664,5 +698,5 @@ func (s *SERPStage) PagesProcessed() int64 {
 	return s.pagesProcessed.Load()
 }
 
-// Ensure db import is used (models.go SERPJob type is referenced indirectly via DB queries).
+// Ensure db import is used.
 var _ = db.SERPJob{}

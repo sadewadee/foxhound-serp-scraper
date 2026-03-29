@@ -124,15 +124,20 @@ services:
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXY_URL: "${PROXY_URL:-}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
-      # ── DB pool (low — persistence only, jobs via Redis) ──
-      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-5}"
-      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-2}"
+      # ── DB pool (minimal — hot path is zero-DB, only persister+reconciler need DB) ──
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
       # ── Browser lifecycle tuning (optional) ──
       PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
       BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
       SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-200}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
+      # ── SERP timing ──
+      SERP_DELAY_MS: "${SERP_DELAY_MS:-3000}"
+      # ── Persister (batch flush Redis→DB) ──
+      PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
+      PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
     command: ["run", "-stage", "serp", "-workers", "${SERP_CONCURRENCY:-4}"]
@@ -174,15 +179,18 @@ services:
       PROXY_URL: "${PROXY_URL:-}"
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
-      # ── DB pool (low — persistence only, jobs via Redis) ──
-      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-5}"
-      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-2}"
+      # ── DB pool (minimal — hot path is zero-DB, only persister+reconciler need DB) ──
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
       # ── Browser lifecycle tuning (optional) ──
       PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
       BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
       STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
       ENRICH_MAX_REQUESTS: "${ENRICH_MAX_REQUESTS:-300}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      # ── Persister (batch flush Redis→DB) ──
+      PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
+      PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
     command: ["run", "-stage", "enrich", "-workers", "${ENRICH_CONCURRENCY:-20}"]

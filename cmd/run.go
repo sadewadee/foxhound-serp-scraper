@@ -16,6 +16,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/monitor"
+	"github.com/sadewadee/serp-scraper/internal/persist"
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
 	"github.com/sadewadee/serp-scraper/internal/telegram"
 )
@@ -23,6 +24,7 @@ import (
 // RunPipeline starts the API server and scraping pipeline.
 // API server is the main process — stays alive even when pipeline is idle.
 // Pipeline stages run in background goroutines.
+// Persister runs alongside to batch-flush Redis results to DB.
 func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	if workers > 0 {
 		switch stageName {
@@ -75,6 +77,11 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		}()
 	}
 
+	// Start persister — drains Redis result queues to DB in batches.
+	// Runs in every container (safe — DB operations are idempotent via ON CONFLICT/WHERE).
+	persister := persist.New(database, dd.Client(), cfg.Fetch.PersistIntervalMs, cfg.Fetch.PersistBatchSize)
+	go persister.Run(ctx)
+
 	// Start pipeline stages in background (skip for "none" — API only mode).
 	if stageName != "none" {
 		orch := pipeline.New(cfg, database, dd)
@@ -94,7 +101,7 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 			slog.Info("pipeline stages finished — API server still running")
 		}()
 	} else {
-		slog.Info("stage=none: API-only mode, no pipeline stages")
+		slog.Info("stage=none: API-only mode, no pipeline stages (persister still running)")
 	}
 
 	// Start REST API server (blocking — keeps process alive).

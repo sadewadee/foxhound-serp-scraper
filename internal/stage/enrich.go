@@ -19,11 +19,11 @@ import (
 
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/fetch"
-	"github.com/lib/pq"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/directory"
+	"github.com/sadewadee/serp-scraper/internal/persist"
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
@@ -41,13 +41,14 @@ var contactPagePaths = []string{
 }
 
 // EnrichStage runs Stage 4: Contact enrichment workers.
+// Hot path is zero-DB: all claims via Redis SETNX, results pushed to
+// Redis lists, persister drains to DB in background batches.
 type EnrichStage struct {
 	cfg   *config.Config
 	db    *sql.DB
 	dedup *dedup.Store
 
 	// Shared browser state — all workers share one browser process (pool of tabs).
-	// browserMu guards sharedBrowser pointer replacement during lifecycle restarts.
 	browserMu     sync.Mutex
 	sharedBrowser *fetch.CamoufoxFetcher
 	lifecycle     *internalScraper.BrowserLifecycle
@@ -59,7 +60,6 @@ type EnrichStage struct {
 
 // NewEnrichStage creates a new contact enrichment stage.
 func NewEnrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *EnrichStage {
-	// Browser factory that matches the pool size to the configured concurrency.
 	browserFactory := func(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		return internalScraper.NewBrowserWithPool(cfg, cfg.Enrich.Concurrency)
 	}
@@ -72,16 +72,8 @@ func NewEnrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Enri
 }
 
 // Run starts contact enrichment workers. Blocks until ctx is cancelled.
-//
-// Browser lifecycle:
-//   - 1 shared Camoufox browser with N pooled tabs (N = worker count)
-//   - Browser auto-recycles every maxBrowserRequests (default 300) via foxhound
-//   - Stealth HTTP handles 95%+ of requests (no browser needed)
-//   - Browser pool is fallback-only for JS-heavy sites
-//   - Stealth fetchers are recycled every stealthRecycleInterval to prevent
-//     memory growth from accumulated TLS sessions and connection pools
 func (c *EnrichStage) Run(ctx context.Context) error {
-	// Requeue stuck processing jobs from previous run.
+	// Requeue stuck processing jobs from previous run (startup only — uses DB).
 	res, err := c.db.Exec(`UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, updated_at = NOW() WHERE status = 'processing'`)
 	if err != nil {
 		slog.Warn("enrich: requeue stuck jobs failed", "error", err)
@@ -99,7 +91,6 @@ func (c *EnrichStage) Run(ctx context.Context) error {
 	go touchHealthFile(ctx, "/tmp/worker-healthy")
 
 	// One shared browser for all workers (fallback for JS-heavy sites).
-	// Pool size = worker count so each goroutine can acquire a pre-warmed tab.
 	browser, err := internalScraper.NewBrowserWithPool(c.cfg, numWorkers)
 	if err != nil {
 		slog.Warn("enrich: shared browser init failed, stealth-only mode", "error", err)
@@ -137,10 +128,7 @@ func (c *EnrichStage) Run(ctx context.Context) error {
 	return nil
 }
 
-// reconciler runs periodically to:
-//  1. Reset enrich_jobs stuck in 'processing' (locked >5 min) back to 'pending'.
-//  2. Re-queue 'pending' DB records that are NOT in the Redis queue (DB↔Redis mismatch).
-//  3. Re-queue 'failed' jobs whose next_attempt_at has elapsed.
+// reconciler runs periodically to handle recovery (NOT hot path — uses DB).
 func (c *EnrichStage) reconciler(ctx context.Context) {
 	interval := time.Duration(c.cfg.Fetch.ReconcilerIntervalMs) * time.Millisecond
 	ticker := time.NewTicker(interval)
@@ -156,7 +144,6 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 		queueKey := "serp:queue:enrich"
 
 		// 1. Reset stuck processing jobs (>5 min) and immediately re-queue.
-		// RETURNING gives us exactly the rows we reset — no separate SELECT race.
 		stuckRows, err := c.db.Query(`
 			UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, updated_at = NOW()
 			WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
@@ -168,6 +155,7 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				var id, pageURL, urlHash string
 				var queryID int64
 				if err := stuckRows.Scan(&id, &pageURL, &urlHash, &queryID); err == nil {
+					c.dedup.Client().Del(ctx, "enrich:lock:"+urlHash) // clear stale lock
 					c.pushToEnrichQueue(ctx, queueKey, pageURL, urlHash, queryID)
 					n++
 				}
@@ -179,7 +167,6 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 		}
 
 		// 2. Re-queue orphaned pending jobs (DB exists but missing from Redis).
-		// UPDATE updated_at so we don't re-push the same jobs every tick.
 		orphanRows, err := c.db.Query(`
 			UPDATE enrich_jobs SET updated_at = NOW()
 			WHERE status = 'pending' AND locked_by IS NULL
@@ -259,6 +246,8 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 	}
 }
 
+// worker is the hot-path goroutine. Zero DB calls — claims via Redis SETNX,
+// results pushed to Redis lists for persister to drain.
 func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 	host, _ := os.Hostname()
 	if len(host) > 12 {
@@ -267,8 +256,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 	workerIDStr := fmt.Sprintf("enrich-%s-%d", host, workerID)
 	slog.Info("enrich: worker starting", "worker", workerID)
 
-	// Each worker gets its own stealth HTTP fetcher (lightweight, per-worker identity).
-	// Recycled every StealthRecycleAfter requests to prevent memory growth.
 	stealth := internalScraper.NewStealth(c.cfg)
 	stealthCount := 0
 	stealthRecycleAfter := c.cfg.Fetch.StealthRecycleAfter
@@ -276,13 +263,14 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 	defer stealth.Close()
 
 	queueKey := "serp:queue:enrich"
+	redisClient := c.dedup.Client()
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Recycle stealth fetcher periodically — new identity, fresh TLS sessions.
+		// Recycle stealth fetcher periodically.
 		stealthCount++
 		if stealthCount >= stealthRecycleAfter {
 			stealth.Close()
@@ -292,7 +280,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		}
 
 		// Pop from Redis enrich queue.
-		job, err := popFromQueue(ctx, c.dedup.Client(), queueKey)
+		job, err := popFromQueue(ctx, redisClient, queueKey)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -320,8 +308,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			continue
 		}
 
-		// Domain-level dedup: if this is the first time we see this domain,
-		// generate contact page candidate URLs and queue them for enrichment.
+		// Domain-level dedup: queue contact pages for new domains.
 		if c.cfg.Enrich.ContactPages {
 			isDomainNew, dedupErr := c.dedup.Add(ctx, dedup.KeyDomains, domain)
 			if dedupErr != nil {
@@ -331,28 +318,15 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			}
 		}
 
-		// Extract url_hash from meta to look up the enrich_job.
+		// Extract url_hash from meta.
 		urlHash, _ := job.Meta["url_hash"].(string)
 		if urlHash == "" {
 			urlHash = dedup.HashURL(pageURL)
 		}
 
-		// Atomic claim: lookup + lock in one statement.
-		// Only succeeds if job exists AND is in a claimable state (pending/failed).
-		// If another worker already claimed it (duplicate in Redis), this returns no rows → skip.
-		var enrichJobID string
-		claimErr := c.db.QueryRowContext(ctx, `
-			UPDATE enrich_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW()
-			WHERE id = (
-				SELECT id FROM enrich_jobs
-				WHERE url_hash = $2 AND status IN ('pending', 'failed')
-				LIMIT 1
-				FOR UPDATE SKIP LOCKED
-			)
-			RETURNING id
-		`, workerIDStr, urlHash).Scan(&enrichJobID)
-		if claimErr != nil {
-			// Already claimed, completed, dead, or doesn't exist — skip.
+		// Redis SETNX claim — only one worker wins. If already claimed, skip.
+		ok, claimErr := redisClient.SetNX(ctx, "enrich:lock:"+urlHash, workerIDStr, 5*time.Minute).Result()
+		if claimErr != nil || !ok {
 			continue
 		}
 
@@ -360,8 +334,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		timeout := time.Duration(c.cfg.Enrich.TimeoutMs) * time.Millisecond
 		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
-		// Snapshot the shared browser pointer for this fetch (the browser itself
-		// is goroutine-safe for concurrent Fetch calls).
 		c.browserMu.Lock()
 		currentBrowser := c.sharedBrowser
 		c.browserMu.Unlock()
@@ -374,22 +346,17 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		}
 		cancel()
 
-		// Check lifecycle after every fetch attempt (success or failure).
-		// Only one goroutine wins the restart; others continue with the new browser.
+		// Check lifecycle after every fetch attempt.
 		if currentBrowser != nil && c.lifecycle.IncrementAndCheck() {
 			slog.Info("enrich: page reuse limit reached, restarting browser", "worker", workerID)
 			c.browserMu.Lock()
-			// Re-check: another worker may have already restarted.
 			if c.sharedBrowser != currentBrowser {
-				// Another worker already restarted — just use the new one.
 				c.browserMu.Unlock()
 			} else {
-				// Mark nil so other workers fall back to stealth-only during restart.
 				oldBrowser := c.sharedBrowser
 				c.sharedBrowser = nil
 				c.browserMu.Unlock()
 
-				// Restart outside the lock — Close() may block waiting for in-flight fetches.
 				newBrowser, restartErr := c.lifecycle.Restart(oldBrowser)
 				c.browserMu.Lock()
 				if restartErr != nil {
@@ -405,34 +372,23 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			errMsg := err.Error()
 			slog.Debug("enrich: fetch failed", "url", pageURL, "error", errMsg)
 
-			// Classify error: permanent (no point retrying) vs transient (retry later).
-			if isPermanentError(errMsg) {
-				c.db.ExecContext(ctx, `
-					UPDATE enrich_jobs SET
-						attempt_count = attempt_count + 1,
-						error_msg = $1,
-						status = 'dead',
-						updated_at = NOW()
-					WHERE id = $2
-				`, errMsg, enrichJobID)
-			} else {
-				c.db.ExecContext(ctx, `
-					UPDATE enrich_jobs SET
-						attempt_count = attempt_count + 1,
-						error_msg = $1,
-						status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'dead' ELSE 'failed' END,
-						next_attempt_at = CASE WHEN attempt_count + 1 >= max_attempts THEN NULL
-							ELSE NOW() + interval '1 second' * 30 * power(2, attempt_count) END,
-						updated_at = NOW()
-					WHERE id = $2
-				`, errMsg, enrichJobID)
+			// Push failure to Redis result queue (persister handles DB update).
+			result := persist.EnrichResult{
+				URLHash:     urlHash,
+				Status:      "failed",
+				ErrorMsg:    errMsg,
+				AttemptIncr: 1,
+				IsPermanent: isPermanentError(errMsg),
 			}
+			data, _ := json.Marshal(result)
+			redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
+			redisClient.Del(ctx, "enrich:lock:"+urlHash) // release lock
 			continue
 		}
 
 		c.pagesProcessed.Add(1)
 
-		// Directory path: extract business listings, queue individual URLs for enrichment.
+		// Directory path: extract business listings, queue individual URLs.
 		if directory.IsDirectory(pageURL) {
 			listings := directory.ExtractListings(pageURL, []byte(body))
 			if len(listings) > 0 {
@@ -440,7 +396,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 					"url", pageURL, "count", len(listings), "worker", workerID)
 			}
 
-			// Collect emails/phones from directory page itself.
 			var rawEmails, rawPhones []string
 			for _, l := range listings {
 				if l.Email != "" {
@@ -456,7 +411,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 					if listingDomain == "" {
 						continue
 					}
-					// Extract query_id from job meta.
 					var qID int64
 					if qid, ok := job.Meta["query_id"]; ok {
 						switch v := qid.(type) {
@@ -466,12 +420,19 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 							qID = v
 						}
 					}
-					c.db.Exec(`
-						INSERT INTO enrich_jobs (parent_job_id, domain, url, url_hash, status)
-						VALUES ($1, $2, $3, $4, 'pending')
-						ON CONFLICT (url_hash) DO NOTHING
-					`, qID, listingDomain, l.URL, listingHash)
 
+					// Push directory listing to persister (DB INSERT deferred).
+					dirResult := persist.EnrichResult{
+						URLHash:     listingHash,
+						Status:      "directory_listing",
+						Website:     listingDomain, // reuse: domain
+						Address:     l.URL,         // reuse: url
+						AttemptIncr: int(qID),      // reuse: queryID
+					}
+					dirData, _ := json.Marshal(dirResult)
+					redisClient.RPush(ctx, persist.KeyResultEnrich, string(dirData))
+
+					// Push to enrich queue immediately.
 					pushData := &foxhound.Job{
 						ID:        fmt.Sprintf("enrich-%s", listingHash[:12]),
 						URL:       l.URL,
@@ -483,7 +444,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 					data, _ := json.Marshal(pushData)
 					micros := pushData.CreatedAt.UnixMicro()
 					score := -(float64(pushData.Priority) * 1_000_000_000) + float64(micros)
-					c.dedup.Client().ZAdd(ctx, queueKey, redis.Z{Score: score, Member: string(data)})
+					redisClient.ZAdd(ctx, queueKey, redis.Z{Score: score, Member: string(data)})
 				}
 			}
 
@@ -491,21 +452,18 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			allPhones := internalScraper.FilterPhones(rawPhones)
 
 			socialLinks := buildSocialLinks(nil)
-			socialJSON, _ := json.Marshal(socialLinks)
 
-			_, updateErr := c.db.ExecContext(ctx, `
-				UPDATE enrich_jobs SET
-					emails = $1,
-					phones = $2,
-					social_links = $3,
-					status = 'completed',
-					completed_at = NOW(),
-					updated_at = NOW()
-				WHERE id = $4
-			`, pq.Array(allEmails), pq.Array(allPhones), socialJSON, enrichJobID)
-			if updateErr != nil {
-				slog.Warn("enrich: directory update enrich_job failed", "error", updateErr)
+			// Push directory completion to persister.
+			result := persist.EnrichResult{
+				URLHash:     urlHash,
+				Status:      "completed",
+				Emails:      allEmails,
+				Phones:      allPhones,
+				SocialLinks: socialLinks,
 			}
+			data, _ := json.Marshal(result)
+			redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
+			redisClient.Del(ctx, "enrich:lock:"+urlHash) // release lock
 
 			c.emailsFound.Add(int64(len(allEmails)))
 			c.phonesFound.Add(int64(len(allPhones)))
@@ -517,69 +475,44 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 
 		// Extract contacts.
 		cd := internalScraper.ExtractContacts([]byte(body))
-
-		// Apply post-extraction filters before any further processing.
 		emails := internalScraper.FilterEmails(cd.Emails)
 		phones := internalScraper.FilterPhones(cd.Phones)
 
-		// Optional MX validation — filter emails that fail MX check.
+		// Optional MX validation.
 		var mxValid *bool
 		if c.cfg.Enrich.ValidateMX && len(emails) > 0 {
-			// Validate MX for the first email's domain (representative for the site).
 			v := internalScraper.ValidateMX(emails[0])
 			mxValid = &v
 			if !v {
-				// Discard emails from domains without MX records.
 				emails = nil
 			}
 		}
 
-		// Build social links JSON.
 		socialLinks := buildSocialLinks(cd)
-		socialJSON, _ := json.Marshal(socialLinks)
-
-		// Determine website URL (main domain URL, not the specific page).
 		websiteURL := fmt.Sprintf("https://%s", dedup.ExtractDomain(pageURL))
 
-		// Update enrich_job with collected arrays + business info.
-		_, updateErr := c.db.ExecContext(ctx, `
-			UPDATE enrich_jobs SET
-				contact_name = $1,
-				business_name = $2,
-				business_category = $3,
-				description = $4,
-				website = $5,
-				emails = $6,
-				phones = $7,
-				social_links = $8,
-				address = $9,
-				location = $10,
-				opening_hours = $11,
-				rating = $12,
-				page_title = $13,
-				mx_valid = $14,
-				status = 'completed',
-				completed_at = NOW(),
-				updated_at = NOW()
-			WHERE id = $15
-		`, cd.ContactName, cd.BusinessName, cd.BusinessCategory, cd.Description, websiteURL,
-			pq.Array(emails), pq.Array(phones), socialJSON,
-			cd.Address, cd.Location, cd.OpeningHours, cd.Rating, cd.PageTitle,
-			mxValid, enrichJobID)
-		if updateErr != nil {
-			slog.Warn("enrich: update enrich_job failed", "url", pageURL, "error", updateErr)
-			c.db.ExecContext(ctx, `
-				UPDATE enrich_jobs SET
-					attempt_count = attempt_count + 1,
-					error_msg = $1,
-					status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'dead' ELSE 'failed' END,
-					next_attempt_at = CASE WHEN attempt_count + 1 >= max_attempts THEN NULL
-						ELSE NOW() + interval '1 second' * 30 * power(2, attempt_count) END,
-					updated_at = NOW()
-				WHERE id = $2
-			`, updateErr.Error(), enrichJobID)
-			continue
+		// Push completion to Redis result queue (persister handles DB update).
+		result := persist.EnrichResult{
+			URLHash:          urlHash,
+			Status:           "completed",
+			Emails:           emails,
+			Phones:           phones,
+			SocialLinks:      socialLinks,
+			ContactName:      cd.ContactName,
+			BusinessName:     cd.BusinessName,
+			BusinessCategory: cd.BusinessCategory,
+			Description:      cd.Description,
+			Website:          websiteURL,
+			Address:          cd.Address,
+			Location:         cd.Location,
+			OpeningHours:     cd.OpeningHours,
+			Rating:           cd.Rating,
+			PageTitle:        cd.PageTitle,
+			MXValid:          mxValid,
 		}
+		data, _ := json.Marshal(result)
+		redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
+		redisClient.Del(ctx, "enrich:lock:"+urlHash) // release lock
 
 		c.emailsFound.Add(int64(len(emails)))
 		c.phonesFound.Add(int64(len(phones)))
@@ -592,15 +525,14 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 	}
 }
 
-// queueContactPages generates contact page candidate URLs for a domain and pushes
-// them to the enrich queue. Called once per new domain (domain-level dedup).
+// queueContactPages generates contact page candidate URLs and queues them.
+// Zero DB — pushes to Redis result queue for persister + enrich queue for workers.
 func (c *EnrichStage) queueContactPages(ctx context.Context, pageURL, domain string, job *foxhound.Job) {
 	u, err := url.Parse(pageURL)
 	if err != nil {
 		return
 	}
 
-	// Extract query_id from job meta.
 	var queryID int64
 	if qid, ok := job.Meta["query_id"]; ok {
 		switch v := qid.(type) {
@@ -612,24 +544,24 @@ func (c *EnrichStage) queueContactPages(ctx context.Context, pageURL, domain str
 	}
 
 	queueKey := "serp:queue:enrich"
+	redisClient := c.dedup.Client()
+
 	for _, path := range contactPagePaths {
 		contactURL := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, path)
 		contactHash := dedup.HashURL(contactURL)
 
-		// Insert website record for tracking.
-		c.db.Exec(`
-			INSERT INTO websites (domain, url, url_hash, source_query_id, page_type, status)
-			VALUES ($1, $2, $3, $4, 'contact', 'pending')
-			ON CONFLICT (url_hash) DO NOTHING
-		`, domain, contactURL, contactHash, queryID)
+		// Push contact page creation to persister (DB INSERTs deferred).
+		cpResult := persist.EnrichResult{
+			URLHash:     contactHash,
+			Status:      "contact_page",
+			Website:     domain,      // reuse: domain
+			Address:     contactURL,  // reuse: url
+			AttemptIncr: int(queryID), // reuse: queryID
+		}
+		cpData, _ := json.Marshal(cpResult)
+		redisClient.RPush(ctx, persist.KeyResultEnrich, string(cpData))
 
-		// Insert enrich_job + push to queue.
-		c.db.Exec(`
-			INSERT INTO enrich_jobs (parent_job_id, domain, url, url_hash, status)
-			VALUES ($1, $2, $3, $4, 'pending')
-			ON CONFLICT (url_hash) DO NOTHING
-		`, queryID, domain, contactURL, contactHash)
-
+		// Push to enrich queue immediately.
 		pushData := &foxhound.Job{
 			ID:        fmt.Sprintf("enrich-%s", contactHash[:12]),
 			URL:       contactURL,
@@ -644,7 +576,7 @@ func (c *EnrichStage) queueContactPages(ctx context.Context, pageURL, domain str
 		data, _ := json.Marshal(pushData)
 		micros := pushData.CreatedAt.UnixMicro()
 		score := -(float64(pushData.Priority) * 1_000_000_000) + float64(micros)
-		c.dedup.Client().ZAdd(ctx, queueKey, redis.Z{Score: score, Member: string(data)})
+		redisClient.ZAdd(ctx, queueKey, redis.Z{Score: score, Member: string(data)})
 	}
 
 	slog.Debug("enrich: contact pages queued", "domain", domain, "count", len(contactPagePaths))
@@ -731,17 +663,16 @@ func (c *EnrichStage) pushToEnrichQueue(ctx context.Context, queueKey, pageURL, 
 }
 
 // isPermanentError returns true for HTTP errors that will never succeed on retry.
-// These are not transient — retrying just wastes crawl budget.
 func isPermanentError(errMsg string) bool {
 	permanent := []string{
-		"HTTP 403", // Forbidden — blocked by server
-		"HTTP 404", // Not Found — page doesn't exist
-		"HTTP 410", // Gone — permanently removed
-		"HTTP 451", // Unavailable For Legal Reasons
-		"certificate",     // SSL/TLS cert issues
-		"x509",            // cert validation failure
-		"no such host",    // DNS resolution failed — domain dead
-		"server misbehaving", // DNS failure variant
+		"HTTP 403",
+		"HTTP 404",
+		"HTTP 410",
+		"HTTP 451",
+		"certificate",
+		"x509",
+		"no such host",
+		"server misbehaving",
 	}
 	lower := strings.ToLower(errMsg)
 	for _, p := range permanent {
