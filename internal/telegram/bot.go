@@ -189,10 +189,17 @@ func (b *Bot) buildRateReport(ctx context.Context) string {
 	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
 	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
 
+	// ── Active workers (distinct locked_by in last 5 min) ──
+	var serpWorkers, enrichWorkers int
+	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM serp_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&serpWorkers)
+	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM enrich_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&enrichWorkers)
+
 	// ── Build message ──
 	ts := time.Now().Format("15:04 MST")
 	lines := []string{
 		fmt.Sprintf("*Hourly Report* (%s)", ts),
+		"",
+		fmt.Sprintf("_Workers:_ SERP: *%d*  Enrich: *%d*", serpWorkers, enrichWorkers),
 		"",
 		"_Rates (last hour):_",
 		fmt.Sprintf("  SERP pages: *%d*/hr", serpHour),
