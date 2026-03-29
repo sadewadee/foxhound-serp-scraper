@@ -64,12 +64,15 @@ func (bl *BrowserLifecycle) Restart(old *fetch.CamoufoxFetcher) (*fetch.Camoufox
 		old.Close()
 	}
 
+	// Always kill orphan browser processes after Close() — child firefox
+	// processes can outlive the parent camoufox and become zombies.
+	killOrphanBrowserProcesses(bl.label)
+
 	// Clean foxhound temp addon dirs.
 	cleanTempAddonDirs()
 
-	// Full cleanup: kill orphans and reset restart counter.
+	// Full cleanup: reset restart counter.
 	if isFullCleanup {
-		killOrphanBrowserProcesses(bl.label)
 		bl.restartCount = 0
 	}
 
