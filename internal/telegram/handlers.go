@@ -157,108 +157,75 @@ func (b *Bot) handleGenerate(msg *Message, args string) {
 }
 
 func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
-	lines := []string{"*Dashboard*"}
+	// ── Active workers ──
+	var serpWorkers, enrichWorkers int
+	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM serp_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&serpWorkers)
+	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM enrich_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&enrichWorkers)
 
-	// ── Queries ── (single query)
-	var qTotal, qPending, qProcessing, qCompleted, qError int
+	// ── Queries ──
+	var qPending, qProcessing, qCompleted int
 	b.db.QueryRow(`
 		SELECT
-			COUNT(*),
 			COUNT(*) FILTER (WHERE status = 'pending'),
 			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'error')
+			COUNT(*) FILTER (WHERE status = 'completed')
 		FROM queries
-	`).Scan(&qTotal, &qPending, &qProcessing, &qCompleted, &qError)
-	lines = append(lines, "",
-		"_Queries:_",
-		fmt.Sprintf("  Total: *%d*  Pending: %d", qTotal, qPending),
-		fmt.Sprintf("  Processing: %d  Done: %d  Error: %d", qProcessing, qCompleted, qError))
+	`).Scan(&qPending, &qProcessing, &qCompleted)
 
-	// ── SERP ── (single query)
-	var serpTotal, serpPending, serpCompleted, serpFailed, serpURLs int
-	var serpHour, serpToday int
+	// ── SERP ──
+	var serpCompleted, serpFailed, serpHour, serpToday int
 	b.db.QueryRow(`
 		SELECT
-			COUNT(*),
-			COUNT(*) FILTER (WHERE status = 'new'),
 			COUNT(*) FILTER (WHERE status = 'completed'),
 			COUNT(*) FILTER (WHERE status = 'failed'),
-			COALESCE(SUM(result_count) FILTER (WHERE status = 'completed'), 0),
 			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours')
 		FROM serp_jobs
-	`).Scan(&serpTotal, &serpPending, &serpCompleted, &serpFailed, &serpURLs, &serpHour, &serpToday)
-	lines = append(lines, "",
-		"_SERP:_",
-		fmt.Sprintf("  Pages: *%d*  Pending: %d  Done: %d  Failed: %d", serpTotal, serpPending, serpCompleted, serpFailed),
-		fmt.Sprintf("  URLs found: *%d*", serpURLs),
-		fmt.Sprintf("  Rate: %d/hour  Today: %d", serpHour, serpToday))
+	`).Scan(&serpCompleted, &serpFailed, &serpHour, &serpToday)
 
-	// ── Enrich ── (single query)
-	var enTotal, enPending, enCompleted, enFailed, enDead int
-	var enHour, enToday int
+	// ── Enrich ──
+	var enCompleted, enFailed, enDead, enHour, enToday int
 	b.db.QueryRow(`
 		SELECT
-			COUNT(*),
-			COUNT(*) FILTER (WHERE status = 'pending'),
 			COUNT(*) FILTER (WHERE status = 'completed'),
 			COUNT(*) FILTER (WHERE status = 'failed'),
 			COUNT(*) FILTER (WHERE status = 'dead'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
 		FROM enrich_jobs
-	`).Scan(&enTotal, &enPending, &enCompleted, &enFailed, &enDead, &enHour, &enToday)
-	lines = append(lines, "",
-		"_Enrich:_",
-		fmt.Sprintf("  Total: *%d*  Pending: %d  Done: %d", enTotal, enPending, enCompleted),
-		fmt.Sprintf("  Failed: %d  Dead: %d", enFailed, enDead),
-		fmt.Sprintf("  Rate: %d/hour  Today: %d", enHour, enToday))
+	`).Scan(&enCompleted, &enFailed, &enDead, &enHour, &enToday)
 
-	// ── Contacts ── (single query)
-	var uniqueEmails, emailsToday, emailsHour, uniqueDomains int
+	// ── Emails ──
+	var emailsHour, emailsToday, emailsTotal int
 	b.db.QueryRow(`
 		SELECT
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'),
 			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			COUNT(DISTINCT domain)
-		FROM enrich_jobs
-		WHERE status = 'completed'
-	`).Scan(&uniqueEmails, &emailsToday, &emailsHour, &uniqueDomains)
-	lines = append(lines, "",
-		"_Contacts:_",
-		fmt.Sprintf("  Unique emails: *%d*", uniqueEmails),
-		fmt.Sprintf("  Emails: %d/hour  Today: %d", emailsHour, emailsToday),
-		fmt.Sprintf("  Domains: %d", uniqueDomains))
-
-	// ── Top providers ──
-	providerRows, _ := b.db.Query(`
-		SELECT split_part(e, '@', 2), COUNT(*)
-		FROM enrich_jobs, unnest(emails) AS e
-		WHERE status = 'completed'
-		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
-	`)
-	if providerRows != nil {
-		lines = append(lines, "", "_Top providers:_")
-		for providerRows.Next() {
-			var p string
-			var c int
-			providerRows.Scan(&p, &c)
-			lines = append(lines, fmt.Sprintf("  %s: %d", p, c))
-		}
-		providerRows.Close()
-	}
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed')
+	`).Scan(&emailsHour, &emailsToday, &emailsTotal)
 
 	// ── Queues ──
-	var qQueries, qSerp, qEnrich int64
-	qQueries, _ = b.redis.ZCard(ctx, "serp:queue:queries").Result()
+	var qSerp, qEnrich int64
 	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
 	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
-	if qQueries > 0 || qSerp > 0 || qEnrich > 0 {
-		lines = append(lines, "",
-			"_Queues:_",
-			fmt.Sprintf("  queries: %d  serp: %d  enrich: %d", qQueries, qSerp, qEnrich))
+
+	lines := []string{
+		"*Dashboard*",
+		"",
+		fmt.Sprintf("_Workers:_ SERP: *%d*  Enrich: *%d*", serpWorkers, enrichWorkers),
+		"",
+		"_Rates (last hour):_",
+		fmt.Sprintf("  SERP: *%d*/hr  Enrich: *%d*/hr", serpHour, enHour),
+		fmt.Sprintf("  Emails: *%d*/hr", emailsHour),
+		"",
+		"_Totals:_",
+		fmt.Sprintf("  SERP: %d done, %d failed", serpCompleted, serpFailed),
+		fmt.Sprintf("  Enrich: %d done, %d failed, %d dead", enCompleted, enFailed, enDead),
+		fmt.Sprintf("  Emails: today %d  |  total *%d*", emailsToday, emailsTotal),
+		"",
+		"_Pipeline:_",
+		fmt.Sprintf("  Queries: %d pending, %d processing, %d done", qPending, qProcessing, qCompleted),
+		fmt.Sprintf("  Queues: serp=%d  enrich=%d", qSerp, qEnrich),
 	}
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
