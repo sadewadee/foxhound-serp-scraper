@@ -101,26 +101,23 @@ CREATE INDEX IF NOT EXISTS idx_serp_jobs_updated_at ON serp_jobs(updated_at) WHE
 
 `
 
-// migrations are ALTER TABLE statements for evolving existing databases.
-// Each uses IF NOT EXISTS or equivalent to be idempotent.
-const migrations = `
--- v2: query auto-expansion tracking
-ALTER TABLE queries ADD COLUMN IF NOT EXISTS expanded_at TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS idx_queries_expand ON queries(status, expanded_at) WHERE status = 'completed' AND expanded_at IS NULL;
+// runMigrations applies incremental schema changes that are safe to re-run.
+func runMigrations(db *sql.DB) error {
+	// v2: query auto-expansion tracking
+	db.Exec(`ALTER TABLE queries ADD COLUMN expanded_at TIMESTAMPTZ`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_queries_expand ON queries(status, expanded_at) WHERE status = 'completed' AND expanded_at IS NULL`)
 
--- v2: indexes for reconciler performance (find stuck locked jobs fast)
-CREATE INDEX IF NOT EXISTS idx_enrich_locked ON enrich_jobs(locked_at) WHERE status = 'processing';
-CREATE INDEX IF NOT EXISTS idx_serp_locked ON serp_jobs(locked_at) WHERE status = 'processing';
-`
+	// v2: indexes for reconciler performance
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_enrich_locked ON enrich_jobs(locked_at) WHERE status = 'processing'`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_locked ON serp_jobs(locked_at) WHERE status = 'processing'`)
+
+	return nil
+}
 
 // Migrate creates all tables if they don't exist, then runs incremental migrations.
 func Migrate(db *sql.DB) error {
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("db: migration failed: %w", err)
 	}
-	// Incremental migrations — safe to re-run (idempotent).
-	if _, err := db.Exec(migrations); err != nil {
-		return fmt.Errorf("db: incremental migration failed: %w", err)
-	}
-	return nil
+	return runMigrations(db)
 }
