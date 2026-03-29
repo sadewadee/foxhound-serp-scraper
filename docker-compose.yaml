@@ -55,7 +55,7 @@ services:
       --requirepass "${REDIS_PASSWORD}"
       --save 60 1
       --loglevel warning
-      --maxmemory ${REDIS_MAXMEM:-512mb}
+      --maxmemory ${REDIS_MAXMEM:-2gb}
       --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
