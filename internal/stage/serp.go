@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -203,7 +204,11 @@ func (s *SERPStage) pushSerpJob(ctx context.Context, jobID, serpURL string, quer
 // tabWorker is one of N goroutines that pops jobs from the Redis queue and
 // fetches SERP pages. All workers share the single pooled browser.
 func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
-	workerID := fmt.Sprintf("serp-tab-%d", tabID)
+	host, _ := os.Hostname()
+	if len(host) > 12 {
+		host = host[:12]
+	}
+	workerID := fmt.Sprintf("serp-%s-%d", host, tabID)
 	slog.Info("serp: tab worker starting", "tab", tabID)
 
 	for {

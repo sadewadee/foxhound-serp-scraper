@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -259,7 +260,11 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 }
 
 func (c *EnrichStage) worker(ctx context.Context, workerID int) {
-	workerIDStr := fmt.Sprintf("enrich-worker-%d", workerID)
+	host, _ := os.Hostname()
+	if len(host) > 12 {
+		host = host[:12]
+	}
+	workerIDStr := fmt.Sprintf("enrich-%s-%d", host, workerID)
 	slog.Info("enrich: worker starting", "worker", workerID)
 
 	// Each worker gets its own stealth HTTP fetcher (lightweight, per-worker identity).
