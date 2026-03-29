@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// Niches for wellness/fitness industry.
+// Niches for wellness/fitness industry — business names.
 var Niches = []string{
 	"yoga studio", "bikram yoga", "hot yoga", "vinyasa yoga",
 	"pilates studio", "pilates class",
@@ -20,7 +20,24 @@ var Niches = []string{
 	"dance studio", "barre studio",
 }
 
-// WellnessTemplates for search query variations.
+// PersonalNiches target individual practitioners (more likely to have gmail/yahoo).
+var PersonalNiches = []string{
+	"yoga instructor", "yoga teacher", "yoga therapist",
+	"pilates instructor", "pilates teacher",
+	"personal trainer", "fitness coach", "fitness instructor",
+	"wellness coach", "wellness practitioner", "wellness consultant",
+	"health coach", "life coach", "nutrition coach",
+	"meditation teacher", "meditation guide",
+	"massage therapist", "sports massage therapist",
+	"reiki practitioner", "reiki healer",
+	"dance instructor", "zumba instructor",
+	"crossfit coach", "strength coach",
+	"physical therapist", "physiotherapist",
+	"acupuncturist", "chiropractor",
+	"naturopath", "ayurvedic practitioner",
+}
+
+// WellnessTemplates for business search query variations.
 var WellnessTemplates = []string{
 	"%s %s",           // "yoga studio bali"
 	"%s in %s",        // "yoga studio in bali"
@@ -28,6 +45,19 @@ var WellnessTemplates = []string{
 	"best %s in %s",   // "best yoga studio in bali"
 	"%s %s contact",   // "yoga studio bali contact"
 	"%s %s email",     // "yoga studio bali email"
+}
+
+// PersonalTemplates target individuals — higher gmail/yahoo yield.
+var PersonalTemplates = []string{
+	"%s %s",                       // "yoga instructor bali"
+	"%s in %s",                    // "yoga instructor in bali"
+	"%s %s email",                 // "yoga instructor bali email"
+	"%s %s contact",               // "yoga instructor bali contact"
+	"%s %s \"@gmail.com\"",        // "yoga instructor bali" "@gmail.com"
+	"%s %s \"@yahoo.com\"",        // "yoga instructor bali" "@yahoo.com"
+	"hire %s in %s",               // "hire yoga instructor in bali"
+	"freelance %s %s",             // "freelance personal trainer bali"
+	"%s %s instagram",             // "yoga instructor bali instagram" (bio has email)
 }
 
 // Cities organized by country.
@@ -147,12 +177,17 @@ func GenerateKeywords(niches, cities []string, templates []string) []string {
 }
 
 // GenerateAllKeywords generates keywords for ALL cities in ALL countries.
+// Combines business templates + personal templates for maximum coverage.
 func GenerateAllKeywords() []string {
 	var allCities []string
 	for _, c := range Cities {
 		allCities = append(allCities, c...)
 	}
-	return GenerateKeywords(Niches, allCities, WellnessTemplates)
+	// Business queries (yoga studio bali, etc).
+	business := GenerateKeywords(Niches, allCities, WellnessTemplates)
+	// Personal queries (yoga instructor bali @gmail.com, etc).
+	personal := GenerateKeywords(PersonalNiches, allCities, PersonalTemplates)
+	return dedupStrings(append(business, personal...))
 }
 
 // GenerateKeywordsForCountry generates keywords for a specific country.
@@ -161,7 +196,23 @@ func GenerateKeywordsForCountry(country string) []string {
 	if !ok {
 		return nil
 	}
-	return GenerateKeywords(Niches, cities, WellnessTemplates)
+	business := GenerateKeywords(Niches, cities, WellnessTemplates)
+	personal := GenerateKeywords(PersonalNiches, cities, PersonalTemplates)
+	return dedupStrings(append(business, personal...))
+}
+
+// dedupStrings removes duplicate strings (case-insensitive).
+func dedupStrings(items []string) []string {
+	seen := make(map[string]bool, len(items))
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		key := strings.ToLower(item)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 // CountryList returns all available country names.

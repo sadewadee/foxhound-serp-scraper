@@ -511,14 +511,14 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 var queryExpanders = []string{
 	"near me",
 	"reviews",
-	"pricing",
-	"schedule",
 	"classes",
-	"open now",
 	"best rated",
-	"affordable",
-	"new",
-	"membership",
+	// Personal email targeting — these surface pages with gmail/yahoo addresses.
+	"\"@gmail.com\"",
+	"\"@yahoo.com\"",
+	"email",
+	"contact",
+	"instagram",
 }
 
 // expandCompletedQueries takes completed queries that yielded results and spawns

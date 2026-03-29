@@ -209,6 +209,27 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
 	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
 
+	// ── Top email providers (shows gmail/yahoo progress) ──
+	type provider struct {
+		name  string
+		count int
+	}
+	var providers []provider
+	providerRows, _ := b.db.Query(`
+		SELECT split_part(e, '@', 2), COUNT(*)
+		FROM enrich_jobs, unnest(emails) AS e
+		WHERE status = 'completed'
+		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+	`)
+	if providerRows != nil {
+		for providerRows.Next() {
+			var p provider
+			providerRows.Scan(&p.name, &p.count)
+			providers = append(providers, p)
+		}
+		providerRows.Close()
+	}
+
 	lines := []string{
 		"*Dashboard*",
 		"",
@@ -222,11 +243,18 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		fmt.Sprintf("  SERP: %d done, %d failed", serpCompleted, serpFailed),
 		fmt.Sprintf("  Enrich: %d done, %d failed, %d dead", enCompleted, enFailed, enDead),
 		fmt.Sprintf("  Emails: today %d  |  total *%d*", emailsToday, emailsTotal),
-		"",
+	}
+	if len(providers) > 0 {
+		lines = append(lines, "", "_Top providers:_")
+		for _, p := range providers {
+			lines = append(lines, fmt.Sprintf("  %s: %d", p.name, p.count))
+		}
+	}
+	lines = append(lines, "",
 		"_Pipeline:_",
 		fmt.Sprintf("  Queries: %d pending, %d processing, %d done", qPending, qProcessing, qCompleted),
 		fmt.Sprintf("  Queues: serp=%d  enrich=%d", qSerp, qEnrich),
-	}
+	)
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
