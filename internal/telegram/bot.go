@@ -136,90 +136,61 @@ func (b *Bot) broadcastReport(ctx context.Context) {
 	}
 }
 
-// buildRateReport generates the hourly rate summary.
+// buildRateReport generates the auto hourly report (broadcast to all chats).
 func (b *Bot) buildRateReport(ctx context.Context) string {
-	// ── Rates (last hour) ──
-	var serpHour, serpTotal int
+	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
+	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
+
+	var serpHour, serpPrevHour int
 	b.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed')
+			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
 		FROM serp_jobs
-	`).Scan(&serpHour, &serpTotal)
+	`).Scan(&serpHour, &serpPrevHour)
 
-	var enrichHour, enrichTotal int
+	var enrichHour, enrichPrevHour int
 	b.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*)
-		FROM enrich_jobs WHERE status = 'completed'
-	`).Scan(&enrichHour, &enrichTotal)
+			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
+		FROM enrich_jobs
+	`).Scan(&enrichHour, &enrichPrevHour)
 
-	var emailsHour, emailsTotal, emailsToday int
+	var emailsHour, emailsPrevHour, emailsToday, emailsTotal int
 	b.db.QueryRow(`
 		SELECT
 			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
-	`).Scan(&emailsHour, &emailsTotal, &emailsToday)
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > date_trunc('day', NOW())),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed')
+	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsTotal)
 
-	var websitesHour int
-	b.db.QueryRow(`SELECT COUNT(*) FROM websites WHERE created_at > NOW() - INTERVAL '1 hour'`).Scan(&websitesHour)
+	var etaStr string
+	if emailsHour > 0 {
+		remaining := 10_000_000 - emailsTotal
+		if remaining > 0 {
+			etaStr = fmt.Sprintf("~%d days", remaining/(emailsHour*24))
+		} else {
+			etaStr = "REACHED!"
+		}
+	} else {
+		etaStr = "--"
+	}
 
-	// ── Queue depths ──
-	var qPending, qProcessing, qCompleted int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending'),
-			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed')
-		FROM queries
-	`).Scan(&qPending, &qProcessing, &qCompleted)
+	pctOf10M := float64(emailsTotal) / 10_000_000 * 100
 
-	var enrichPending, enrichFailed, enrichDead int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COUNT(*) FILTER (WHERE status = 'dead')
-		FROM enrich_jobs
-	`).Scan(&enrichPending, &enrichFailed, &enrichDead)
-
-	var qSerp, qEnrich int64
-	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
-	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
-
-	// ── Active workers (count Redis lock keys) ──
-	// Workers use Redis SETNX for claims, so DB locked_by is no longer set.
-	// Scan Redis for active lock keys to count workers.
-	var serpWorkers, enrichWorkers int
-	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
-	serpWorkers = len(serpLocks)
-	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
-	enrichWorkers = len(enrichLocks)
-
-	// ── Build message ──
-	ts := time.Now().Format("15:04 MST")
 	lines := []string{
-		fmt.Sprintf("*Hourly Report* (%s)", ts),
+		fmt.Sprintf("*Hourly Report* (%s)", time.Now().Format("15:04 MST")),
 		"",
-		fmt.Sprintf("_Workers:_ SERP: *%d*  Enrich: *%d*", serpWorkers, enrichWorkers),
+		fmt.Sprintf("_Active:_ SERP: *%d*  Enrich: *%d*", len(serpLocks), len(enrichLocks)),
 		"",
-		"_Rates (last hour):_",
-		fmt.Sprintf("  SERP pages: *%d*/hr", serpHour),
-		fmt.Sprintf("  Websites discovered: *%d*/hr", websitesHour),
-		fmt.Sprintf("  Enrich processed: *%d*/hr", enrichHour),
-		fmt.Sprintf("  Emails found: *%d*/hr", emailsHour),
+		fmt.Sprintf("  SERP: *%d*/hr %s", serpHour, delta(serpHour, serpPrevHour)),
+		fmt.Sprintf("  Enrich: *%d*/hr %s", enrichHour, delta(enrichHour, enrichPrevHour)),
+		fmt.Sprintf("  Emails: *%d*/hr %s", emailsHour, delta(emailsHour, emailsPrevHour)),
 		"",
-		"_Totals:_",
-		fmt.Sprintf("  SERP pages: %d", serpTotal),
-		fmt.Sprintf("  Enrich completed: %d", enrichTotal),
-		fmt.Sprintf("  Emails today: %d  |  Total: *%d*", emailsToday, emailsTotal),
-		"",
-		"_Pipeline:_",
-		fmt.Sprintf("  Queries: %d pending, %d processing, %d done", qPending, qProcessing, qCompleted),
-		fmt.Sprintf("  Enrich: %d pending, %d failed, %d dead", enrichPending, enrichFailed, enrichDead),
-		fmt.Sprintf("  Queues: serp=%d  enrich=%d", qSerp, qEnrich),
+		fmt.Sprintf("  Today: *%s*  Total: *%s* (%.1f%%)", fmtK(emailsToday), fmtK(emailsTotal), pctOf10M),
+		fmt.Sprintf("  ETA 10M: *%s*", etaStr),
 	}
 
 	return strings.Join(lines, "\n")

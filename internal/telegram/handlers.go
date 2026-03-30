@@ -40,6 +40,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
 		b.handleScrape(msg, args)
 	case "/status":
 		b.handleStatus(ctx, msg)
+	case "/analytics":
+		b.handleAnalytics(ctx, msg)
 	case "/queries":
 		b.handleQueries(msg)
 	case "/contacts":
@@ -60,9 +62,10 @@ func (b *Bot) handleStart(msg *Message) {
 
 Available commands:
 
+/status — Dashboard with rates, totals, ETA
+/analytics — Historical: 1hr vs prev hr, today vs yesterday, 7d trends
 /scrape <keywords> — Submit keywords (one per line)
 /generate <country> — Generate wellness keywords ("all" for global)
-/status — Full dashboard (queries, SERP, enrich, emails, providers)
 /queries — Query status breakdown
 /contacts — Contact stats + top email providers
 /export — Export contacts as CSV file
@@ -156,13 +159,14 @@ func (b *Bot) handleGenerate(msg *Message, args string) {
 	b.sendMessage(msg.Chat.ID, text)
 }
 
+// ────────────────────────────────────────────────────────────────────
+// /status — Live dashboard with rates, totals, ETA
+// ────────────────────────────────────────────────────────────────────
+
 func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
-	// ── Active workers (count Redis lock keys — workers use SETNX, not DB locked_by) ──
-	var serpWorkers, enrichWorkers int
+	// ── Active workers (Redis lock keys) ──
 	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
-	serpWorkers = len(serpLocks)
 	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
-	enrichWorkers = len(enrichLocks)
 
 	// ── Queries ──
 	var qPending, qProcessing, qCompleted int
@@ -174,44 +178,45 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		FROM queries
 	`).Scan(&qPending, &qProcessing, &qCompleted)
 
-	// ── SERP ──
-	var serpCompleted, serpFailed, serpHour, serpToday int
+	// ── SERP (current hour + prev hour for comparison) ──
+	var serpCompleted, serpFailed, serpHour, serpPrevHour int
 	b.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'completed'),
 			COUNT(*) FILTER (WHERE status = 'failed'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours')
+			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
 		FROM serp_jobs
-	`).Scan(&serpCompleted, &serpFailed, &serpHour, &serpToday)
+	`).Scan(&serpCompleted, &serpFailed, &serpHour, &serpPrevHour)
 
-	// ── Enrich ──
-	var enCompleted, enFailed, enDead, enHour, enToday int
+	// ── Enrich (current hour + prev hour) ──
+	var enCompleted, enFailed, enDead, enHour, enPrevHour int
 	b.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'completed'),
 			COUNT(*) FILTER (WHERE status = 'failed'),
 			COUNT(*) FILTER (WHERE status = 'dead'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
+			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
 		FROM enrich_jobs
-	`).Scan(&enCompleted, &enFailed, &enDead, &enHour, &enToday)
+	`).Scan(&enCompleted, &enFailed, &enDead, &enHour, &enPrevHour)
 
-	// ── Emails ──
-	var emailsHour, emailsToday, emailsTotal int
+	// ── Emails (current hour + prev hour + today + yesterday + total) ──
+	var emailsHour, emailsPrevHour, emailsToday, emailsYesterday, emailsTotal int
 	b.db.QueryRow(`
 		SELECT
 			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > date_trunc('day', NOW())),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
 			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed')
-	`).Scan(&emailsHour, &emailsToday, &emailsTotal)
+	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsYesterday, &emailsTotal)
 
 	// ── Queues ──
-	var qSerp, qEnrich int64
-	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
-	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
+	qSerp, _ := b.redis.ZCard(ctx, "serp:queue:serp").Result()
+	qEnrich, _ := b.redis.ZCard(ctx, "serp:queue:enrich").Result()
 
-	// ── Top email providers (shows gmail/yahoo progress) ──
+	// ── Top email providers ──
 	type provider struct {
 		name  string
 		count int
@@ -232,50 +237,233 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		providerRows.Close()
 	}
 
-	// ETA to 10M emails.
+	// ── Email yield rate ──
+	var enrichWithEmail int
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0`).Scan(&enrichWithEmail)
+	yieldPct := 0.0
+	if enCompleted > 0 {
+		yieldPct = float64(enrichWithEmail) / float64(enCompleted) * 100
+	}
+
+	// ── ETA ──
 	var etaStr string
 	if emailsHour > 0 {
 		remaining := 10_000_000 - emailsTotal
 		if remaining > 0 {
-			hoursLeft := remaining / emailsHour
-			daysLeft := hoursLeft / 24
-			etaStr = fmt.Sprintf("  ETA 10M: ~%d days (%d hrs)", daysLeft, hoursLeft)
+			daysLeft := remaining / (emailsHour * 24)
+			etaStr = fmt.Sprintf("~%d days", daysLeft)
 		} else {
-			etaStr = "  ETA 10M: *REACHED!*"
+			etaStr = "REACHED!"
 		}
 	} else {
-		etaStr = "  ETA 10M: --"
+		etaStr = "--"
 	}
 
+	// ── Build message ──
 	lines := []string{
 		fmt.Sprintf("*Dashboard* (%s)", time.Now().Format("15:04 MST")),
 		"",
-		fmt.Sprintf("_Active:_ SERP locks: *%d*  Enrich locks: *%d*", serpWorkers, enrichWorkers),
+		fmt.Sprintf("_Active:_ SERP: *%d* locks  Enrich: *%d* locks", len(serpLocks), len(enrichLocks)),
 		"",
-		"_Rates (last hour):_",
-		fmt.Sprintf("  SERP: *%d*/hr  Enrich: *%d*/hr", serpHour, enHour),
-		fmt.Sprintf("  Emails: *%d*/hr", emailsHour),
-		etaStr,
+		"_Rates (this hr vs prev hr):_",
+		fmt.Sprintf("  SERP: *%d*/hr %s", serpHour, delta(serpHour, serpPrevHour)),
+		fmt.Sprintf("  Enrich: *%d*/hr %s", enHour, delta(enHour, enPrevHour)),
+		fmt.Sprintf("  Emails: *%d*/hr %s", emailsHour, delta(emailsHour, emailsPrevHour)),
+		fmt.Sprintf("  Yield: %.1f%% pages have email", yieldPct),
+		fmt.Sprintf("  ETA 10M: *%s*", etaStr),
+		"",
+		"_Today vs Yesterday:_",
+		fmt.Sprintf("  Emails today: *%d*  yesterday: %d %s", emailsToday, emailsYesterday, delta(emailsToday, emailsYesterday)),
+		fmt.Sprintf("  Total: *%s*", fmtK(emailsTotal)),
 		"",
 		"_Totals:_",
-		fmt.Sprintf("  SERP: %d done, %d failed", serpCompleted, serpFailed),
-		fmt.Sprintf("  Enrich: %d done, %d failed, %d dead", enCompleted, enFailed, enDead),
-		fmt.Sprintf("  Emails: today %d  |  total *%d*", emailsToday, emailsTotal),
+		fmt.Sprintf("  SERP: %s done, %d failed", fmtK(serpCompleted), serpFailed),
+		fmt.Sprintf("  Enrich: %s done, %d failed, %s dead", fmtK(enCompleted), enFailed, fmtK(enDead)),
 	}
 	if len(providers) > 0 {
 		lines = append(lines, "", "_Top providers:_")
 		for _, p := range providers {
-			lines = append(lines, fmt.Sprintf("  %s: %d", p.name, p.count))
+			lines = append(lines, fmt.Sprintf("  %s: %s", p.name, fmtK(p.count)))
 		}
 	}
 	lines = append(lines, "",
 		"_Pipeline:_",
-		fmt.Sprintf("  Queries: %d pending, %d processing, %d done", qPending, qProcessing, qCompleted),
-		fmt.Sprintf("  Queues: serp=%d  enrich=%d", qSerp, qEnrich),
+		fmt.Sprintf("  Queries: %s pending, %s processing, %d done", fmtK(qPending), fmtK(qProcessing), qCompleted),
+		fmt.Sprintf("  Queues: serp=%s  enrich=%s", fmtK(int(qSerp)), fmtK(int(qEnrich))),
 	)
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
+
+// ────────────────────────────────────────────────────────────────────
+// /analytics — Historical analytics: 1hr, 24hr, 7d with comparisons
+// ────────────────────────────────────────────────────────────────────
+
+func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
+	// ── Hourly breakdown (last 6 hours) ──
+	type hourBucket struct {
+		hour    string
+		enrich  int
+		emails  int
+		serp    int
+	}
+	var hours []hourBucket
+	hourRows, _ := b.db.Query(`
+		SELECT
+			to_char(h, 'HH24:MI') as hr,
+			(SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'
+				AND completed_at >= h AND completed_at < h + INTERVAL '1 hour'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e
+				WHERE status = 'completed' AND completed_at >= h AND completed_at < h + INTERVAL '1 hour'),
+			(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
+				AND updated_at >= h AND updated_at < h + INTERVAL '1 hour')
+		FROM generate_series(
+			date_trunc('hour', NOW()) - INTERVAL '5 hours',
+			date_trunc('hour', NOW()),
+			INTERVAL '1 hour'
+		) AS h
+		ORDER BY h
+	`)
+	if hourRows != nil {
+		for hourRows.Next() {
+			var hb hourBucket
+			hourRows.Scan(&hb.hour, &hb.enrich, &hb.emails, &hb.serp)
+			hours = append(hours, hb)
+		}
+		hourRows.Close()
+	}
+
+	// ── Daily breakdown (last 7 days) ──
+	type dayBucket struct {
+		day    string
+		enrich int
+		emails int
+		serp   int
+	}
+	var days []dayBucket
+	dayRows, _ := b.db.Query(`
+		SELECT
+			to_char(d, 'Mon DD') as dy,
+			(SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'
+				AND completed_at >= d AND completed_at < d + INTERVAL '1 day'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e
+				WHERE status = 'completed' AND completed_at >= d AND completed_at < d + INTERVAL '1 day'),
+			(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
+				AND updated_at >= d AND updated_at < d + INTERVAL '1 day')
+		FROM generate_series(
+			date_trunc('day', NOW()) - INTERVAL '6 days',
+			date_trunc('day', NOW()),
+			INTERVAL '1 day'
+		) AS d
+		ORDER BY d
+	`)
+	if dayRows != nil {
+		for dayRows.Next() {
+			var db dayBucket
+			dayRows.Scan(&db.day, &db.enrich, &db.emails, &db.serp)
+			days = append(days, db)
+		}
+		dayRows.Close()
+	}
+
+	// ── Summary comparisons ──
+	var emailsToday, emailsYesterday, emails7d, emailsPrev7d int
+	b.db.QueryRow(`
+		SELECT
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
+				AND completed_at > date_trunc('day', NOW())),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
+				AND completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
+				AND completed_at > NOW() - INTERVAL '7 days'),
+			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
+				AND completed_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days')
+	`).Scan(&emailsToday, &emailsYesterday, &emails7d, &emailsPrev7d)
+
+	var enrichToday, enrichYesterday int
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE completed_at > date_trunc('day', NOW())),
+			COUNT(*) FILTER (WHERE completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW()))
+		FROM enrich_jobs WHERE status = 'completed'
+	`).Scan(&enrichToday, &enrichYesterday)
+
+	var emailsTotal int
+	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&emailsTotal)
+	pctOf10M := float64(emailsTotal) / 10_000_000 * 100
+
+	// ── Dead job breakdown ──
+	var dead404, dead403, deadOther int
+	b.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 404%'),
+			COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 403%'),
+			COUNT(*) FILTER (WHERE error_msg NOT LIKE 'HTTP 404%' AND error_msg NOT LIKE 'HTTP 403%')
+		FROM enrich_jobs WHERE status = 'dead'
+	`).Scan(&dead404, &dead403, &deadOther)
+
+	// ── Build message ──
+	lines := []string{
+		fmt.Sprintf("*Analytics* (%s)", time.Now().Format("15:04 MST")),
+	}
+
+	// Hourly chart
+	lines = append(lines, "", "_Last 6 hours (emails/hr):_")
+	hourMax := 1
+	for _, h := range hours {
+		if h.emails > hourMax {
+			hourMax = h.emails
+		}
+	}
+	for _, h := range hours {
+		bar := chartBar(h.emails, hourMax)
+		lines = append(lines, fmt.Sprintf("  `%s` %s *%d*", h.hour, bar, h.emails))
+	}
+
+	// Daily chart
+	lines = append(lines, "", "_Last 7 days (emails/day):_")
+	dayMax := 1
+	for _, d := range days {
+		if d.emails > dayMax {
+			dayMax = d.emails
+		}
+	}
+	for _, d := range days {
+		bar := chartBar(d.emails, dayMax)
+		lines = append(lines, fmt.Sprintf("  `%s` %s *%s*", d.day, bar, fmtK(d.emails)))
+	}
+
+	// Comparisons
+	lines = append(lines, "",
+		"_Comparisons:_",
+		fmt.Sprintf("  Today vs yesterday:"),
+		fmt.Sprintf("    Emails: *%s* vs %s %s", fmtK(emailsToday), fmtK(emailsYesterday), delta(emailsToday, emailsYesterday)),
+		fmt.Sprintf("    Enrich: *%s* vs %s %s", fmtK(enrichToday), fmtK(enrichYesterday), delta(enrichToday, enrichYesterday)),
+		fmt.Sprintf("  This week vs last week:"),
+		fmt.Sprintf("    Emails: *%s* vs %s %s", fmtK(emails7d), fmtK(emailsPrev7d), delta(emails7d, emailsPrev7d)),
+	)
+
+	// Progress
+	lines = append(lines, "",
+		"_Progress to 10M:_",
+		fmt.Sprintf("  Total: *%s* (%.2f%%)", fmtK(emailsTotal), pctOf10M),
+		progressBar(emailsTotal, 10_000_000),
+	)
+
+	// Dead breakdown
+	lines = append(lines, "",
+		"_Dead jobs breakdown:_",
+		fmt.Sprintf("  404 Not Found: %s (contact pages don't exist)", fmtK(dead404)),
+		fmt.Sprintf("  403 Forbidden: %s (site blocks scraper)", fmtK(dead403)),
+		fmt.Sprintf("  Other: %s", fmtK(deadOther)),
+	)
+
+	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Existing handlers (unchanged)
+// ────────────────────────────────────────────────────────────────────
 
 func (b *Bot) handleQueries(msg *Message) {
 	counts, err := b.queryRepo.CountByStatus()
@@ -411,9 +599,79 @@ func (b *Bot) handleReset(ctx context.Context, msg *Message) {
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────
+
 func csvEscape(s string) string {
 	if strings.ContainsAny(s, ",\"\n") {
 		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 	}
 	return s
+}
+
+// delta returns a formatted change indicator like "+15%" or "-8%".
+func delta(current, previous int) string {
+	if previous == 0 {
+		if current > 0 {
+			return "(new)"
+		}
+		return ""
+	}
+	pct := float64(current-previous) / float64(previous) * 100
+	if pct > 0 {
+		return fmt.Sprintf("(+%.0f%%)", pct)
+	} else if pct < 0 {
+		return fmt.Sprintf("(%.0f%%)", pct)
+	}
+	return "(=)"
+}
+
+// fmtK formats large numbers as "123K" or "1.2M" for readability.
+func fmtK(n int) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 10_000 {
+		return fmt.Sprintf("%dK", n/1000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// chartBar returns a simple text bar for Telegram monospace display.
+func chartBar(value, maxValue int) string {
+	if maxValue == 0 {
+		return ""
+	}
+	barLen := value * 8 / maxValue
+	if barLen < 0 {
+		barLen = 0
+	}
+	if barLen > 8 {
+		barLen = 8
+	}
+	return strings.Repeat("█", barLen) + strings.Repeat("░", 8-barLen)
+}
+
+// progressBar returns a 10M progress bar.
+func progressBar(current, target int) string {
+	pct := current * 20 / target
+	if pct > 20 {
+		pct = 20
+	}
+	return "  `[" + strings.Repeat("█", pct) + strings.Repeat("░", 20-pct) + "]`"
+}
+
+// maxVal returns the max of a slice of ints.
+func maxVal(vals ...int) int {
+	m := 0
+	for _, v := range vals {
+		if v > m {
+			m = v
+		}
+	}
+	return m
 }
