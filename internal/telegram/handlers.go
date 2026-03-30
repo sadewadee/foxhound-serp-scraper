@@ -157,10 +157,12 @@ func (b *Bot) handleGenerate(msg *Message, args string) {
 }
 
 func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
-	// ── Active workers ──
+	// ── Active workers (count Redis lock keys — workers use SETNX, not DB locked_by) ──
 	var serpWorkers, enrichWorkers int
-	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM serp_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&serpWorkers)
-	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM enrich_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&enrichWorkers)
+	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
+	serpWorkers = len(serpLocks)
+	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
+	enrichWorkers = len(enrichLocks)
 
 	// ── Queries ──
 	var qPending, qProcessing, qCompleted int
@@ -230,14 +232,30 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		providerRows.Close()
 	}
 
+	// ETA to 10M emails.
+	var etaStr string
+	if emailsHour > 0 {
+		remaining := 10_000_000 - emailsTotal
+		if remaining > 0 {
+			hoursLeft := remaining / emailsHour
+			daysLeft := hoursLeft / 24
+			etaStr = fmt.Sprintf("  ETA 10M: ~%d days (%d hrs)", daysLeft, hoursLeft)
+		} else {
+			etaStr = "  ETA 10M: *REACHED!*"
+		}
+	} else {
+		etaStr = "  ETA 10M: --"
+	}
+
 	lines := []string{
-		"*Dashboard*",
+		fmt.Sprintf("*Dashboard* (%s)", time.Now().Format("15:04 MST")),
 		"",
-		fmt.Sprintf("_Workers:_ SERP: *%d*  Enrich: *%d*", serpWorkers, enrichWorkers),
+		fmt.Sprintf("_Active:_ SERP locks: *%d*  Enrich locks: *%d*", serpWorkers, enrichWorkers),
 		"",
 		"_Rates (last hour):_",
 		fmt.Sprintf("  SERP: *%d*/hr  Enrich: *%d*/hr", serpHour, enHour),
 		fmt.Sprintf("  Emails: *%d*/hr", emailsHour),
+		etaStr,
 		"",
 		"_Totals:_",
 		fmt.Sprintf("  SERP: %d done, %d failed", serpCompleted, serpFailed),
