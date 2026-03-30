@@ -23,13 +23,17 @@ var (
 	linkedinRe  = regexp.MustCompile(`https?://(?:www\.)?linkedin\.com/(?:company|in)/([a-zA-Z0-9._\-]+)/?`)
 )
 
-// extraBlocklist extends foxhound's built-in spam domain list.
-var extraBlocklist = []string{
-	"example.com", "domain.com", "email.com", "test.com",
-	"yoursite.com", "youremail.com", "yourdomain.com",
-	"company.com", "placeholder.com", "mail.com",
-	"reddit.com", "error-tracking",
-	"noreply@", "no-reply@",
+// extraBlockedDomains are placeholder/spam domains to reject (exact match on domain part).
+var extraBlockedDomains = map[string]bool{
+	"example.com": true, "domain.com": true, "email.com": true, "test.com": true,
+	"yoursite.com": true, "youremail.com": true, "yourdomain.com": true,
+	"company.com": true, "placeholder.com": true,
+	"reddit.com": true,
+}
+
+// extraBlockedPrefixes are email prefixes to reject (prefix match).
+var extraBlockedPrefixes = []string{
+	"noreply@", "no-reply@", "error-tracking",
 }
 
 // socialNoise are tracking/widget handles to filter out.
@@ -409,14 +413,24 @@ func normalizePhone(p string) string {
 }
 
 // isExtraBlocklisted checks against our extended blocklist (on top of foxhound's built-in).
+// Uses exact domain match (not substring) to avoid killing gmail.com/hotmail.com.
 func isExtraBlocklisted(email string) bool {
 	lower := strings.ToLower(email)
-	for _, blocked := range extraBlocklist {
-		if strings.Contains(lower, blocked) {
+
+	// Check prefix blocklist (substring match on full email is OK for prefixes).
+	for _, prefix := range extraBlockedPrefixes {
+		if strings.Contains(lower, prefix) {
 			return true
 		}
 	}
-	return false
+
+	// Check domain blocklist (exact match on domain part only).
+	atIdx := strings.LastIndex(lower, "@")
+	if atIdx < 0 {
+		return false
+	}
+	domain := lower[atIdx+1:]
+	return extraBlockedDomains[domain]
 }
 
 func isSocialNoise(handle string) bool {
@@ -442,8 +456,8 @@ func isCleanEmail(email string) bool {
 
 	// Reject if local part has digits immediately followed by a known email prefix
 	// Pattern: "9346082info@" or "812-3868-7387marcom@" — phone concatenated with email.
-	if len(local) > 20 {
-		return false // Local parts > 20 chars are almost always garbage.
+	if len(local) > 40 {
+		return false // Local parts > 40 chars are almost always garbage.
 	}
 
 	// Reject if domain has extra text appended after TLD.

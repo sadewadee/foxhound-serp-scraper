@@ -143,7 +143,7 @@ var placeholderDomains = []string{
 	"example.com", "example.org", "example.net",
 	"test.com", "test.org",
 	"domain.com", "yourdomain.com", "mydomain.com",
-	"email.com", "mail.com",
+	"email.com",
 	"addresshere.com", "sampleemail.com",
 	"placeholder.com", "fakeemail.com",
 	"company.com", "yourcompany.com",
