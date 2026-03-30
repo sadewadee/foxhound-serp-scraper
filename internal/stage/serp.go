@@ -164,10 +164,16 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 			continue
 		}
 
-		// Redis SETNX claim — only one container wins.
-		ok, err := s.redis.SetNX(ctx, fmt.Sprintf("query:lock:%d", qMsg.ID), workerHostname(), 10*time.Minute).Result()
-		if err != nil || !ok {
-			// Already claimed by another container — skip.
+		// Atomic claim via DB — queryFeeder is a singleton goroutine (not hot path).
+		// DB claim is fine here: only 1 query/sec throughput, prevents duplicates.
+		res, claimErr := s.db.Exec(`
+			UPDATE queries SET status = 'processing', updated_at = NOW()
+			WHERE id = $1 AND status = 'pending'
+		`, qMsg.ID)
+		if claimErr != nil {
+			continue
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
 			continue
 		}
 
@@ -177,16 +183,12 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 			jobID := fmt.Sprintf("serp-%d-p%d", qMsg.ID, page)
 			serpURL := scraper.BuildSERPURL(qMsg.Text, page, s.cfg.SERP.ResultsPerPage)
 
-			// Push serp_job creation to persister (DB write deferred).
-			result := persist.SERPResult{
-				JobID:       jobID,
-				QueryID:     qMsg.ID,
-				Status:      "new_job",
-				ErrorMsg:    serpURL, // reuse field for searchURL
-				ResultCount: page,   // reuse field for pageNum
-			}
-			data, _ := json.Marshal(result)
-			s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
+			// INSERT directly — queryFeeder is not hot path (1 query/sec).
+			s.db.Exec(`
+				INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, status)
+				VALUES ($1, $2, $3, $4, 'new')
+				ON CONFLICT (id) DO NOTHING
+			`, jobID, qMsg.ID, serpURL, page)
 
 			s.pushSerpJob(ctx, jobID, serpURL, qMsg.ID, page)
 		}

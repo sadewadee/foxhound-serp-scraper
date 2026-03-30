@@ -189,10 +189,14 @@ func (b *Bot) buildRateReport(ctx context.Context) string {
 	qSerp, _ = b.redis.ZCard(ctx, "serp:queue:serp").Result()
 	qEnrich, _ = b.redis.ZCard(ctx, "serp:queue:enrich").Result()
 
-	// ── Active workers (distinct locked_by in last 5 min) ──
+	// ── Active workers (count Redis lock keys) ──
+	// Workers use Redis SETNX for claims, so DB locked_by is no longer set.
+	// Scan Redis for active lock keys to count workers.
 	var serpWorkers, enrichWorkers int
-	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM serp_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&serpWorkers)
-	b.db.QueryRow(`SELECT COUNT(DISTINCT locked_by) FROM enrich_jobs WHERE status = 'processing' AND locked_at > NOW() - INTERVAL '5 minutes'`).Scan(&enrichWorkers)
+	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
+	serpWorkers = len(serpLocks)
+	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
+	enrichWorkers = len(enrichLocks)
 
 	// ── Build message ──
 	ts := time.Now().Format("15:04 MST")

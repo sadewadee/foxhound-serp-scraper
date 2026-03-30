@@ -225,15 +225,6 @@ func (p *Persister) flushSERPResults(ctx context.Context) {
 					`, r.AttemptCount, r.ErrorMsg, r.JobID)
 				}
 
-			case "new_job":
-				// Query feeder creating new serp_jobs.
-				// ErrorMsg carries searchURL, ResultCount carries pageNum.
-				_, execErr = tx.ExecContext(ctx, `
-					INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, status)
-					VALUES ($1, $2, $3, $4, 'new')
-					ON CONFLICT (id) DO NOTHING
-				`, r.JobID, r.QueryID, r.ErrorMsg, r.ResultCount)
-
 			case "parse_failed":
 				_, execErr = tx.ExecContext(ctx, `
 					UPDATE serp_jobs SET status = 'failed', error_msg = $1, updated_at = NOW()
