@@ -151,8 +151,13 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 }
 
 // NewStealth creates a TLS-impersonating HTTP fetcher for website scraping.
+// Geo-matches identity to proxy country to avoid detection from IP/identity mismatch.
 func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
-	profile := identity.Generate()
+	var idOpts []identity.Option
+	if cfg.Proxy.URL != "" {
+		idOpts = append(idOpts, identity.WithCountry("ID"))
+	}
+	profile := identity.Generate(idOpts...)
 
 	opts := []fetch.StealthOption{
 		fetch.WithIdentity(profile),

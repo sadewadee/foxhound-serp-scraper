@@ -28,16 +28,49 @@ import (
 )
 
 // contactPagePaths are common paths that contain contact information.
+// Reduced to 4 highest-yield paths to minimize 404 waste.
 var contactPagePaths = []string{
 	"/contact",
 	"/contact-us",
-	"/kontakt",
 	"/about",
 	"/about-us",
-	"/hubungi-kami",
-	"/team",
-	"/impressum",
-	"/contact.html",
+}
+
+// blockedDomains are sites with aggressive bot detection that always return 403.
+// Fetching these wastes crawl budget — they never yield personal emails.
+var blockedDomains = map[string]bool{
+	"www.yelp.com": true, "m.yelp.com": true,
+	"www.tripadvisor.com": true, "www.tripadvisor.co.uk": true, "www.tripadvisor.co.id": true,
+	"www.indeed.com": true, "de.indeed.com": true, "id.indeed.com": true,
+	"www.ziprecruiter.com": true,
+	"www.glassdoor.com": true, "www.glassdoor.co.uk": true,
+	"www.quora.com": true,
+	"rocketreach.co": true,
+	"www.simplyhired.com": true,
+	"www.researchgate.net": true,
+	"pmc.ncbi.nlm.nih.gov": true,
+	"journals.sagepub.com": true, "www.tandfonline.com": true,
+	"www.linkedin.com": true,
+	"www.facebook.com": true, "m.facebook.com": true,
+	"www.instagram.com": true,
+	"twitter.com": true, "x.com": true,
+	"www.amazon.com": true,
+	"www.walmart.com": true,
+	"www.pinterest.com": true,
+}
+
+// isSkipDomain returns true for domains that should not be fetched.
+func isSkipDomain(domain string) bool {
+	if blockedDomains[domain] {
+		return true
+	}
+	// Academic, government, military — not wellness/fitness target.
+	for _, suffix := range []string{".edu", ".gov", ".mil"} {
+		if strings.HasSuffix(domain, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // EnrichStage runs Stage 4: Contact enrichment workers.
@@ -305,6 +338,11 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		pageURL := job.URL
 		domain := dedup.ExtractDomain(pageURL)
 		if domain == "" {
+			continue
+		}
+
+		// Skip domains that always block or are off-target.
+		if isSkipDomain(domain) {
 			continue
 		}
 
@@ -663,9 +701,10 @@ func (c *EnrichStage) pushToEnrichQueue(ctx context.Context, queueKey, pageURL, 
 }
 
 // isPermanentError returns true for HTTP errors that will never succeed on retry.
+// NOTE: HTTP 403 removed — with rotating proxy, a different IP may succeed.
+// Blocked domains are handled by isSkipDomain() before fetching.
 func isPermanentError(errMsg string) bool {
 	permanent := []string{
-		"HTTP 403",
 		"HTTP 404",
 		"HTTP 410",
 		"HTTP 451",
