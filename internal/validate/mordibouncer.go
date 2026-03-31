@@ -109,6 +109,28 @@ func (c *MordibouncerClient) Check(ctx context.Context, email string) (*CheckRes
 	return &result, nil
 }
 
+// FilterValid checks emails via the Mordibouncer API and returns only valid ones.
+// Fail-open: on API error, the email is kept to avoid data loss.
+// Uses a 10s per-email timeout to avoid blocking callers for too long.
+func (c *MordibouncerClient) FilterValid(ctx context.Context, emails []string) []string {
+	var valid []string
+	for _, email := range emails {
+		emailCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		result, err := c.Check(emailCtx, email)
+		cancel()
+		if err != nil {
+			valid = append(valid, email)
+			continue
+		}
+		if result.IsGoodEmail() {
+			valid = append(valid, email)
+		} else {
+			slog.Debug("mordibouncer: email rejected", "email", email, "status", result.IsReachable)
+		}
+	}
+	return valid
+}
+
 // BackfillValidation scans existing completed enrich_jobs with emails but no
 // validation (mx_valid IS NULL) and validates them via Mordibouncer.
 // Runs as a background goroutine in the manager container.
@@ -169,25 +191,9 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 				return
 			}
 
-			var validEmails []string
-			allGood := true
-			for _, email := range j.emails {
-				result, err := client.Check(ctx, email)
-				if err != nil {
-					// API error — keep email, mark as validated to avoid re-checking.
-					validEmails = append(validEmails, email)
-					continue
-				}
-				if result.IsGoodEmail() {
-					validEmails = append(validEmails, email)
-				} else {
-					allGood = false
-					removed++
-				}
-			}
-
-			// Update DB: replace emails with only validated ones, set mx_valid.
-			mxValid := allGood && len(validEmails) > 0
+			validEmails := client.FilterValid(ctx, j.emails)
+			removed += len(j.emails) - len(validEmails)
+			mxValid := len(validEmails) > 0 && len(validEmails) == len(j.emails)
 			db.ExecContext(ctx, `
 				UPDATE enrich_jobs SET emails = $1, mx_valid = $2, updated_at = NOW()
 				WHERE id = $3

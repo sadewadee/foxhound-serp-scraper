@@ -487,15 +487,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 					if listingDomain == "" {
 						continue
 					}
-					var qID int64
-					if qid, ok := job.Meta["query_id"]; ok {
-						switch v := qid.(type) {
-						case float64:
-							qID = int64(v)
-						case int64:
-							qID = v
-						}
-					}
+					qID := queryIDFromMeta(job.Meta)
 
 					// Push directory listing to persister (DB INSERT deferred).
 					dirResult := persist.EnrichResult{
@@ -621,15 +613,7 @@ func (c *EnrichStage) queueContactPages(ctx context.Context, pageURL, domain str
 		return
 	}
 
-	var queryID int64
-	if qid, ok := job.Meta["query_id"]; ok {
-		switch v := qid.(type) {
-		case float64:
-			queryID = int64(v)
-		case int64:
-			queryID = v
-		}
-	}
+	queryID := queryIDFromMeta(job.Meta)
 
 	queueKey := "serp:queue:enrich"
 	redisClient := c.dedup.Client()
@@ -694,27 +678,22 @@ func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 	return links
 }
 
-// validateEmails checks emails via Mordibouncer API, returns only valid ones.
-// Validates each email individually — rejects invalid, disposable, honeypot.
-// On API error, keeps the email (fail-open to avoid data loss).
+// validateEmails delegates to MordibouncerClient.FilterValid (10s per-email timeout, fail-open).
 func (c *EnrichStage) validateEmails(ctx context.Context, emails []string) []string {
-	var valid []string
-	for _, email := range emails {
-		result, err := c.validator.Check(ctx, email)
-		if err != nil {
-			// API error — keep email (fail-open).
-			slog.Debug("enrich: mordibouncer check failed, keeping email", "email", email, "error", err)
-			valid = append(valid, email)
-			continue
-		}
-		if result.IsGoodEmail() {
-			valid = append(valid, email)
-		} else {
-			slog.Debug("enrich: email rejected by mordibouncer",
-				"email", email, "status", result.IsReachable, "sub", result.SubStatus)
+	return c.validator.FilterValid(ctx, emails)
+}
+
+// queryIDFromMeta extracts query_id from job metadata (handles float64 from JSON unmarshal).
+func queryIDFromMeta(meta map[string]any) int64 {
+	if qid, ok := meta["query_id"]; ok {
+		switch v := qid.(type) {
+		case float64:
+			return int64(v)
+		case int64:
+			return v
 		}
 	}
-	return valid
+	return 0
 }
 
 // popFromQueue pops a job from a Redis sorted set queue (ZPOPMIN).

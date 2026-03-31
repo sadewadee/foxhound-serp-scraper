@@ -20,7 +20,6 @@ import (
 	"github.com/sadewadee/foxhound/fetch"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
-	"github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/persist"
 	"github.com/sadewadee/serp-scraper/internal/query"
@@ -687,12 +686,6 @@ func shortHostname() string {
 	return host
 }
 
-// workerHostname returns full hostname for lock values.
-func workerHostname() string {
-	host, _ := os.Hostname()
-	return host
-}
-
 // QueriesProcessed returns the count of processed queries.
 func (s *SERPStage) QueriesProcessed() int64 {
 	return s.queriesProcessed.Load()
@@ -708,5 +701,3 @@ func (s *SERPStage) PagesProcessed() int64 {
 	return s.pagesProcessed.Load()
 }
 
-// Ensure db import is used.
-var _ = db.SERPJob{}
