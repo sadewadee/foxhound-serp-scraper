@@ -126,12 +126,12 @@ var placeholderLocals = []string{
 
 func isPlaceholderLocal(local string) bool {
 	for _, p := range placeholderLocals {
-		if local == p || strings.Contains(local, "your") || strings.Contains(local, "enter") {
+		if local == p {
 			return true
 		}
 	}
-	// Reject "enteryour", "youremail", "testemail", etc.
-	for _, keyword := range []string{"youremail", "enteryour", "testemail", "sampleemail", "myemail"} {
+	// Reject compound placeholder patterns (substring match is intentional here).
+	for _, keyword := range []string{"youremail", "enteryour", "testemail", "sampleemail", "myemail", "enterhere", "enteremail"} {
 		if strings.Contains(local, keyword) {
 			return true
 		}

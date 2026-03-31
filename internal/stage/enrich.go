@@ -36,27 +36,38 @@ var contactPagePaths = []string{
 	"/about-us",
 }
 
-// blockedDomains are sites with aggressive bot detection that always return 403.
-// Fetching these wastes crawl budget — they never yield personal emails.
+// blockedDomains are sites with aggressive bot detection or no useful email content.
+// Fetching these wastes crawl budget — they never yield personal wellness emails.
 var blockedDomains = map[string]bool{
+	// Directories with bot detection
 	"www.yelp.com": true, "m.yelp.com": true,
 	"www.tripadvisor.com": true, "www.tripadvisor.co.uk": true, "www.tripadvisor.co.id": true,
+	"www.tripadvisor.de": true, "www.tripadvisor.fr": true, "www.tripadvisor.com.au": true,
+	// Job boards
 	"www.indeed.com": true, "de.indeed.com": true, "id.indeed.com": true,
-	"www.ziprecruiter.com": true,
-	"www.glassdoor.com": true, "www.glassdoor.co.uk": true,
-	"www.quora.com": true,
-	"rocketreach.co": true,
-	"www.simplyhired.com": true,
-	"www.researchgate.net": true,
-	"pmc.ncbi.nlm.nih.gov": true,
-	"journals.sagepub.com": true, "www.tandfonline.com": true,
+	"www.ziprecruiter.com": true, "www.simplyhired.com": true,
+	"www.glassdoor.com": true, "www.glassdoor.co.uk": true, "www.glassdoor.de": true,
+	// Social media (no scrapeable emails)
 	"www.linkedin.com": true,
 	"www.facebook.com": true, "m.facebook.com": true,
 	"www.instagram.com": true,
 	"twitter.com": true, "x.com": true,
-	"www.amazon.com": true,
-	"www.walmart.com": true,
+	"www.tiktok.com": true,
+	"www.youtube.com": true,
 	"www.pinterest.com": true,
+	"www.reddit.com": true,
+	// Q&A / research
+	"www.quora.com": true,
+	"www.researchgate.net": true,
+	"pmc.ncbi.nlm.nih.gov": true,
+	"journals.sagepub.com": true, "www.tandfonline.com": true,
+	// Aggregators / no personal emails
+	"rocketreach.co": true,
+	"www.amazon.com": true, "www.walmart.com": true,
+	"www.booking.com": true, "www.airbnb.com": true,
+	"www.bbb.org": true,
+	"maps.google.com": true,
+	"www.yellowpages.com": true, "www.whitepages.com": true,
 }
 
 // isSkipDomain returns true for domains that should not be fetched.
@@ -65,7 +76,14 @@ func isSkipDomain(domain string) bool {
 		return true
 	}
 	// Academic, government, military — not wellness/fitness target.
-	for _, suffix := range []string{".edu", ".gov", ".mil"} {
+	// Includes international variants.
+	for _, suffix := range []string{
+		".edu", ".gov", ".mil",
+		".ac.uk", ".gov.uk", ".edu.au", ".gov.au",
+		".ac.id", ".go.id",
+		".edu.sg", ".gov.sg",
+		".ac.jp", ".go.jp",
+	} {
 		if strings.HasSuffix(domain, suffix) {
 			return true
 		}
@@ -341,8 +359,21 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			continue
 		}
 
-		// Skip domains that always block or are off-target.
+		// Skip domains that always block or are off-target — mark dead so reconciler doesn't re-queue.
 		if isSkipDomain(domain) {
+			urlHash, _ := job.Meta["url_hash"].(string)
+			if urlHash == "" {
+				urlHash = dedup.HashURL(pageURL)
+			}
+			result := persist.EnrichResult{
+				URLHash:     urlHash,
+				Status:      "dead",
+				ErrorMsg:    "blocked domain: " + domain,
+				IsPermanent: true,
+				AttemptIncr: 1,
+			}
+			data, _ := json.Marshal(result)
+			redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
 			continue
 		}
 

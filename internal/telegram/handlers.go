@@ -685,13 +685,3 @@ func progressBar(current, target int) string {
 	return "  `[" + strings.Repeat("█", pct) + strings.Repeat("░", 20-pct) + "]`"
 }
 
-// maxVal returns the max of a slice of ints.
-func maxVal(vals ...int) int {
-	m := 0
-	for _, v := range vals {
-		if v > m {
-			m = v
-		}
-	}
-	return m
-}

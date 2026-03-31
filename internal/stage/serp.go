@@ -198,10 +198,15 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 // pushSerpJob enqueues a serp_job onto the Redis sorted-set queue.
 // Score is the current time in microseconds — FIFO within the queue.
 func (s *SERPStage) pushSerpJob(ctx context.Context, jobID, serpURL string, queryID int64, pageNum int) {
-	data := fmt.Sprintf(`{"id":"%s","url":"%s","query_id":%d,"page_num":%d}`,
-		jobID, serpURL, queryID, pageNum)
+	payload := struct {
+		ID      string `json:"id"`
+		URL     string `json:"url"`
+		QueryID int64  `json:"query_id"`
+		PageNum int    `json:"page_num"`
+	}{jobID, serpURL, queryID, pageNum}
+	data, _ := json.Marshal(payload)
 	score := float64(time.Now().UnixMicro())
-	if err := s.redis.ZAdd(ctx, "serp:queue:serp", redis.Z{Score: score, Member: data}).Err(); err != nil {
+	if err := s.redis.ZAdd(ctx, "serp:queue:serp", redis.Z{Score: score, Member: string(data)}).Err(); err != nil {
 		slog.Warn("serp: push to queue failed", "job", jobID, "error", err)
 	}
 }
@@ -635,8 +640,12 @@ func (s *SERPStage) requeuePendingQueriesToRedis(ctx context.Context) {
 		if err := rows.Scan(&id, &text); err != nil {
 			continue
 		}
-		data := fmt.Sprintf(`{"id":%d,"text":"%s"}`, id, text)
-		s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(id), Member: data})
+		payload := struct {
+			ID   int64  `json:"id"`
+			Text string `json:"text"`
+		}{id, text}
+		data, _ := json.Marshal(payload)
+		s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(id), Member: string(data)})
 		n++
 	}
 	if n > 0 {
@@ -661,12 +670,11 @@ func pushToQueue(ctx context.Context, client *redis.Client, queueKey, urlStr str
 	micros := job.CreatedAt.UnixMicro()
 	score := -(float64(job.Priority) * 1_000_000_000) + float64(micros)
 
-	data := fmt.Sprintf(`{"id":"%s","url":"%s","method":"GET","priority":%d,"meta":{"query_id":%d,"serp_id":"%s"}}`,
-		job.ID, urlStr, job.Priority, queryID, serpID)
+	data, _ := json.Marshal(job)
 
 	return client.ZAdd(ctx, queueKey, redis.Z{
 		Score:  score,
-		Member: data,
+		Member: string(data),
 	}).Err()
 }
 

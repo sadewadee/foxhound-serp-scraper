@@ -500,8 +500,21 @@ var validTLDs = map[string]bool{
 	"gym": true, "beauty": true, "salon": true, "restaurant": true, "cafe": true,
 	"space": true, "today": true, "email": true, "link": true,
 	"work": true, "asia": true, "rent": true, "page": true,
+	// Wellness/business gTLDs
+	"services": true, "center": true, "coach": true, "training": true,
+	"consulting": true, "solutions": true, "academy": true, "education": true,
+	"care": true, "clinic": true, "dental": true, "vet": true,
+	"events": true, "marketing": true, "photography": true, "wedding": true,
+	"group": true, "team": true, "zone": true, "network": true, "systems": true,
+	"expert": true, "guru": true, "tips": true, "bio": true, "eco": true,
+	"foundation": true, "institute": true, "international": true,
+	"partners": true, "ventures": true, "holdings": true, "limited": true,
+	"enterprises": true, "management": true, "properties": true,
+	"fun": true, "live": true, "news": true, "social": true, "run": true,
+	"one": true, "top": true, "icu": true, "vip": true, "mobi": true,
+	"name": true, "ly": true, "gg": true, "to": true, "is": true,
 
-	// Country codes (common ones)
+	// Country codes
 	"id": true, "uk": true, "au": true, "de": true, "fr": true,
 	"jp": true, "kr": true, "sg": true, "my": true, "th": true,
 	"ph": true, "vn": true, "in": true, "cn": true, "tw": true,
@@ -511,10 +524,21 @@ var validTLDs = map[string]bool{
 	"dk": true, "fi": true, "pt": true, "ru": true, "ua": true,
 	"za": true, "ae": true, "sa": true, "il": true, "tr": true,
 	"ie": true, "cz": true, "ro": true, "hu": true, "gr": true,
-
-	// Second-level country (treated as TLD after last dot)
-	// e.g. info@foo.co.id → TLD is "id", works.
-	// But for co.uk addresses the last dot gives "uk", also works.
+	// Africa & Middle East
+	"ke": true, "tz": true, "ug": true, "ng": true, "gh": true,
+	"eg": true, "ma": true, "et": true, "qa": true, "kw": true,
+	"om": true, "bh": true, "jo": true, "lb": true,
+	// Americas
+	"ar": true, "cl": true, "pe": true, "ec": true,
+	"ve": true, "cr": true, "pa": true, "do": true, "gt": true,
+	"pr": true, "tt": true, "jm": true,
+	// Europe (additional)
+	"sk": true, "bg": true, "lt": true, "lv": true, "ee": true,
+	"si": true, "hr": true, "rs": true, "lu": true, "mt": true,
+	"cy": true,
+	// South/SE Asia (additional)
+	"pk": true, "bd": true, "lk": true, "np": true, "mm": true,
+	"kh": true, "la": true,
 
 	// Education & gov
 	"edu": true, "gov": true, "mil": true, "ac": true,
