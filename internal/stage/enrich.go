@@ -25,6 +25,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/directory"
 	"github.com/sadewadee/serp-scraper/internal/persist"
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
+	"github.com/sadewadee/serp-scraper/internal/validate"
 )
 
 // contactPagePaths are common paths that contain contact information.
@@ -95,9 +96,10 @@ func isSkipDomain(domain string) bool {
 // Hot path is zero-DB: all claims via Redis SETNX, results pushed to
 // Redis lists, persister drains to DB in background batches.
 type EnrichStage struct {
-	cfg   *config.Config
-	db    *sql.DB
-	dedup *dedup.Store
+	cfg       *config.Config
+	db        *sql.DB
+	dedup     *dedup.Store
+	validator *validate.MordibouncerClient // nil if not configured
 
 	// Shared browser state — all workers share one browser process (pool of tabs).
 	browserMu     sync.Mutex
@@ -114,10 +116,15 @@ func NewEnrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Enri
 	browserFactory := func(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		return internalScraper.NewBrowserWithPool(cfg, cfg.Enrich.Concurrency)
 	}
+	validator := validate.NewMordibouncer(&cfg.Mordibouncer)
+	if validator != nil {
+		slog.Info("enrich: Mordibouncer email validation enabled", "api", cfg.Mordibouncer.APIURL)
+	}
 	return &EnrichStage{
 		cfg:       cfg,
 		db:        database,
 		dedup:     dd,
+		validator: validator,
 		lifecycle: internalScraper.NewBrowserLifecycle(cfg, browserFactory, "enrich"),
 	}
 }
@@ -520,6 +527,11 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			allEmails := internalScraper.FilterEmails(rawEmails)
 			allPhones := internalScraper.FilterPhones(rawPhones)
 
+			// Mordibouncer validation for directory emails too.
+			if c.validator != nil && len(allEmails) > 0 {
+				allEmails = c.validateEmails(ctx, allEmails)
+			}
+
 			socialLinks := buildSocialLinks(nil)
 
 			// Push directory completion to persister.
@@ -547,9 +559,16 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		emails := internalScraper.FilterEmails(cd.Emails)
 		phones := internalScraper.FilterPhones(cd.Phones)
 
-		// Optional MX validation.
+		// Mordibouncer validation (highest priority — SMTP-level check).
+		// Falls back to MX validation if Mordibouncer is not configured.
 		var mxValid *bool
-		if c.cfg.Enrich.ValidateMX && len(emails) > 0 {
+		if c.validator != nil && len(emails) > 0 {
+			emails = c.validateEmails(ctx, emails)
+			if len(emails) > 0 {
+				v := true
+				mxValid = &v
+			}
+		} else if c.cfg.Enrich.ValidateMX && len(emails) > 0 {
 			v := internalScraper.ValidateMX(emails[0])
 			mxValid = &v
 			if !v {
@@ -673,6 +692,29 @@ func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 		links["whatsapp"] = cd.WhatsApp
 	}
 	return links
+}
+
+// validateEmails checks emails via Mordibouncer API, returns only valid ones.
+// Validates each email individually — rejects invalid, disposable, honeypot.
+// On API error, keeps the email (fail-open to avoid data loss).
+func (c *EnrichStage) validateEmails(ctx context.Context, emails []string) []string {
+	var valid []string
+	for _, email := range emails {
+		result, err := c.validator.Check(ctx, email)
+		if err != nil {
+			// API error — keep email (fail-open).
+			slog.Debug("enrich: mordibouncer check failed, keeping email", "email", email, "error", err)
+			valid = append(valid, email)
+			continue
+		}
+		if result.IsGoodEmail() {
+			valid = append(valid, email)
+		} else {
+			slog.Debug("enrich: email rejected by mordibouncer",
+				"email", email, "status", result.IsReachable, "sub", result.SubStatus)
+		}
+	}
+	return valid
 }
 
 // popFromQueue pops a job from a Redis sorted set queue (ZPOPMIN).
