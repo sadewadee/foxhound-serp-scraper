@@ -19,6 +19,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/persist"
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
 	"github.com/sadewadee/serp-scraper/internal/telegram"
+	"github.com/sadewadee/serp-scraper/internal/validate"
 )
 
 // RunPipeline starts the API server and scraping pipeline.
@@ -78,9 +79,16 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	}
 
 	// Start persister — drains Redis result queues to DB in batches.
-	// Runs in every container (safe — DB operations are idempotent via ON CONFLICT/WHERE).
 	persister := persist.New(database, dd.Client(), cfg.Fetch.PersistIntervalMs, cfg.Fetch.PersistBatchSize)
 	go persister.Run(ctx)
+
+	// Start email backfill validator — validates existing unvalidated emails via Mordibouncer.
+	// Only runs in manager (stage=none) to avoid competing with workers.
+	if stageName == "none" {
+		if validator := validate.NewMordibouncer(&cfg.Mordibouncer); validator != nil {
+			go validate.BackfillValidation(ctx, database, validator)
+		}
+	}
 
 	// Start pipeline stages in background (skip for "none" — API only mode).
 	if stageName != "none" {

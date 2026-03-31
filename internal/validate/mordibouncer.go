@@ -3,12 +3,15 @@ package validate
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/lib/pq"
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
 
@@ -104,6 +107,103 @@ func (c *MordibouncerClient) Check(ctx context.Context, email string) (*CheckRes
 	}
 
 	return &result, nil
+}
+
+// BackfillValidation scans existing completed enrich_jobs with emails but no
+// validation (mx_valid IS NULL) and validates them via Mordibouncer.
+// Runs as a background goroutine in the manager container.
+func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerClient) {
+	slog.Info("backfill: starting email validation for existing records")
+
+	// Small delay to let other services start first.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+
+	validated, removed := 0, 0
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+
+		// Fetch batch of unvalidated jobs (oldest first).
+		rows, err := db.QueryContext(ctx, `
+			SELECT id, emails
+			FROM enrich_jobs
+			WHERE status = 'completed'
+			  AND mx_valid IS NULL
+			  AND array_length(emails, 1) > 0
+			ORDER BY completed_at ASC
+			LIMIT 100
+		`)
+		if err != nil {
+			slog.Warn("backfill: query failed", "error", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		type job struct {
+			id     string
+			emails []string
+		}
+		var batch []job
+		for rows.Next() {
+			var j job
+			var emails pq.StringArray
+			if err := rows.Scan(&j.id, &emails); err == nil {
+				j.emails = emails
+				batch = append(batch, j)
+			}
+		}
+		rows.Close()
+
+		if len(batch) == 0 {
+			slog.Info("backfill: all existing emails validated", "total_validated", validated, "total_removed", removed)
+			return // Done — no more unvalidated records.
+		}
+
+		for _, j := range batch {
+			if ctx.Err() != nil {
+				return
+			}
+
+			var validEmails []string
+			allGood := true
+			for _, email := range j.emails {
+				result, err := client.Check(ctx, email)
+				if err != nil {
+					// API error — keep email, mark as validated to avoid re-checking.
+					validEmails = append(validEmails, email)
+					continue
+				}
+				if result.IsGoodEmail() {
+					validEmails = append(validEmails, email)
+				} else {
+					allGood = false
+					removed++
+				}
+			}
+
+			// Update DB: replace emails with only validated ones, set mx_valid.
+			mxValid := allGood && len(validEmails) > 0
+			db.ExecContext(ctx, `
+				UPDATE enrich_jobs SET emails = $1, mx_valid = $2, updated_at = NOW()
+				WHERE id = $3
+			`, pq.Array(validEmails), mxValid, j.id)
+
+			validated++
+			if validated%500 == 0 {
+				slog.Info("backfill: progress", "validated", validated, "removed", removed)
+			}
+
+			// Rate limit — don't hammer Mordibouncer API.
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	slog.Info("backfill: finished", "validated", validated, "removed", removed)
 }
 
 // IsGoodEmail returns true if the email is safe or risky-but-deliverable.
