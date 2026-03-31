@@ -237,12 +237,17 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		providerRows.Close()
 	}
 
-	// ── Email yield rate ──
-	var enrichWithEmail int
+	// ── Email yield rate + validation stats ──
+	var enrichWithEmail, validatedCount int
 	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0`).Scan(&enrichWithEmail)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND mx_valid = true AND array_length(emails, 1) > 0`).Scan(&validatedCount)
 	yieldPct := 0.0
 	if enCompleted > 0 {
 		yieldPct = float64(enrichWithEmail) / float64(enCompleted) * 100
+	}
+	validPct := 0.0
+	if enrichWithEmail > 0 {
+		validPct = float64(validatedCount) / float64(enrichWithEmail) * 100
 	}
 
 	// ── ETA ──
@@ -270,6 +275,7 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		fmt.Sprintf("  Enrich: *%d*/hr %s", enHour, delta(enHour, enPrevHour)),
 		fmt.Sprintf("  Emails: *%d*/hr %s", emailsHour, delta(emailsHour, emailsPrevHour)),
 		fmt.Sprintf("  Yield: %.1f%% pages have email", yieldPct),
+		fmt.Sprintf("  Validated: *%s* (%.1f%% of emails)", fmtK(validatedCount), validPct),
 		fmt.Sprintf("  ETA 10M: *%s*", etaStr),
 		"",
 		"_Today vs Yesterday:_",
@@ -388,8 +394,9 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		FROM enrich_jobs WHERE status = 'completed'
 	`).Scan(&enrichToday, &enrichYesterday)
 
-	var emailsTotal int
+	var emailsTotal, validatedTotal int
 	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&emailsTotal)
+	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND mx_valid = true AND array_length(emails, 1) > 0`).Scan(&validatedTotal)
 	pctOf10M := float64(emailsTotal) / 10_000_000 * 100
 
 	// ── Dead job breakdown ──
@@ -443,10 +450,15 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		fmt.Sprintf("    Emails: *%s* vs %s %s", fmtK(emails7d), fmtK(emailsPrev7d), delta(emails7d, emailsPrev7d)),
 	)
 
-	// Progress
+	// Progress + validation
+	validPctA := 0.0
+	if emailsTotal > 0 {
+		validPctA = float64(validatedTotal) / float64(emailsTotal) * 100
+	}
 	lines = append(lines, "",
 		"_Progress to 10M:_",
 		fmt.Sprintf("  Total: *%s* (%.2f%%)", fmtK(emailsTotal), pctOf10M),
+		fmt.Sprintf("  Validated (Mordibouncer): *%s* (%.1f%%)", fmtK(validatedTotal), validPctA),
 		progressBar(emailsTotal, 10_000_000),
 	)
 
