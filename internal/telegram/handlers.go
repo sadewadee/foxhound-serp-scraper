@@ -531,10 +531,21 @@ func (b *Bot) handleExport(msg *Message) {
 	b.sendMessage(msg.Chat.ID, "Generating CSV export...")
 
 	rows, err := b.db.Query(`
-		SELECT emails, phones, domain, url, social_links, address
+		SELECT
+			emails, phones, domain, url,
+			COALESCE(contact_name, ''),
+			COALESCE(business_name, ''),
+			COALESCE(business_category, ''),
+			COALESCE(page_title, ''),
+			COALESCE(website, ''),
+			COALESCE(address, ''),
+			COALESCE(location, ''),
+			COALESCE(opening_hours, ''),
+			COALESCE(rating, ''),
+			social_links
 		FROM enrich_jobs
 		WHERE status = 'completed' AND array_length(emails, 1) > 0
-		ORDER BY id ASC LIMIT 50000
+		ORDER BY completed_at DESC LIMIT 50000
 	`)
 	if err != nil {
 		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
@@ -543,19 +554,28 @@ func (b *Bot) handleExport(msg *Message) {
 	defer rows.Close()
 
 	var buf strings.Builder
-	buf.WriteString("emails,phones,domain,url,social_links,address\n")
+	buf.WriteString("emails,phones,domain,url,contact_name,business_name,category,page_title,website,address,location,opening_hours,rating,social_links\n")
 
 	count := 0
 	for rows.Next() {
 		var emails, phones []string
-		var domain, url, address string
+		var domain, url, contactName, bizName, category, pageTitle, website, address, location, hours, rating string
 		var socialLinksJSON []byte
-		rows.Scan(pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON, &address)
-		emailsStr := strings.Join(emails, ";")
-		phonesStr := strings.Join(phones, ";")
-		fmt.Fprintf(&buf, "%s,%s,%s,%s,%s,%s\n",
-			csvEscape(emailsStr), csvEscape(phonesStr), csvEscape(domain), csvEscape(url),
-			csvEscape(string(socialLinksJSON)), csvEscape(address))
+		rows.Scan(
+			pq.Array(&emails), pq.Array(&phones), &domain, &url,
+			&contactName, &bizName, &category, &pageTitle, &website,
+			&address, &location, &hours, &rating, &socialLinksJSON,
+		)
+		fmt.Fprintf(&buf, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+			csvEscape(strings.Join(emails, ";")),
+			csvEscape(strings.Join(phones, ";")),
+			csvEscape(domain), csvEscape(url),
+			csvEscape(contactName), csvEscape(bizName),
+			csvEscape(category), csvEscape(pageTitle),
+			csvEscape(website), csvEscape(address),
+			csvEscape(location), csvEscape(hours),
+			csvEscape(rating), csvEscape(string(socialLinksJSON)),
+		)
 		count++
 	}
 
