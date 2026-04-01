@@ -575,16 +575,27 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 		}
 
 		// 2. Re-queue retry-eligible jobs whose backoff has elapsed.
-		retryRows, _ := s.db.Query(`
-			UPDATE serp_jobs SET updated_at = NOW()
-			WHERE id IN (
-				SELECT id FROM serp_jobs
-				WHERE status = 'new' AND attempt_count > 0
-				  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-				LIMIT 500
-			)
-			RETURNING id, search_url, parent_job_id, page_num
-		`)
+		// Skip if serp queue is already deep — no point adding more to a full queue.
+		serpQueueDepth, _ := s.redis.ZCard(ctx, "serp:queue:serp").Result()
+		retryLimit := 500
+		if serpQueueDepth > 10000 {
+			retryLimit = 0
+		} else if serpQueueDepth > 5000 {
+			retryLimit = 50
+		}
+		var retryRows *sql.Rows
+		if retryLimit > 0 {
+			retryRows, _ = s.db.Query(fmt.Sprintf(`
+				UPDATE serp_jobs SET updated_at = NOW()
+				WHERE id IN (
+					SELECT id FROM serp_jobs
+					WHERE status = 'new' AND attempt_count > 0
+					  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+					LIMIT %d
+				)
+				RETURNING id, search_url, parent_job_id, page_num
+			`, retryLimit))
+		}
 		if retryRows != nil {
 			requeued := 0
 			for retryRows.Next() {
