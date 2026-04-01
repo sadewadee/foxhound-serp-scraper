@@ -549,7 +549,11 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 		// 1. Reset stuck processing jobs (>5 min without progress).
 		stuckRows, err := s.db.Query(`
 			UPDATE serp_jobs SET status = 'new', locked_by = NULL, locked_at = NULL, updated_at = NOW()
-			WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
+			WHERE id IN (
+				SELECT id FROM serp_jobs
+				WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
+				LIMIT 200
+			)
 			RETURNING id, search_url, parent_job_id, page_num
 		`)
 		if err == nil {
@@ -573,8 +577,12 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 		// 2. Re-queue retry-eligible jobs whose backoff has elapsed.
 		retryRows, _ := s.db.Query(`
 			UPDATE serp_jobs SET updated_at = NOW()
-			WHERE status = 'new' AND attempt_count > 0
-			  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+			WHERE id IN (
+				SELECT id FROM serp_jobs
+				WHERE status = 'new' AND attempt_count > 0
+				  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+				LIMIT 500
+			)
 			RETURNING id, search_url, parent_job_id, page_num
 		`)
 		if retryRows != nil {
@@ -594,25 +602,27 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 			}
 		}
 
-		// 3. Mark queries completed.
+		// 3. Mark queries completed when all their serp_jobs are done.
+		// Uses recently-updated serp_jobs as candidates to avoid full table scan.
 		completedRes, _ := s.db.Exec(`
 			UPDATE queries SET
 				status = 'completed',
-				result_count = COALESCE((
-					SELECT SUM(result_count) FROM serp_jobs WHERE parent_job_id = queries.id
-				), 0),
+				result_count = sub.total_results,
 				updated_at = NOW()
-			WHERE status = 'processing'
-			AND id IN (
-				SELECT DISTINCT parent_job_id FROM serp_jobs
-				WHERE status IN ('completed', 'failed')
-				  AND updated_at > NOW() - INTERVAL '2 minutes'
-			)
-			AND NOT EXISTS (
-				SELECT 1 FROM serp_jobs
-				WHERE parent_job_id = queries.id
-				  AND status IN ('new', 'processing')
-			)
+			FROM (
+				SELECT s.parent_job_id, SUM(s.result_count) AS total_results
+				FROM serp_jobs s
+				WHERE s.parent_job_id IN (
+					SELECT DISTINCT parent_job_id FROM serp_jobs
+					WHERE status IN ('completed', 'failed')
+					  AND updated_at > NOW() - INTERVAL '2 minutes'
+					LIMIT 200
+				)
+				GROUP BY s.parent_job_id
+				HAVING COUNT(*) FILTER (WHERE s.status IN ('new', 'processing')) = 0
+			) sub
+			WHERE queries.id = sub.parent_job_id
+			  AND queries.status = 'processing'
 		`)
 		if completedRes != nil {
 			if n, _ := completedRes.RowsAffected(); n > 0 {
@@ -622,22 +632,33 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 		}
 
 		// 4. Requeue queries stuck in 'processing' with no active serp_jobs.
-		stuckQRes, stuckQErr := s.db.Exec(`
-			UPDATE queries SET status = 'pending', updated_at = NOW()
-			WHERE id IN (
-				SELECT q.id FROM queries q
-				LEFT JOIN serp_jobs s ON s.parent_job_id = q.id
-				WHERE q.status = 'processing'
-				  AND q.updated_at < NOW() - INTERVAL '10 minutes'
-				GROUP BY q.id
-				HAVING COUNT(s.id) FILTER (WHERE s.status IN ('new', 'processing')) = 0
-				LIMIT 100
-			)
-		`)
-		if stuckQErr == nil {
-			if n, _ := stuckQRes.RowsAffected(); n > 0 {
-				slog.Info("serp: reconciler requeued stuck queries", "count", n)
-				s.requeuePendingQueriesToRedis(ctx)
+		// These are zombies — all serp_jobs finished (completed or failed) but query never transitioned.
+		serpDepth, _ := s.redis.ZCard(ctx, "serp:queue:serp").Result()
+		requeueLimit := 500
+		if serpDepth > 5000 {
+			requeueLimit = 0 // backpressure: don't add more if serp queue is busy
+		} else if serpDepth > 2000 {
+			requeueLimit = 50
+		}
+		if requeueLimit > 0 {
+			stuckQRes, stuckQErr := s.db.Exec(fmt.Sprintf(`
+				UPDATE queries SET status = 'pending', updated_at = NOW()
+				WHERE id IN (
+					SELECT q.id FROM queries q
+					WHERE q.status = 'processing'
+					  AND q.updated_at < NOW() - INTERVAL '10 minutes'
+					  AND NOT EXISTS (
+						SELECT 1 FROM serp_jobs s
+						WHERE s.parent_job_id = q.id AND s.status IN ('new', 'processing')
+					)
+					LIMIT %d
+				)
+			`, requeueLimit))
+			if stuckQErr == nil {
+				if n, _ := stuckQRes.RowsAffected(); n > 0 {
+					slog.Info("serp: reconciler requeued stuck queries", "count", n)
+					s.requeuePendingQueriesToRedis(ctx)
+				}
 			}
 		}
 
