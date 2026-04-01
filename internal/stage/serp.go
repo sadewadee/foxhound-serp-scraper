@@ -245,7 +245,10 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 				s.db.Exec(`
 					INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, engine, status)
 					VALUES ($1, $2, $3, $4, $5, 'new')
-					ON CONFLICT (id) DO NOTHING
+					ON CONFLICT (id) DO UPDATE SET
+						status = 'new', attempt_count = 0, error_msg = '', locked_by = NULL,
+						next_attempt_at = NULL, updated_at = NOW()
+					WHERE serp_jobs.status = 'failed'
 				`, jobID, qMsg.ID, serpURL, page, eng.Name())
 
 				s.pushSerpJob(ctx, jobID, serpURL, qMsg.ID, page)
