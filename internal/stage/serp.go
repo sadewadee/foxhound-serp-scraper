@@ -59,6 +59,13 @@ type SERPStage struct {
 	queriesProcessed atomic.Int64
 	urlsFound        atomic.Int64
 	pagesProcessed   atomic.Int64
+
+	// Beta metrics (circuit breaker + fatigue).
+	betaCBSkipped  atomic.Int64 // requests skipped by open circuit
+	betaCBPassed   atomic.Int64 // requests allowed through circuit
+	betaCBTripped  atomic.Int64 // times circuit opened
+	betaFatigueSum atomic.Int64 // cumulative fatigue-adjusted delay (ms) for averaging
+	betaFatigueN   atomic.Int64 // number of fatigue-adjusted delays
 }
 
 // NewSERPStage creates a new SERP discovery stage.
@@ -352,6 +359,8 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			if s.fatigue != nil {
 				base := s.timing.Delay()
 				adjusted := s.fatigue.AdjustDelay(base)
+				s.betaFatigueSum.Add(adjusted.Milliseconds())
+				s.betaFatigueN.Add(1)
 				time.Sleep(adjusted)
 			}
 
@@ -377,12 +386,18 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 					ID: job.ID, URL: job.URL, Method: "GET", FetchMode: foxhound.FetchBrowser,
 				})
 				if probeErr == nil && probeResp != nil && probeResp.StatusCode == 503 {
-					// Circuit is open — skip this job, re-queue with backoff.
-					slog.Debug("serp: circuit open, skipping", "job", job.ID, "engine", eng.Name())
+					// Circuit is open — skip this job instantly (0ms vs 60s timeout).
+					s.betaCBSkipped.Add(1)
 					fetchErr = fmt.Errorf("circuit breaker open")
 				} else if probeErr == nil && probeResp != nil {
+					s.betaCBPassed.Add(1)
 					body = probeResp.Body
+					// Record captcha as failure for circuit breaker learning.
+					if eng.IsCaptchaPage(body) {
+						s.betaCBTripped.Add(1)
+					}
 				} else {
+					s.betaCBTripped.Add(1)
 					fetchErr = probeErr
 				}
 			}
@@ -708,6 +723,34 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 
 		// 5. Auto-expand completed queries.
 		s.expandCompletedQueries()
+
+		// 6. Beta metrics report (only when beta features are active).
+		if s.circuitBreaker != nil || s.fatigue != nil {
+			cbSkipped := s.betaCBSkipped.Load()
+			cbPassed := s.betaCBPassed.Load()
+			cbTripped := s.betaCBTripped.Load()
+			fatigueN := s.betaFatigueN.Load()
+			avgFatigueMs := int64(0)
+			if fatigueN > 0 {
+				avgFatigueMs = s.betaFatigueSum.Load() / fatigueN
+			}
+
+			// Compute circuit breaker skip rate.
+			cbTotal := cbSkipped + cbPassed
+			cbSkipPct := 0.0
+			if cbTotal > 0 {
+				cbSkipPct = float64(cbSkipped) / float64(cbTotal) * 100
+			}
+
+			slog.Info("beta-metrics: serp",
+				"cb_skipped", cbSkipped,
+				"cb_passed", cbPassed,
+				"cb_tripped", cbTripped,
+				"cb_skip_pct", fmt.Sprintf("%.1f%%", cbSkipPct),
+				"fatigue_avg_ms", avgFatigueMs,
+				"fatigue_samples", fatigueN,
+			)
+		}
 	}
 }
 

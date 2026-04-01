@@ -106,9 +106,17 @@ type EnrichStage struct {
 	sharedBrowser *fetch.CamoufoxFetcher
 	lifecycle     *internalScraper.BrowserLifecycle
 
+	// Beta: domain scorer for stealth→browser auto-escalation (nil when disabled).
+	domainScorer *fetch.DomainScorer
+
 	pagesProcessed atomic.Int64
 	emailsFound    atomic.Int64
 	phonesFound    atomic.Int64
+
+	// Beta metrics (domain scorer).
+	betaDSStatic  atomic.Int64 // fetches routed to stealth
+	betaDSCaution atomic.Int64 // fetches routed to stealth-cautious (5s timeout)
+	betaDSBrowser atomic.Int64 // fetches escalated directly to browser
 }
 
 // NewEnrichStage creates a new contact enrichment stage.
@@ -121,11 +129,12 @@ func NewEnrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Enri
 		slog.Info("enrich: Mordibouncer email validation enabled", "api", cfg.Mordibouncer.APIURL)
 	}
 	return &EnrichStage{
-		cfg:       cfg,
-		db:        database,
-		dedup:     dd,
-		validator: validator,
-		lifecycle: internalScraper.NewBrowserLifecycle(cfg, browserFactory, "enrich"),
+		cfg:          cfg,
+		db:           database,
+		dedup:        dd,
+		validator:    validator,
+		lifecycle:    internalScraper.NewBrowserLifecycle(cfg, browserFactory, "enrich"),
+		domainScorer: internalScraper.NewDomainScorer(cfg),
 	}
 }
 
@@ -322,6 +331,24 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				slog.Info("enrich: reconciler re-queued failed retries", "count", retried)
 			}
 		}
+
+		// Beta metrics report (only when domain scorer is active).
+		if c.domainScorer != nil {
+			dsStatic := c.betaDSStatic.Load()
+			dsCaution := c.betaDSCaution.Load()
+			dsBrowser := c.betaDSBrowser.Load()
+			dsTotal := dsStatic + dsCaution + dsBrowser
+			escalatePct := 0.0
+			if dsTotal > 0 {
+				escalatePct = float64(dsBrowser) / float64(dsTotal) * 100
+			}
+			slog.Info("beta-metrics: enrich",
+				"ds_static", dsStatic,
+				"ds_caution", dsCaution,
+				"ds_browser", dsBrowser,
+				"ds_escalate_pct", fmt.Sprintf("%.1f%%", escalatePct),
+			)
+		}
 	}
 }
 
@@ -427,7 +454,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			continue
 		}
 
-		// Fetch page.
+		// Fetch page — with optional domain scorer (beta).
 		timeout := time.Duration(c.cfg.Enrich.TimeoutMs) * time.Millisecond
 		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
@@ -436,7 +463,33 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		c.browserMu.Unlock()
 
 		var body string
-		if currentBrowser != nil {
+		if c.domainScorer != nil && currentBrowser != nil {
+			// Beta: domain scorer decides fetch strategy per domain.
+			action := c.domainScorer.Recommend(domain)
+			switch action {
+			case fetch.ActionBrowserDirect:
+				c.betaDSBrowser.Add(1)
+				body, err = internalScraper.FetchWithBrowserString(fetchCtx, currentBrowser, pageURL, job.ID)
+				if err == nil {
+					c.domainScorer.RecordBrowser(domain, false)
+				} else {
+					c.domainScorer.RecordBrowser(domain, true)
+				}
+			case fetch.ActionStaticCautious:
+				c.betaDSCaution.Add(1)
+				// Cautious: 5s timeout on stealth, then fallback to browser.
+				cautionCtx, cautionCancel := context.WithTimeout(fetchCtx, 5*time.Second)
+				body, err = internalScraper.FetchPage(cautionCtx, stealth, currentBrowser, pageURL, job.ID)
+				cautionCancel()
+				blocked := err != nil
+				c.domainScorer.RecordStatic(domain, blocked)
+			default:
+				c.betaDSStatic.Add(1)
+				body, err = internalScraper.FetchPage(fetchCtx, stealth, currentBrowser, pageURL, job.ID)
+				blocked := err != nil
+				c.domainScorer.RecordStatic(domain, blocked)
+			}
+		} else if currentBrowser != nil {
 			body, err = internalScraper.FetchPage(fetchCtx, stealth, currentBrowser, pageURL, job.ID)
 		} else {
 			body, err = fetchStealthOnly(fetchCtx, stealth, pageURL, job.ID)

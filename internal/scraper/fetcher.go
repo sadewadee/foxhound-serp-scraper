@@ -298,6 +298,16 @@ func FetchWithBrowser(ctx context.Context, browser *fetch.CamoufoxFetcher, pageU
 	return resp.Body, nil
 }
 
+// FetchWithBrowserString fetches a page using only the browser, returns string body.
+// Used by enrich domain scorer when it decides to skip stealth entirely.
+func FetchWithBrowserString(ctx context.Context, browser *fetch.CamoufoxFetcher, pageURL, jobID string) (string, error) {
+	body, err := FetchWithBrowser(ctx, browser, pageURL, "ds-"+jobID)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
 // ──────────────────────────────────────────────────────────────
 // Beta features (foxhound v0.0.7) — enabled via BETA_FEATURES=1
 // ──────────────────────────────────────────────────────────────
