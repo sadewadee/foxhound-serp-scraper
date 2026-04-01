@@ -9,8 +9,10 @@ import (
 	"time"
 
 	foxhound "github.com/sadewadee/foxhound"
+	"github.com/sadewadee/foxhound/behavior"
 	"github.com/sadewadee/foxhound/fetch"
 	"github.com/sadewadee/foxhound/identity"
+	"github.com/sadewadee/foxhound/middleware"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
@@ -294,4 +296,64 @@ func FetchWithBrowser(ctx context.Context, browser *fetch.CamoufoxFetcher, pageU
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return resp.Body, nil
+}
+
+// ──────────────────────────────────────────────────────────────
+// Beta features (foxhound v0.0.7) — enabled via BETA_FEATURES=1
+// ──────────────────────────────────────────────────────────────
+
+// NewCircuitBreaker creates a per-domain circuit breaker for SERP fetches.
+// When google.com fails >50% in a 20-request window, the circuit opens
+// and rejects requests for 30s→10min (exponential backoff with 50% jitter).
+// This prevents wasting browser tabs on domains that are actively blocking.
+//
+// Returns nil when beta features are disabled.
+func NewCircuitBreaker(cfg *config.Config) foxhound.Middleware {
+	if !cfg.Fetch.BetaFeatures && !cfg.Fetch.CircuitBreaker {
+		return nil
+	}
+	slog.Info("beta: circuit breaker enabled for SERP")
+	return middleware.NewCircuitBreaker(middleware.CircuitBreakerConfig{
+		FailureThreshold: 0.5,
+		MinObservations:  5,
+		WindowSize:       20,
+		BaseTimeout:      30 * time.Second,
+		MaxTimeout:       10 * time.Minute,
+		MaxTrips:         8,
+	})
+}
+
+// NewDomainScorer creates a Bayesian domain risk scorer for enrich SmartFetcher.
+// Learns which domains block stealth HTTP and auto-escalates to browser.
+// Returns nil when beta features are disabled.
+func NewDomainScorer(cfg *config.Config) *fetch.DomainScorer {
+	if !cfg.Fetch.BetaFeatures && !cfg.Fetch.DomainScorer {
+		return nil
+	}
+	slog.Info("beta: domain scorer enabled for enrich")
+	return fetch.NewDomainScorer(fetch.DefaultDomainScoreConfig())
+}
+
+// NewSmartFetcherWithScorer creates a SmartFetcher (stealth→browser auto-router) with
+// optional domain scoring. When scorer is non-nil, it learns per-domain risk
+// and skips stealth for domains that always block (e.g. LinkedIn, Instagram).
+func NewSmartFetcherWithScorer(stealth foxhound.Fetcher, browser foxhound.Fetcher, scorer *fetch.DomainScorer) *fetch.SmartFetcher {
+	opts := []fetch.SmartOption{}
+	if scorer != nil {
+		opts = append(opts, fetch.WithDomainScorer(scorer))
+		opts = append(opts, fetch.WithCautiousTimeout(5*time.Second))
+	}
+	return fetch.NewSmart(stealth, browser, opts...)
+}
+
+// NewSessionFatigue creates a session fatigue model for human-like timing.
+// Returns nil when beta features are disabled.
+func NewSessionFatigue(cfg *config.Config) *behavior.SessionFatigue {
+	if !cfg.Fetch.BetaFeatures && !cfg.Fetch.SessionFatigue {
+		return nil
+	}
+	slog.Info("beta: session fatigue enabled")
+	f := behavior.NewSessionFatigue(behavior.DefaultFatigueConfig())
+	f.Start()
+	return f
 }

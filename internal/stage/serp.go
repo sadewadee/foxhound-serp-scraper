@@ -49,6 +49,12 @@ type SERPStage struct {
 	browser   *fetch.CamoufoxFetcher
 	browserMu sync.Mutex
 
+	// Beta: circuit breaker wraps browser fetch (nil when disabled).
+	circuitBreaker foxhound.Middleware
+
+	// Beta: session fatigue for human-like timing (nil when disabled).
+	fatigue *behavior.SessionFatigue
+
 	// Metrics.
 	queriesProcessed atomic.Int64
 	urlsFound        atomic.Int64
@@ -65,13 +71,15 @@ func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPSt
 	slog.Info("serp: engines enabled", "engines", engineNames)
 
 	s := &SERPStage{
-		cfg:       cfg,
-		db:        database,
-		redis:     dd.Client(),
-		dedup:     dd,
-		queryRepo: query.NewRepositoryWithRedis(database, dd.Client()),
-		timing:    behavior.NewTiming(behavior.CarefulProfile().Timing),
-		engines:   engines,
+		cfg:            cfg,
+		db:             database,
+		redis:          dd.Client(),
+		dedup:          dd,
+		queryRepo:      query.NewRepositoryWithRedis(database, dd.Client()),
+		timing:         behavior.NewTiming(behavior.CarefulProfile().Timing),
+		engines:        engines,
+		circuitBreaker: scraper.NewCircuitBreaker(cfg),
+		fatigue:        scraper.NewSessionFatigue(cfg),
 	}
 	s.lifecycle = scraper.NewBrowserLifecycle(cfg, scraper.NewSERPBrowser, "serp")
 	return s
@@ -340,7 +348,13 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		var fetchErr error
 
 		if eng.NeedsBrowser() {
-			// Google path — needs browser (Camoufox).
+			// Beta: apply session fatigue to inter-request delay.
+			if s.fatigue != nil {
+				base := s.timing.Delay()
+				adjusted := s.fatigue.AdjustDelay(base)
+				time.Sleep(adjusted)
+			}
+
 			s.browserMu.Lock()
 			browser := s.browser
 			s.browserMu.Unlock()
@@ -356,12 +370,31 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				continue
 			}
 
-			// Use engine-specific steps (Google has consent banners, Bing waits for #b_results, etc.)
-			steps := eng.FetchSteps()
-			if len(steps) > 0 {
-				body, fetchErr = scraper.FetchSERPWithEngine(ctx, browser, job.URL, job.ID, steps)
-			} else {
-				body, fetchErr = scraper.FetchSERP(ctx, browser, job.URL, job.ID)
+			// Beta: circuit breaker — if domain is in open state, skip immediately.
+			if s.circuitBreaker != nil {
+				cbFetcher := s.circuitBreaker.Wrap(browser)
+				probeResp, probeErr := cbFetcher.Fetch(ctx, &foxhound.Job{
+					ID: job.ID, URL: job.URL, Method: "GET", FetchMode: foxhound.FetchBrowser,
+				})
+				if probeErr == nil && probeResp != nil && probeResp.StatusCode == 503 {
+					// Circuit is open — skip this job, re-queue with backoff.
+					slog.Debug("serp: circuit open, skipping", "job", job.ID, "engine", eng.Name())
+					fetchErr = fmt.Errorf("circuit breaker open")
+				} else if probeErr == nil && probeResp != nil {
+					body = probeResp.Body
+				} else {
+					fetchErr = probeErr
+				}
+			}
+
+			// Normal fetch (when circuit breaker is disabled or didn't handle it).
+			if body == nil && fetchErr == nil {
+				steps := eng.FetchSteps()
+				if len(steps) > 0 {
+					body, fetchErr = scraper.FetchSERPWithEngine(ctx, browser, job.URL, job.ID, steps)
+				} else {
+					body, fetchErr = scraper.FetchSERP(ctx, browser, job.URL, job.ID)
+				}
 			}
 		} else {
 			// DDG path — stealth HTTP (plain HTML endpoint).

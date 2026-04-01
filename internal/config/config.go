@@ -106,6 +106,12 @@ type FetchConfig struct {
 	// Persister — batch flush from Redis result queues to DB.
 	PersistIntervalMs int `yaml:"persist_interval_ms"` // flush interval in ms (default 5000)
 	PersistBatchSize  int `yaml:"persist_batch_size"`  // max items per flush (default 500)
+
+	// Beta features (foxhound v0.0.7) — set BETA_FEATURES=1 to enable all.
+	BetaFeatures     bool `yaml:"beta_features"`      // master switch for all beta features
+	CircuitBreaker   bool `yaml:"circuit_breaker"`     // per-domain circuit breaker on SERP fetches
+	DomainScorer     bool `yaml:"domain_scorer"`       // Bayesian domain risk scoring on enrich (stealth→browser auto-escalation)
+	SessionFatigue   bool `yaml:"session_fatigue"`     // human-like warmup/fatigue timing on browser
 }
 
 type MonitorConfig struct {
@@ -186,6 +192,10 @@ func LoadFromEnv() (*Config, error) {
 			ReconcilerIntervalMs: parseEnvInt("RECONCILER_INTERVAL_MS", 0),
 			PersistIntervalMs:    parseEnvInt("PERSIST_INTERVAL_MS", 0),
 			PersistBatchSize:     parseEnvInt("PERSIST_BATCH_SIZE", 0),
+			BetaFeatures:         os.Getenv("BETA_FEATURES") == "1",
+			CircuitBreaker:       os.Getenv("BETA_CIRCUIT_BREAKER") == "1",
+			DomainScorer:         os.Getenv("BETA_DOMAIN_SCORER") == "1",
+			SessionFatigue:       os.Getenv("BETA_SESSION_FATIGUE") == "1",
 		},
 		Mordibouncer: MordibouncerConfig{
 			APIURL: os.Getenv("MORDIBOUNCER_API_URL"),
