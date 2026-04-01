@@ -18,6 +18,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/monitor"
 	"github.com/sadewadee/serp-scraper/internal/persist"
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
+	"github.com/sadewadee/serp-scraper/internal/reconciler"
 	"github.com/sadewadee/serp-scraper/internal/telegram"
 	"github.com/sadewadee/serp-scraper/internal/validate"
 )
@@ -88,6 +89,9 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		if validator := validate.NewMordibouncer(&cfg.Mordibouncer); validator != nil {
 			go validate.BackfillValidation(ctx, database, validator)
 		}
+		// Start project-level reconciler — manages the full pipeline from manager.
+		projReconciler := reconciler.New(database, dd.Client())
+		go projReconciler.Run(ctx)
 	}
 
 	// Start pipeline stages in background (skip for "none" — API only mode).
