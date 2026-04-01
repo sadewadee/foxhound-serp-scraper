@@ -139,6 +139,8 @@ services:
       GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-3}"
       BING_MAX_PAGES: "${BING_MAX_PAGES:-5}"
       DDG_MAX_PAGES: "${DDG_MAX_PAGES:-1}"
+      # ── Beta features (foxhound v0.0.7) — set to "1" to enable ──
+      BETA_FEATURES: "${BETA_FEATURES:-0}"
       # ── Persister (batch flush Redis→DB) ──
       PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
       PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
@@ -192,6 +194,8 @@ services:
       STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
       ENRICH_MAX_REQUESTS: "${ENRICH_MAX_REQUESTS:-300}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      # ── Beta features (foxhound v0.0.7) — set to "1" to enable ──
+      BETA_FEATURES: "${BETA_FEATURES:-0}"
       # ── Persister (batch flush Redis→DB) ──
       PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
       PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
