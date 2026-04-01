@@ -120,7 +120,12 @@ func runMigrations(db *sql.DB) error {
 }
 
 // Migrate creates all tables if they don't exist, then runs incremental migrations.
+// Uses a longer statement timeout for DDL operations on large tables.
 func Migrate(db *sql.DB) error {
+	// Temporarily raise statement timeout for migrations (5 min).
+	db.Exec(`SET statement_timeout = '300s'`)
+	defer db.Exec(`SET statement_timeout = '60s'`)
+
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("db: migration failed: %w", err)
 	}

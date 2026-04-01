@@ -232,7 +232,7 @@ func (r *Repository) RequeuePendingToRedis() (int, error) {
 	if r.redis == nil {
 		return 0, nil
 	}
-	rows, err := r.db.Query(`SELECT id, text FROM queries WHERE status = 'pending' ORDER BY id ASC`)
+	rows, err := r.db.Query(`SELECT id, text FROM queries WHERE status = 'pending' ORDER BY id ASC LIMIT 1000`)
 	if err != nil {
 		return 0, fmt.Errorf("query: requeue pending to redis: %w", err)
 	}
