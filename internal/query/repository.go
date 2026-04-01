@@ -139,10 +139,11 @@ func (r *Repository) UpdateStatus(id int64, status string, resultCount int, errM
 }
 
 // RequeueProcessing resets processing queries back to pending (for resume on restart).
+// Limited to 500 per call to avoid statement timeouts on large tables.
 func (r *Repository) RequeueProcessing() (int, error) {
 	res, err := r.db.Exec(`
 		UPDATE queries SET status = 'pending', updated_at = NOW()
-		WHERE status = 'processing'
+		WHERE id IN (SELECT id FROM queries WHERE status = 'processing' LIMIT 500)
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("query: requeue processing: %w", err)

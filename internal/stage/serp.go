@@ -688,9 +688,10 @@ func (s *SERPStage) expandCompletedQueries() {
 // requeueStuckJobs is called at startup to reset any jobs left in 'processing'
 // state by the previous process run.
 func (s *SERPStage) requeueStuckJobs() {
+	// Use subquery with LIMIT to avoid full-table scan timeout on large tables.
 	res, err := s.db.Exec(`
 		UPDATE serp_jobs SET status = 'new', locked_by = NULL, locked_at = NULL, updated_at = NOW()
-		WHERE status = 'processing'
+		WHERE id IN (SELECT id FROM serp_jobs WHERE status = 'processing' LIMIT 500)
 	`)
 	if err != nil {
 		slog.Warn("serp: requeueStuckJobs failed", "error", err)
@@ -700,7 +701,7 @@ func (s *SERPStage) requeueStuckJobs() {
 
 	qRes, qErr := s.db.Exec(`
 		UPDATE queries SET status = 'pending', updated_at = NOW()
-		WHERE status = 'processing'
+		WHERE id IN (SELECT id FROM queries WHERE status = 'processing' LIMIT 500)
 	`)
 	if qErr != nil {
 		slog.Warn("serp: requeue stuck queries failed", "error", qErr)
