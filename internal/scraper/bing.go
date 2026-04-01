@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 
@@ -72,12 +73,17 @@ func (b *BingEngine) ParseResults(body []byte) ([]string, error) {
 }
 
 func (b *BingEngine) FetchSteps() []foxhound.JobStep {
-	return nil
+	return []foxhound.JobStep{
+		{Action: foxhound.JobStepWait, Selector: "#b_results", Duration: 10 * time.Second, Optional: true},
+	}
 }
 
 func (b *BingEngine) IsCaptchaPage(body []byte) bool {
 	lower := strings.ToLower(string(body))
-	return strings.Contains(lower, "turing") || strings.Contains(lower, "/captcha")
+	return strings.Contains(lower, "turing") ||
+		strings.Contains(lower, "/captcha") ||
+		strings.Contains(lower, "class=\"captcha") ||
+		strings.Contains(lower, "captcha_header")
 }
 
 func (b *BingEngine) ExcludedDomains() []string {
@@ -86,7 +92,9 @@ func (b *BingEngine) ExcludedDomains() []string {
 
 func (b *BingEngine) MaxPages() int { return 5 }
 
-func (b *BingEngine) NeedsBrowser() bool { return false }
+// NeedsBrowser returns true — Bing serves captcha pages to stealth HTTP.
+// Requires browser with JS to pass Bing's bot detection.
+func (b *BingEngine) NeedsBrowser() bool { return true }
 
 // isBingDomain returns true if the URL belongs to a Bing/Microsoft property.
 func isBingDomain(rawURL string) bool {

@@ -78,10 +78,10 @@ func (d *DuckDuckGoEngine) FetchSteps() []foxhound.JobStep {
 	return nil
 }
 
-// IsCaptchaPage returns false — DDG does not serve captchas on the HTML endpoint.
-// Blocks manifest as empty result pages instead.
-func (d *DuckDuckGoEngine) IsCaptchaPage(_ []byte) bool {
-	return false
+// IsCaptchaPage checks for DDG's anomaly detection page.
+func (d *DuckDuckGoEngine) IsCaptchaPage(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "anomaly-modal") || strings.Contains(lower, "anomaly_modal")
 }
 
 func (d *DuckDuckGoEngine) ExcludedDomains() []string {

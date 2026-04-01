@@ -353,9 +353,15 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				continue
 			}
 
-			body, fetchErr = scraper.FetchSERP(ctx, browser, job.URL, job.ID)
+			// Use engine-specific steps (Google has consent banners, Bing waits for #b_results, etc.)
+			steps := eng.FetchSteps()
+			if len(steps) > 0 {
+				body, fetchErr = scraper.FetchSERPWithEngine(ctx, browser, job.URL, job.ID, steps)
+			} else {
+				body, fetchErr = scraper.FetchSERP(ctx, browser, job.URL, job.ID)
+			}
 		} else {
-			// Bing/DDG path — stealth HTTP (much faster, no browser needed).
+			// DDG path — stealth HTTP (plain HTML endpoint).
 			stealth := scraper.NewStealth(s.cfg)
 			body, fetchErr = scraper.FetchSERPStealth(ctx, stealth, job.URL, job.ID)
 			stealth.Close()

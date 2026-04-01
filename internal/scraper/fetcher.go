@@ -233,8 +233,31 @@ func FetchPage(ctx context.Context, stealth *fetch.StealthFetcher, browser *fetc
 	return string(resp.Body), nil
 }
 
+// FetchSERPWithEngine fetches a SERP page using browser with engine-specific steps.
+// Used by engines that need browser but have different steps than Google.
+func FetchSERPWithEngine(ctx context.Context, browser *fetch.CamoufoxFetcher, serpURL, jobID string, steps []foxhound.JobStep) ([]byte, error) {
+	job := &foxhound.Job{
+		ID:        jobID,
+		URL:       serpURL,
+		Method:    "GET",
+		FetchMode: foxhound.FetchBrowser,
+		Steps:     steps,
+	}
+	resp, err := browser.Fetch(ctx, job)
+	if err != nil {
+		return FetchWithBrowser(ctx, browser, serpURL, jobID+"-plain")
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nil response")
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
 // FetchSERPStealth fetches a SERP page via stealth HTTP (no browser).
-// Used by engines that do not require a full browser (e.g. Bing, DuckDuckGo).
+// Used by engines that do not require a full browser (e.g. DuckDuckGo).
 func FetchSERPStealth(ctx context.Context, stealth *fetch.StealthFetcher, serpURL, jobID string) ([]byte, error) {
 	resp, err := stealth.Fetch(ctx, &foxhound.Job{
 		ID:     jobID,
