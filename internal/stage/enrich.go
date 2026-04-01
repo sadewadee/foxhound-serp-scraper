@@ -225,12 +225,24 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 		}
 
 		// 2. Re-queue orphaned pending jobs (DB exists but missing from Redis).
+		// Respect enrich queue cap — only re-queue when below 50K.
+		enrichDepth, _ := c.dedup.Client().ZCard(ctx, queueKey).Result()
+		batchLimit := int64(1000)
+		if enrichDepth > 50000 {
+			batchLimit = 0 // skip re-queue when queue is full
+		} else if enrichDepth > 40000 {
+			batchLimit = 200 // slow refill near cap
+		}
 		orphanRows, err := c.db.Query(`
 			UPDATE enrich_jobs SET updated_at = NOW()
-			WHERE status = 'pending' AND locked_by IS NULL
-			  AND updated_at < NOW() - INTERVAL '2 minutes'
+			WHERE id IN (
+				SELECT id FROM enrich_jobs
+				WHERE status = 'pending' AND locked_by IS NULL
+				  AND updated_at < NOW() - INTERVAL '2 minutes'
+				LIMIT $1
+			)
 			RETURNING id, url, url_hash, parent_job_id
-		`)
+		`, batchLimit)
 		if err == nil {
 			requeued := 0
 			for orphanRows.Next() {
@@ -248,20 +260,25 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 		}
 
 		// 3. Resurrect dead jobs with transient errors (hourly).
+		// Skip if queue already over cap.
 		deadRows, deadErr := c.db.Query(`
 			UPDATE enrich_jobs SET status = 'pending', attempt_count = 0, locked_by = NULL, updated_at = NOW()
-			WHERE status = 'dead'
-			  AND updated_at < NOW() - INTERVAL '1 hour'
-			  AND error_msg NOT LIKE 'HTTP 403%'
-			  AND error_msg NOT LIKE 'HTTP 404%'
-			  AND error_msg NOT LIKE 'HTTP 410%'
-			  AND error_msg NOT LIKE 'HTTP 451%'
-			  AND error_msg NOT LIKE '%certificate%'
-			  AND error_msg NOT LIKE '%x509%'
-			  AND error_msg NOT LIKE '%no such host%'
-			  AND error_msg NOT LIKE '%server misbehaving%'
+			WHERE id IN (
+				SELECT id FROM enrich_jobs
+				WHERE status = 'dead'
+				  AND updated_at < NOW() - INTERVAL '1 hour'
+				  AND error_msg NOT LIKE 'HTTP 403%'
+				  AND error_msg NOT LIKE 'HTTP 404%'
+				  AND error_msg NOT LIKE 'HTTP 410%'
+				  AND error_msg NOT LIKE 'HTTP 451%'
+				  AND error_msg NOT LIKE '%certificate%'
+				  AND error_msg NOT LIKE '%x509%'
+				  AND error_msg NOT LIKE '%no such host%'
+				  AND error_msg NOT LIKE '%server misbehaving%'
+				LIMIT $1
+			)
 			RETURNING id, url, url_hash, parent_job_id
-		`)
+		`, batchLimit)
 		if deadErr == nil {
 			n := 0
 			for deadRows.Next() {
@@ -281,11 +298,15 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 		// 4. Re-queue failed jobs whose retry window has elapsed.
 		failedRows, err := c.db.Query(`
 			UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, updated_at = NOW()
-			WHERE status = 'failed'
-			  AND next_attempt_at IS NOT NULL AND next_attempt_at <= NOW()
-			  AND attempt_count < max_attempts
+			WHERE id IN (
+				SELECT id FROM enrich_jobs
+				WHERE status = 'failed'
+				  AND next_attempt_at IS NOT NULL AND next_attempt_at <= NOW()
+				  AND attempt_count < max_attempts
+				LIMIT $1
+			)
 			RETURNING id, url, url_hash, parent_job_id
-		`)
+		`, batchLimit)
 		if err == nil {
 			retried := 0
 			for failedRows.Next() {

@@ -428,6 +428,11 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		}
 
 		// Push URL results to Redis list (persister will INSERT to DB).
+		// Check enrich queue depth for backpressure — skip enrich push if over cap.
+		// URLs still go to websites table via persister; enrich reconciler will pick them up later.
+		enrichDepth, _ := s.redis.ZCard(ctx, "serp:queue:enrich").Result()
+		skipEnrich := enrichDepth > 50000
+
 		inserted := 0
 		for _, u := range urls {
 			urlHash := dedup.HashURL(u)
@@ -436,7 +441,7 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				continue
 			}
 
-			// Push URL result to persister queue.
+			// Push URL result to persister queue (always — creates DB record).
 			urlResult := persist.URLResult{
 				URL:       u,
 				URLHash:   urlHash,
@@ -447,10 +452,13 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			data, _ := json.Marshal(urlResult)
 			s.redis.RPush(ctx, persist.KeyResultURLs, string(data))
 
-			// Push to enrich queue immediately (workers can start enriching
-			// even before persister creates the DB record).
-			if err := pushToQueue(ctx, s.redis, "serp:queue:enrich", u, job.QueryID, job.ID); err != nil {
-				slog.Warn("serp: push to enrich queue failed", "url", u, "error", err)
+			// Push to enrich queue only if below cap.
+			// When over cap, URLs wait in websites table (status=pending).
+			// Enrich reconciler will feed them when queue drains.
+			if !skipEnrich {
+				if err := pushToQueue(ctx, s.redis, "serp:queue:enrich", u, job.QueryID, job.ID); err != nil {
+					slog.Warn("serp: push to enrich queue failed", "url", u, "error", err)
+				}
 			}
 			inserted++
 		}
