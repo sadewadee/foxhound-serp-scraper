@@ -54,12 +54,16 @@ type RedisConfig struct {
 }
 
 type SERPConfig struct {
-	PagesPerQuery         int `yaml:"pages_per_query"`
-	ResultsPerPage        int `yaml:"results_per_page"`
-	DelayBetweenPagesMs   int `yaml:"delay_between_pages_ms"`
-	DelayBetweenQueriesMs int `yaml:"delay_between_queries_ms"`
-	Concurrency           int `yaml:"concurrency"`    // number of tabs (goroutines)
-	SERPDelayMs           int `yaml:"serp_delay_ms"`   // inter-page delay override (0 = use timing profile)
+	PagesPerQuery         int    `yaml:"pages_per_query"`
+	ResultsPerPage        int    `yaml:"results_per_page"`
+	DelayBetweenPagesMs   int    `yaml:"delay_between_pages_ms"`
+	DelayBetweenQueriesMs int    `yaml:"delay_between_queries_ms"`
+	Concurrency           int    `yaml:"concurrency"`       // number of tabs (goroutines)
+	SERPDelayMs           int    `yaml:"serp_delay_ms"`     // inter-page delay override (0 = use timing profile)
+	Engines               string `yaml:"engines"`           // "all", "google", "bing", "duckduckgo" (default: "all")
+	GoogleMaxPages        int    `yaml:"google_max_pages"`  // default 3
+	BingMaxPages          int    `yaml:"bing_max_pages"`    // default 5
+	DDGMaxPages           int    `yaml:"ddg_max_pages"`     // default 1
 }
 
 type WebsiteConfig struct {
@@ -164,7 +168,11 @@ func LoadFromEnv() (*Config, error) {
 			URL: os.Getenv("PROXY_URL"),
 		},
 		SERP: SERPConfig{
-			SERPDelayMs: parseEnvInt("SERP_DELAY_MS", 0),
+			SERPDelayMs:    parseEnvInt("SERP_DELAY_MS", 0),
+			Engines:        os.Getenv("SERP_ENGINES"),
+			GoogleMaxPages: parseEnvInt("GOOGLE_MAX_PAGES", 0),
+			BingMaxPages:   parseEnvInt("BING_MAX_PAGES", 0),
+			DDGMaxPages:    parseEnvInt("DDG_MAX_PAGES", 0),
 		},
 		Fetch: FetchConfig{
 			Headless:             true,
@@ -240,6 +248,18 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.SERP.Concurrency == 0 {
 		cfg.SERP.Concurrency = 4
+	}
+	if cfg.SERP.Engines == "" {
+		cfg.SERP.Engines = "all"
+	}
+	if cfg.SERP.GoogleMaxPages == 0 {
+		cfg.SERP.GoogleMaxPages = 3
+	}
+	if cfg.SERP.BingMaxPages == 0 {
+		cfg.SERP.BingMaxPages = 5
+	}
+	if cfg.SERP.DDGMaxPages == 0 {
+		cfg.SERP.DDGMaxPages = 1
 	}
 	if cfg.Website.Concurrency == 0 {
 		cfg.Website.Concurrency = 5

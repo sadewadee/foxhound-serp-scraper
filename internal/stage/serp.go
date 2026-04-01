@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,7 @@ type SERPStage struct {
 	queryRepo *query.Repository
 	timing    *behavior.Timing
 	lifecycle *scraper.BrowserLifecycle
+	engines   []scraper.SearchEngine // enabled search engines
 
 	// Shared browser — protected by mutex for rotation.
 	browser   *fetch.CamoufoxFetcher
@@ -55,6 +57,13 @@ type SERPStage struct {
 
 // NewSERPStage creates a new SERP discovery stage.
 func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPStage {
+	engines := scraper.EnabledEngines(cfg.SERP.Engines)
+	engineNames := make([]string, len(engines))
+	for i, e := range engines {
+		engineNames[i] = e.Name()
+	}
+	slog.Info("serp: engines enabled", "engines", engineNames)
+
 	s := &SERPStage{
 		cfg:       cfg,
 		db:        database,
@@ -62,6 +71,7 @@ func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPSt
 		dedup:     dd,
 		queryRepo: query.NewRepositoryWithRedis(database, dd.Client()),
 		timing:    behavior.NewTiming(behavior.CarefulProfile().Timing),
+		engines:   engines,
 	}
 	s.lifecycle = scraper.NewBrowserLifecycle(cfg, scraper.NewSERPBrowser, "serp")
 	return s
@@ -176,20 +186,70 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 			continue
 		}
 
-		slog.Info("serp: generating jobs for query", "query", qMsg.Text, "id", qMsg.ID)
+		// Backpressure: if too many serp jobs queued, wait before generating more.
+		depth, _ := s.redis.ZCard(ctx, "serp:queue:serp").Result()
+		if depth > 10000 {
+			slog.Info("serp: backpressure — queue depth too high, waiting", "depth", depth)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+				// Re-queue the query for later processing.
+				data, _ := json.Marshal(qMsg)
+				s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(qMsg.ID), Member: string(data)})
+				continue
+			}
+		}
 
-		for page := 0; page < s.cfg.SERP.PagesPerQuery; page++ {
-			jobID := fmt.Sprintf("serp-%d-p%d", qMsg.ID, page)
-			serpURL := scraper.BuildSERPURL(qMsg.Text, page, s.cfg.SERP.ResultsPerPage)
+		// Look up query country for geo-locale (empty = default US/en).
+		var country string
+		s.db.QueryRow(`SELECT COALESCE(country, '') FROM queries WHERE id = $1`, qMsg.ID).Scan(&country)
+		locale := scraper.GetLocale(country)
 
-			// INSERT directly — queryFeeder is not hot path (1 query/sec).
-			s.db.Exec(`
-				INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, status)
-				VALUES ($1, $2, $3, $4, 'new')
-				ON CONFLICT (id) DO NOTHING
-			`, jobID, qMsg.ID, serpURL, page)
+		slog.Info("serp: generating jobs for query", "query", qMsg.Text, "id", qMsg.ID, "engines", len(s.engines), "country", country)
 
-			s.pushSerpJob(ctx, jobID, serpURL, qMsg.ID, page)
+		// Generate jobs for ALL enabled engines.
+		for _, eng := range s.engines {
+			maxPages := eng.MaxPages()
+			// Override max pages from config if set.
+			switch eng.Name() {
+			case "google":
+				if s.cfg.SERP.GoogleMaxPages > 0 {
+					maxPages = s.cfg.SERP.GoogleMaxPages
+				}
+			case "bing":
+				if s.cfg.SERP.BingMaxPages > 0 {
+					maxPages = s.cfg.SERP.BingMaxPages
+				}
+			case "duckduckgo":
+				if s.cfg.SERP.DDGMaxPages > 0 {
+					maxPages = s.cfg.SERP.DDGMaxPages
+				}
+			}
+
+			// Get locale params for this engine.
+			var gl, hl string
+			switch eng.Name() {
+			case "google":
+				gl, hl = locale.GoogleGL, locale.GoogleHL
+			case "bing":
+				gl, hl = locale.BingCC, locale.BingLang
+			case "duckduckgo":
+				gl, hl = locale.DDGKL, "" // DDG uses single kl param
+			}
+
+			for page := 0; page < maxPages; page++ {
+				jobID := fmt.Sprintf("%s-%d-p%d", eng.Name(), qMsg.ID, page)
+				serpURL := eng.BuildURL(qMsg.Text, page, s.cfg.SERP.ResultsPerPage, gl, hl)
+
+				s.db.Exec(`
+					INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, engine, status)
+					VALUES ($1, $2, $3, $4, $5, 'new')
+					ON CONFLICT (id) DO NOTHING
+				`, jobID, qMsg.ID, serpURL, page, eng.Name())
+
+				s.pushSerpJob(ctx, jobID, serpURL, qMsg.ID, page)
+			}
 		}
 	}
 }
@@ -197,12 +257,18 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 // pushSerpJob enqueues a serp_job onto the Redis sorted-set queue.
 // Score is the current time in microseconds — FIFO within the queue.
 func (s *SERPStage) pushSerpJob(ctx context.Context, jobID, serpURL string, queryID int64, pageNum int) {
+	// Extract engine name from jobID prefix (e.g. "google-123-p0" → "google").
+	engine := "google"
+	if idx := strings.Index(jobID, "-"); idx > 0 {
+		engine = jobID[:idx]
+	}
 	payload := struct {
 		ID      string `json:"id"`
 		URL     string `json:"url"`
 		QueryID int64  `json:"query_id"`
 		PageNum int    `json:"page_num"`
-	}{jobID, serpURL, queryID, pageNum}
+		Engine  string `json:"engine"`
+	}{jobID, serpURL, queryID, pageNum, engine}
 	data, _ := json.Marshal(payload)
 	score := float64(time.Now().UnixMicro())
 	if err := s.redis.ZAdd(ctx, "serp:queue:serp", redis.Z{Score: score, Member: string(data)}).Err(); err != nil {
@@ -235,49 +301,68 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			}
 		}
 
-		// Parse job payload.
+		// Parse job payload (now includes engine field).
 		var job struct {
 			ID      string `json:"id"`
 			URL     string `json:"url"`
 			QueryID int64  `json:"query_id"`
 			PageNum int    `json:"page_num"`
+			Engine  string `json:"engine"`
 		}
 		if err := json.Unmarshal([]byte(results[0].Member.(string)), &job); err != nil {
 			slog.Warn("serp: invalid job in queue", "raw", results[0].Member, "error", err)
 			continue
 		}
 
-		// Redis SETNX claim — only one worker wins. If job is already claimed
-		// (e.g. duplicate in Redis queue from reconciler), skip.
+		// Default to google for backward compat with old queue items.
+		if job.Engine == "" {
+			job.Engine = "google"
+		}
+
+		// Resolve engine implementation.
+		eng := scraper.GetEngine(job.Engine)
+		if eng == nil {
+			slog.Warn("serp: unknown engine, skipping", "engine", job.Engine, "job", job.ID)
+			continue
+		}
+
+		// Redis SETNX claim.
 		ok, claimErr := s.redis.SetNX(ctx, "serp:lock:"+job.ID, workerID, 5*time.Minute).Result()
 		if claimErr != nil || !ok {
 			continue
 		}
 
-		// Snapshot the browser reference under lock.
-		s.browserMu.Lock()
-		browser := s.browser
-		s.browserMu.Unlock()
+		// Fetch SERP page — route based on engine type.
+		var body []byte
+		var fetchErr error
 
-		if browser == nil {
-			slog.Warn("serp: browser is nil, re-queuing job", "tab", tabID, "job", job.ID)
-			s.pushSerpJob(ctx, job.ID, job.URL, job.QueryID, job.PageNum)
-			s.redis.Del(ctx, "serp:lock:"+job.ID) // release lock
+		if eng.NeedsBrowser() {
+			// Google path — needs browser (Camoufox).
+			s.browserMu.Lock()
+			browser := s.browser
+			s.browserMu.Unlock()
 
-			// Push requeue status to persister.
-			result := persist.SERPResult{JobID: job.ID, Status: "requeue"}
-			data, _ := json.Marshal(result)
-			s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
+			if browser == nil {
+				slog.Warn("serp: browser is nil, re-queuing job", "tab", tabID, "job", job.ID)
+				s.pushSerpJob(ctx, job.ID, job.URL, job.QueryID, job.PageNum)
+				s.redis.Del(ctx, "serp:lock:"+job.ID)
+				result := persist.SERPResult{JobID: job.ID, Status: "requeue"}
+				data, _ := json.Marshal(result)
+				s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
+				time.Sleep(5 * time.Second)
+				continue
+			}
 
-			time.Sleep(5 * time.Second)
-			continue
+			body, fetchErr = scraper.FetchSERP(ctx, browser, job.URL, job.ID)
+		} else {
+			// Bing/DDG path — stealth HTTP (much faster, no browser needed).
+			stealth := scraper.NewStealth(s.cfg)
+			body, fetchErr = scraper.FetchSERPStealth(ctx, stealth, job.URL, job.ID)
+			stealth.Close()
 		}
 
-		// Fetch SERP page.
-		body, fetchErr := scraper.FetchSERP(ctx, browser, job.URL, job.ID)
-
-		// Treat captcha pages as a fetch error.
-		if fetchErr == nil && scraper.IsCaptchaPage(body) {
+		// Treat captcha pages as a fetch error (engine-specific detection).
+		if fetchErr == nil && eng.IsCaptchaPage(body) {
 			fetchErr = fmt.Errorf("captcha detected")
 		}
 
@@ -314,15 +399,15 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 
 			s.redis.Del(ctx, "serp:lock:"+job.ID) // release lock
 
-			// Rotate browser after captcha/block regardless of lifecycle counter.
-			if s.lifecycle.IncrementAndCheck() {
+			// Rotate browser after captcha/block (only if engine uses browser).
+			if eng.NeedsBrowser() && s.lifecycle.IncrementAndCheck() {
 				s.restartBrowser()
 			}
 			continue
 		}
 
-		// Parse SERP results.
-		urls, parseErr := scraper.ParseSERPResults(body)
+		// Parse SERP results using engine-specific parser.
+		urls, parseErr := eng.ParseResults(body)
 		if parseErr != nil {
 			slog.Warn("serp: parse failed", "job", job.ID, "error", parseErr)
 			result := persist.SERPResult{
@@ -380,10 +465,10 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		// Release lock.
 		s.redis.Del(ctx, "serp:lock:"+job.ID)
 
-		slog.Info("serp: page done", "job", job.ID, "found", len(urls), "new", inserted, "tab", tabID)
+		slog.Info("serp: page done", "job", job.ID, "engine", job.Engine, "found", len(urls), "new", inserted, "tab", tabID)
 
-		// Check lifecycle — rotate browser when page-reuse limit is reached.
-		if s.lifecycle.IncrementAndCheck() {
+		// Check lifecycle — rotate browser when page-reuse limit is reached (browser engines only).
+		if eng.NeedsBrowser() && s.lifecycle.IncrementAndCheck() {
 			slog.Info("serp: page reuse limit reached, rotating browser", "tab", tabID)
 			s.restartBrowser()
 		}

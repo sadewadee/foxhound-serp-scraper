@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 
@@ -43,7 +44,48 @@ var socialDomains = []string{
 	"medium.com", "blogspot.com", "wordpress.com",
 }
 
+// GoogleEngine implements SearchEngine for Google Search.
+type GoogleEngine struct{}
+
+func (g *GoogleEngine) Name() string { return "google" }
+
+func (g *GoogleEngine) BuildURL(query string, page, perPage int, gl, hl string) string {
+	q := url.QueryEscape(query)
+	start := page * perPage
+	return fmt.Sprintf(
+		"https://www.google.com/search?q=%s&num=%d&start=%d&gl=%s&hl=%s",
+		q, perPage, start, url.QueryEscape(gl), url.QueryEscape(hl),
+	)
+}
+
+func (g *GoogleEngine) ParseResults(body []byte) ([]string, error) {
+	return ParseSERPResults(body)
+}
+
+func (g *GoogleEngine) FetchSteps() []foxhound.JobStep {
+	return []foxhound.JobStep{
+		// Click Google consent "Accept all" button if present.
+		{Action: foxhound.JobStepClick, Selector: "button#L2AGLb", Optional: true},
+		{Action: foxhound.JobStepClick, Selector: "button[jsname='higCR']", Optional: true},
+		// Wait for results — optional so we still get content even if captcha blocks.
+		{Action: foxhound.JobStepWait, Selector: "div#search", Duration: 10 * time.Second, Optional: true},
+	}
+}
+
+func (g *GoogleEngine) IsCaptchaPage(body []byte) bool {
+	return IsCaptchaPage(body)
+}
+
+func (g *GoogleEngine) ExcludedDomains() []string {
+	return googleDomains
+}
+
+func (g *GoogleEngine) MaxPages() int { return 3 }
+
+func (g *GoogleEngine) NeedsBrowser() bool { return true }
+
 // BuildSERPURL constructs a Google Search URL.
+// Retained for backward compatibility with existing callers.
 func BuildSERPURL(query string, page, resultsPerPage int) string {
 	q := url.QueryEscape(query)
 	start := page * resultsPerPage

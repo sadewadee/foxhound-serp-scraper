@@ -47,7 +47,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
 	case "/contacts":
 		b.handleContacts(msg)
 	case "/export":
-		b.handleExport(msg)
+		b.handleExport(msg, args)
+	case "/categories":
+		b.handleCategories(msg)
 	case "/retry":
 		b.handleRetry(msg)
 	case "/reset":
@@ -68,7 +70,8 @@ Available commands:
 /generate <country> — Generate wellness keywords ("all" for global)
 /queries — Query status breakdown
 /contacts — Contact stats + top email providers
-/export — Export contacts as CSV file
+/export — Export contacts as CSV (filter: gmail, bali, yoga…)
+/categories — Top 20 business categories
 /retry — Retry failed queries
 /reset — Reset dedup sets`
 
@@ -292,6 +295,100 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 			lines = append(lines, fmt.Sprintf("  %s: %s", p.name, fmtK(p.count)))
 		}
 	}
+
+	// ── Target providers (gmail, yahoo, hotmail, outlook) ──
+	type targetProv struct {
+		domain string
+		count  int
+	}
+	var targets []targetProv
+	targetRows, tErr := b.db.Query(`
+		SELECT split_part(e, '@', 2), COUNT(*)
+		FROM enrich_jobs, unnest(emails) AS e
+		WHERE status = 'completed'
+			AND split_part(e, '@', 2) IN ('gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com')
+		GROUP BY 1
+	`)
+	if tErr == nil && targetRows != nil {
+		for targetRows.Next() {
+			var tp targetProv
+			targetRows.Scan(&tp.domain, &tp.count)
+			targets = append(targets, tp)
+		}
+		targetRows.Close()
+	}
+	if len(targets) > 0 {
+		parts := make([]string, 0, len(targets))
+		for _, tp := range targets {
+			short := strings.TrimSuffix(tp.domain, ".com")
+			short = strings.ToUpper(short[:1]) + short[1:]
+			parts = append(parts, fmt.Sprintf("%s: %s", short, fmtK(tp.count)))
+		}
+		lines = append(lines, "", "_Target providers:_")
+		lines = append(lines, "  "+strings.Join(parts, "  "))
+	}
+
+	// ── Top 3 categories ──
+	type catCount struct {
+		name  string
+		count int
+	}
+	var topCats []catCount
+	catRows, cErr := b.db.Query(`
+		SELECT business_category, COUNT(*)
+		FROM enrich_jobs
+		WHERE status = 'completed' AND business_category != '' AND business_category IS NOT NULL
+		GROUP BY 1 ORDER BY 2 DESC LIMIT 3
+	`)
+	if cErr == nil && catRows != nil {
+		for catRows.Next() {
+			var cc catCount
+			catRows.Scan(&cc.name, &cc.count)
+			topCats = append(topCats, cc)
+		}
+		catRows.Close()
+	}
+	if len(topCats) > 0 {
+		lines = append(lines, "", "_Top categories:_")
+		for _, cc := range topCats {
+			lines = append(lines, fmt.Sprintf("  %s: %s", cc.name, fmtK(cc.count)))
+		}
+	}
+
+	// ── Success rate ──
+	successRate := 0.0
+	if enCompleted+enDead > 0 {
+		successRate = float64(enCompleted) / float64(enCompleted+enDead) * 100
+	}
+	lines = append(lines, "", fmt.Sprintf("_Success rate:_ %.1f%% (completed / completed+dead)", successRate))
+
+	// ── Per-engine SERP rates (last hour) — engine column may not exist ──
+	type engineRate struct {
+		engine string
+		count  int
+	}
+	var engines []engineRate
+	engineRows, eErr := b.db.Query(`
+		SELECT engine, COUNT(*)
+		FROM serp_jobs
+		WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'
+		GROUP BY engine
+	`)
+	if eErr == nil && engineRows != nil {
+		for engineRows.Next() {
+			var er engineRate
+			engineRows.Scan(&er.engine, &er.count)
+			engines = append(engines, er)
+		}
+		engineRows.Close()
+	}
+	if len(engines) > 0 {
+		lines = append(lines, "", "_SERP engines (last hr):_")
+		for _, er := range engines {
+			lines = append(lines, fmt.Sprintf("  %s: %d/hr", er.engine, er.count))
+		}
+	}
+
 	lines = append(lines, "",
 		"_Pipeline:_",
 		fmt.Sprintf("  Queries: %s pending, %s processing, %d done", fmtK(qPending), fmtK(qProcessing), qCompleted),
@@ -470,6 +567,80 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		fmt.Sprintf("  Other: %s", fmtK(deadOther)),
 	)
 
+	// ── Gmail trend (7 days) ──
+	type gmailDay struct {
+		day   string
+		count int
+	}
+	var gmailDays []gmailDay
+	gmailRows, gmErr := b.db.Query(`
+		SELECT
+			to_char(d, 'Mon DD') AS dy,
+			(SELECT COUNT(*) FROM enrich_jobs, unnest(emails) AS e
+				WHERE status = 'completed'
+				AND e LIKE '%@gmail.com'
+				AND completed_at >= d AND completed_at < d + INTERVAL '1 day')
+		FROM generate_series(
+			date_trunc('day', NOW()) - INTERVAL '6 days',
+			date_trunc('day', NOW()),
+			INTERVAL '1 day'
+		) AS d
+		ORDER BY d
+	`)
+	if gmErr == nil && gmailRows != nil {
+		for gmailRows.Next() {
+			var gd gmailDay
+			gmailRows.Scan(&gd.day, &gd.count)
+			gmailDays = append(gmailDays, gd)
+		}
+		gmailRows.Close()
+	}
+	if len(gmailDays) > 0 {
+		lines = append(lines, "", "_Gmail trend (7 days):_")
+		gmailMax := 1
+		for _, gd := range gmailDays {
+			if gd.count > gmailMax {
+				gmailMax = gd.count
+			}
+		}
+		for _, gd := range gmailDays {
+			bar := chartBar(gd.count, gmailMax)
+			lines = append(lines, fmt.Sprintf("  `%s` %s *%s*", gd.day, bar, fmtK(gd.count)))
+		}
+	}
+
+	// ── Category top 5 with bar chart ──
+	type catStat struct {
+		name  string
+		count int
+	}
+	var catStats []catStat
+	catStatRows, csErr := b.db.Query(`
+		SELECT business_category, COUNT(*)
+		FROM enrich_jobs
+		WHERE status = 'completed' AND business_category != '' AND business_category IS NOT NULL
+		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+	`)
+	if csErr == nil && catStatRows != nil {
+		for catStatRows.Next() {
+			var cs catStat
+			catStatRows.Scan(&cs.name, &cs.count)
+			catStats = append(catStats, cs)
+		}
+		catStatRows.Close()
+	}
+	if len(catStats) > 0 {
+		lines = append(lines, "", "_Top 5 categories:_")
+		catMax := 1
+		if catStats[0].count > catMax {
+			catMax = catStats[0].count
+		}
+		for _, cs := range catStats {
+			bar := chartBar(cs.count, catMax)
+			lines = append(lines, fmt.Sprintf("  %s *%s* %s", bar, fmtK(cs.count), cs.name))
+		}
+	}
+
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
@@ -539,10 +710,39 @@ func (b *Bot) handleContacts(msg *Message) {
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
-func (b *Bot) handleExport(msg *Message) {
-	b.sendMessage(msg.Chat.ID, "Generating CSV export...")
+func (b *Bot) handleExport(msg *Message, args string) {
+	filter := strings.TrimSpace(strings.ToLower(args))
 
-	rows, err := b.db.Query(`
+	// Build WHERE clause based on filter arg.
+	whereClause := "status = 'completed' AND array_length(emails, 1) > 0"
+	filterLabel := "all"
+
+	switch {
+	case filter == "gmail":
+		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@gmail.com')"
+		filterLabel = "gmail"
+	case filter == "yahoo":
+		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@yahoo.com')"
+		filterLabel = "yahoo"
+	case filter == "hotmail":
+		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@hotmail.com')"
+		filterLabel = "hotmail"
+	case filter == "outlook":
+		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@outlook.com')"
+		filterLabel = "outlook"
+	case filter != "":
+		// Treat as location or category filter.
+		safe := strings.ReplaceAll(filter, "'", "''")
+		whereClause += fmt.Sprintf(
+			" AND (location ILIKE '%%%s%%' OR address ILIKE '%%%s%%' OR business_category ILIKE '%%%s%%')",
+			safe, safe, safe,
+		)
+		filterLabel = filter
+	}
+
+	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Generating CSV export (filter: %s)...", filterLabel))
+
+	rows, err := b.db.Query(fmt.Sprintf(`
 		SELECT
 			emails, phones, domain, url,
 			COALESCE(contact_name, ''),
@@ -556,9 +756,9 @@ func (b *Bot) handleExport(msg *Message) {
 			COALESCE(rating, ''),
 			social_links
 		FROM enrich_jobs
-		WHERE status = 'completed' AND array_length(emails, 1) > 0
+		WHERE %s
 		ORDER BY completed_at DESC LIMIT 50000
-	`)
+	`, whereClause))
 	if err != nil {
 		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
 		return
@@ -596,7 +796,11 @@ func (b *Bot) handleExport(msg *Message) {
 		return
 	}
 
-	filename := fmt.Sprintf("contacts_%s.csv", time.Now().Format("2006-01-02"))
+	fileSuffix := ""
+	if filterLabel != "all" {
+		fileSuffix = "_" + filterLabel
+	}
+	filename := fmt.Sprintf("contacts%s_%s.csv", fileSuffix, time.Now().Format("2006-01-02"))
 	b.sendDocument(msg.Chat.ID, filename, []byte(buf.String()))
 	if count >= 50000 {
 		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Exported *%d* contacts (truncated at 50K). Use API for full export.", count))
@@ -626,6 +830,47 @@ func (b *Bot) handleReset(ctx context.Context, msg *Message) {
 		b.redis.Del(ctx, key)
 		short := key[len("serp:dedup:"):]
 		lines = append(lines, fmt.Sprintf("%s: %d cleared", short, n))
+	}
+
+	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// /categories — Top 20 business categories
+// ────────────────────────────────────────────────────────────────────
+
+func (b *Bot) handleCategories(msg *Message) {
+	type catRow struct {
+		name  string
+		count int
+	}
+	var cats []catRow
+	rows, err := b.db.Query(`
+		SELECT business_category, COUNT(*)
+		FROM enrich_jobs
+		WHERE status = 'completed' AND business_category != '' AND business_category IS NOT NULL
+		GROUP BY 1 ORDER BY 2 DESC LIMIT 20
+	`)
+	if err != nil {
+		b.sendMessage(msg.Chat.ID, "Error fetching categories: "+err.Error())
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var c catRow
+		rows.Scan(&c.name, &c.count)
+		cats = append(cats, c)
+	}
+
+	if len(cats) == 0 {
+		b.sendMessage(msg.Chat.ID, "No categories found yet.")
+		return
+	}
+
+	lines := []string{"*Top 20 Categories*", ""}
+	for i, c := range cats {
+		lines = append(lines, fmt.Sprintf("%2d. %s — %s", i+1, c.name, fmtK(c.count)))
 	}
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))

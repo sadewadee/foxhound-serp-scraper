@@ -111,6 +111,11 @@ func runMigrations(db *sql.DB) error {
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_enrich_locked ON enrich_jobs(locked_at) WHERE status = 'processing'`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_locked ON serp_jobs(locked_at) WHERE status = 'processing'`)
 
+	// v3: multi-engine support — track country per query and engine per serp job
+	db.Exec(`ALTER TABLE queries ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''`)
+	db.Exec(`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS engine TEXT DEFAULT 'google'`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_engine ON serp_jobs(engine, status)`)
+
 	return nil
 }
 

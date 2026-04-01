@@ -133,8 +133,12 @@ services:
       SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-200}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
-      # ── SERP timing ──
+      # ── SERP engines + timing ──
+      SERP_ENGINES: "${SERP_ENGINES:-all}"
       SERP_DELAY_MS: "${SERP_DELAY_MS:-3000}"
+      GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-3}"
+      BING_MAX_PAGES: "${BING_MAX_PAGES:-5}"
+      DDG_MAX_PAGES: "${DDG_MAX_PAGES:-1}"
       # ── Persister (batch flush Redis→DB) ──
       PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
       PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
