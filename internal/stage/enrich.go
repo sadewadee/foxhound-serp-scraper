@@ -211,11 +211,21 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 		queueKey := "serp:queue:enrich"
 
 		// 1. Reset stuck processing jobs (>5 min) and immediately re-queue.
+		// Respect enrich queue cap.
+		stuckDepth, _ := c.dedup.Client().ZCard(ctx, queueKey).Result()
+		stuckLimit := 200
+		if stuckDepth > 50000 {
+			stuckLimit = 0
+		}
 		stuckRows, err := c.db.Query(`
 			UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, updated_at = NOW()
-			WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
+			WHERE id IN (
+				SELECT id FROM enrich_jobs
+				WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
+				LIMIT $1
+			)
 			RETURNING id, url, url_hash, parent_job_id
-		`)
+		`, stuckLimit)
 		if err == nil {
 			n := 0
 			for stuckRows.Next() {
@@ -539,7 +549,9 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		c.pagesProcessed.Add(1)
 
 		// Directory path: extract business listings, queue individual URLs.
-		if directory.IsDirectory(pageURL) {
+		// Respect enrich queue cap — skip directory expansion when over limit.
+		dirDepth, _ := redisClient.ZCard(ctx, queueKey).Result()
+		if directory.IsDirectory(pageURL) && dirDepth <= 50000 {
 			listings := directory.ExtractListings(pageURL, []byte(body))
 			if len(listings) > 0 {
 				slog.Info("enrich: directory listings extracted",
@@ -691,6 +703,12 @@ func (c *EnrichStage) queueContactPages(ctx context.Context, pageURL, domain str
 
 	queueKey := "serp:queue:enrich"
 	redisClient := c.dedup.Client()
+
+	// Backpressure: skip contact page expansion when enrich queue is over cap.
+	depth, _ := redisClient.ZCard(ctx, queueKey).Result()
+	if depth > 50000 {
+		return
+	}
 
 	for _, path := range contactPagePaths {
 		contactURL := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, path)
