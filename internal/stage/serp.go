@@ -455,7 +455,11 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				data, _ := json.Marshal(result)
 				s.redis.RPush(ctx, persist.KeyResultSERP, string(data))
 			} else {
-				backoffSec := 30 * (1 << (newAttempt - 1))
+				shift := newAttempt - 1
+				if shift < 0 {
+					shift = 0
+				}
+				backoffSec := 30 * (1 << shift)
 				result := persist.SERPResult{
 					JobID:        job.ID,
 					Status:       "failed",
