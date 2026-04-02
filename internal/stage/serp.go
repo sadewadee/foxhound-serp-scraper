@@ -49,6 +49,10 @@ type SERPStage struct {
 	browser   *fetch.CamoufoxFetcher
 	browserMu sync.Mutex
 
+	// Direct browser (no proxy) — fallback when proxy is blocked.
+	// Lazy-initialized on first proxy failure. Protected by browserMu.
+	directBrowser *fetch.CamoufoxFetcher
+
 	// Beta: circuit breaker wraps browser fetch (nil when disabled).
 	circuitBreaker foxhound.Middleware
 
@@ -60,11 +64,13 @@ type SERPStage struct {
 	urlsFound        atomic.Int64
 	pagesProcessed   atomic.Int64
 
-	// Beta metrics (circuit breaker + fatigue).
-	betaCBSkipped  atomic.Int64 // requests skipped by open circuit
-	betaCBPassed   atomic.Int64 // requests allowed through circuit
-	betaCBTripped  atomic.Int64 // times circuit opened
-	betaFatigueSum atomic.Int64 // cumulative fatigue-adjusted delay (ms) for averaging
+	// Beta metrics (circuit breaker + fatigue + direct fallback).
+	betaCBSkipped    atomic.Int64 // requests skipped by open circuit
+	betaCBPassed     atomic.Int64 // requests allowed through circuit
+	betaCBTripped    atomic.Int64 // times circuit opened
+	betaDirectUsed   atomic.Int64 // requests served by direct (no-proxy) browser
+	betaDirectOK     atomic.Int64 // successful direct fetches
+	betaFatigueSum   atomic.Int64 // cumulative fatigue-adjusted delay (ms) for averaging
 	betaFatigueN   atomic.Int64 // number of fatigue-adjusted delays
 }
 
@@ -121,6 +127,9 @@ func (s *SERPStage) Run(ctx context.Context) error {
 		s.browserMu.Lock()
 		if s.browser != nil {
 			s.browser.Close()
+		}
+		if s.directBrowser != nil {
+			s.directBrowser.Close()
 		}
 		s.browserMu.Unlock()
 	}()
@@ -379,20 +388,24 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				continue
 			}
 
-			// Beta: circuit breaker — if domain is in open state, skip immediately.
+			// Beta: circuit breaker — when proxy is blocked, fallback to direct browser.
 			if s.circuitBreaker != nil {
 				cbFetcher := s.circuitBreaker.Wrap(browser)
 				probeResp, probeErr := cbFetcher.Fetch(ctx, &foxhound.Job{
 					ID: job.ID, URL: job.URL, Method: "GET", FetchMode: foxhound.FetchBrowser,
 				})
 				if probeErr == nil && probeResp != nil && probeResp.StatusCode == 503 {
-					// Circuit is open — skip this job instantly (0ms vs 60s timeout).
+					// Circuit is open (proxy blocked) — try direct browser.
 					s.betaCBSkipped.Add(1)
-					fetchErr = fmt.Errorf("circuit breaker open")
+					directBody, directErr := s.fetchDirect(ctx, job.ID, job.URL, eng)
+					if directErr == nil && directBody != nil {
+						body = directBody
+					} else {
+						fetchErr = fmt.Errorf("proxy: circuit open, direct: %v", directErr)
+					}
 				} else if probeErr == nil && probeResp != nil {
 					s.betaCBPassed.Add(1)
 					body = probeResp.Body
-					// Record captcha as failure for circuit breaker learning.
 					if eng.IsCaptchaPage(body) {
 						s.betaCBTripped.Add(1)
 					}
@@ -576,6 +589,47 @@ func (s *SERPStage) restartBrowser() {
 	slog.Info("serp: browser rotated successfully")
 }
 
+// fetchDirect tries fetching a SERP page via the direct (no-proxy) browser.
+// Lazy-initializes the direct browser on first call. Only 1 tab to protect server IP.
+// Returns nil body + error if direct also fails.
+func (s *SERPStage) fetchDirect(ctx context.Context, jobID, jobURL string, eng scraper.SearchEngine) ([]byte, error) {
+	s.browserMu.Lock()
+	if s.directBrowser == nil {
+		db, err := scraper.NewSERPBrowserDirect(s.cfg)
+		if err != nil {
+			s.browserMu.Unlock()
+			return nil, fmt.Errorf("direct browser init: %w", err)
+		}
+		s.directBrowser = db
+	}
+	db := s.directBrowser
+	s.browserMu.Unlock()
+
+	s.betaDirectUsed.Add(1)
+
+	steps := eng.FetchSteps()
+	var body []byte
+	var err error
+	if len(steps) > 0 {
+		body, err = scraper.FetchSERPWithEngine(ctx, db, jobURL, "direct-"+jobID, steps)
+	} else {
+		body, err = scraper.FetchSERP(ctx, db, jobURL, "direct-"+jobID)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if direct also got captcha.
+	if eng.IsCaptchaPage(body) {
+		return nil, fmt.Errorf("captcha on direct")
+	}
+
+	s.betaDirectOK.Add(1)
+	slog.Info("serp: direct fetch succeeded", "job", jobID, "engine", eng.Name())
+	return body, nil
+}
+
 // reconciler runs every 60 s to:
 //  1. Reset stuck processing jobs (locked >5 min) and re-queue them.
 //  2. Re-queue new jobs whose next_attempt_at has elapsed.
@@ -742,11 +796,21 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 				cbSkipPct = float64(cbSkipped) / float64(cbTotal) * 100
 			}
 
+			directUsed := s.betaDirectUsed.Load()
+			directOK := s.betaDirectOK.Load()
+			directSuccPct := 0.0
+			if directUsed > 0 {
+				directSuccPct = float64(directOK) / float64(directUsed) * 100
+			}
+
 			slog.Info("beta-metrics: serp",
 				"cb_skipped", cbSkipped,
 				"cb_passed", cbPassed,
 				"cb_tripped", cbTripped,
 				"cb_skip_pct", fmt.Sprintf("%.1f%%", cbSkipPct),
+				"direct_used", directUsed,
+				"direct_ok", directOK,
+				"direct_succ_pct", fmt.Sprintf("%.1f%%", directSuccPct),
 				"fatigue_avg_ms", avgFatigueMs,
 				"fatigue_samples", fatigueN,
 			)

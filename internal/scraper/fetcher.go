@@ -298,6 +298,36 @@ func FetchWithBrowser(ctx context.Context, browser *fetch.CamoufoxFetcher, pageU
 	return resp.Body, nil
 }
 
+// NewSERPBrowserDirect creates a Camoufox browser WITHOUT proxy for direct SERP fetching.
+// Used as fallback when proxy is blocked by search engines.
+// Only 1 tab — rate-limited to protect server IP.
+func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
+	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+
+	headless := "virtual"
+	if !cfg.Fetch.Headless {
+		headless = "false"
+	}
+
+	opts := []fetch.CamoufoxOption{
+		fetch.WithBrowserIdentity(profile),
+		fetch.WithHeadless(headless),
+		fetch.WithBlockImages(true),
+		fetch.WithBrowserTimeout(60 * time.Second),
+		fetch.WithPersistSession(true),
+		fetch.WithMaxBrowserRequests(100), // conservative — protect server IP
+		fetch.WithPoolSize(1),             // single tab to limit rate
+	}
+	// NO proxy — uses server IP directly.
+
+	browser, err := fetch.NewCamoufox(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("fetcher: creating direct serp browser: %w", err)
+	}
+	slog.Info("fetch: created direct (no-proxy) SERP browser")
+	return browser, nil
+}
+
 // FetchWithBrowserString fetches a page using only the browser, returns string body.
 // Used by enrich domain scorer when it decides to skip stealth entirely.
 func FetchWithBrowserString(ctx context.Context, browser *fetch.CamoufoxFetcher, pageURL, jobID string) (string, error) {
