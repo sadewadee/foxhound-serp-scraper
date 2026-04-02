@@ -103,10 +103,6 @@ type FetchConfig struct {
 	BrowserTimeoutSec    int `yaml:"browser_timeout_sec"`    // browser-level timeout in seconds (default 60)
 	ReconcilerIntervalMs int `yaml:"reconciler_interval_ms"` // reconciler tick interval in ms (default 60000)
 
-	// Persister — batch flush from Redis result queues to DB.
-	PersistIntervalMs int `yaml:"persist_interval_ms"` // flush interval in ms (default 5000)
-	PersistBatchSize  int `yaml:"persist_batch_size"`  // max items per flush (default 500)
-
 	// Beta features (foxhound v0.0.7) — set BETA_FEATURES=1 to enable all.
 	BetaFeatures     bool `yaml:"beta_features"`      // master switch for all beta features
 	CircuitBreaker   bool `yaml:"circuit_breaker"`     // per-domain circuit breaker on SERP fetches
@@ -190,8 +186,6 @@ func LoadFromEnv() (*Config, error) {
 			EnrichMaxRequests:    parseEnvInt("ENRICH_MAX_REQUESTS", 0),
 			BrowserTimeoutSec:    parseEnvInt("BROWSER_TIMEOUT_SEC", 0),
 			ReconcilerIntervalMs: parseEnvInt("RECONCILER_INTERVAL_MS", 0),
-			PersistIntervalMs:    parseEnvInt("PERSIST_INTERVAL_MS", 0),
-			PersistBatchSize:     parseEnvInt("PERSIST_BATCH_SIZE", 0),
 			BetaFeatures:         os.Getenv("BETA_FEATURES") == "1",
 			CircuitBreaker:       os.Getenv("BETA_CIRCUIT_BREAKER") == "1",
 			DomainScorer:         os.Getenv("BETA_DOMAIN_SCORER") == "1",
@@ -306,12 +300,6 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Fetch.ReconcilerIntervalMs == 0 {
 		cfg.Fetch.ReconcilerIntervalMs = 60000
-	}
-	if cfg.Fetch.PersistIntervalMs == 0 {
-		cfg.Fetch.PersistIntervalMs = 5000
-	}
-	if cfg.Fetch.PersistBatchSize == 0 {
-		cfg.Fetch.PersistBatchSize = 500
 	}
 	// Default bools that YAML unmarshals as false when missing.
 	// We use a separate "defaults applied" check via Concurrency > 0 above.

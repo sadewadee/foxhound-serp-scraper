@@ -13,12 +13,6 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
 
-// Redis key constants for dedup sets.
-const (
-	KeyURLs    = "serp:dedup:urls"
-	KeyDomains = "serp:dedup:domains"
-)
-
 // Store wraps a Redis client for dedup operations using SETs.
 type Store struct {
 	client *redis.Client
@@ -43,34 +37,6 @@ func New(cfg *config.RedisConfig) (*Store, error) {
 // NewFromClient creates a dedup Store from an existing redis.Client.
 func NewFromClient(client *redis.Client) *Store {
 	return &Store{client: client}
-}
-
-// Add tries to add a value to the dedup set. Returns true if the value was new
-// (SADD returned 1), false if it already existed.
-func (s *Store) Add(ctx context.Context, key, value string) (bool, error) {
-	n, err := s.client.SAdd(ctx, key, value).Result()
-	if err != nil {
-		return false, fmt.Errorf("dedup: sadd %s: %w", key, err)
-	}
-	return n > 0, nil
-}
-
-// Exists checks whether a value exists in the dedup set.
-func (s *Store) Exists(ctx context.Context, key, value string) (bool, error) {
-	ok, err := s.client.SIsMember(ctx, key, value).Result()
-	if err != nil {
-		return false, fmt.Errorf("dedup: sismember %s: %w", key, err)
-	}
-	return ok, nil
-}
-
-// Count returns the number of elements in a dedup set.
-func (s *Store) Count(ctx context.Context, key string) (int64, error) {
-	n, err := s.client.SCard(ctx, key).Result()
-	if err != nil {
-		return 0, fmt.Errorf("dedup: scard %s: %w", key, err)
-	}
-	return n, nil
 }
 
 // Client returns the underlying redis.Client for shared use.

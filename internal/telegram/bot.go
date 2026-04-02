@@ -154,16 +154,16 @@ func (b *Bot) buildRateReport(ctx context.Context) string {
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
-		FROM enrich_jobs
+		FROM enrichment_jobs
 	`).Scan(&enrichHour, &enrichPrevHour)
 
 	var emailsHour, emailsPrevHour, emailsToday, emailsTotal int
 	b.db.QueryRow(`
 		SELECT
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > date_trunc('day', NOW())),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed')
+			(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'),
+			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
+			(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
+			(SELECT COUNT(*) FROM emails)
 	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsTotal)
 
 	var etaStr string

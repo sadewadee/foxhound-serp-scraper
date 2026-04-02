@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/lib/pq"
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
 
@@ -131,8 +130,8 @@ func (c *MordibouncerClient) FilterValid(ctx context.Context, emails []string) [
 	return valid
 }
 
-// BackfillValidation scans existing completed enrich_jobs with emails but no
-// validation (mx_valid IS NULL) and validates them via Mordibouncer.
+// BackfillValidation scans existing emails with pending validation status
+// and validates them via Mordibouncer.
 // Runs as a background goroutine in the manager container.
 func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerClient) {
 	slog.Info("backfill: starting email validation for existing records")
@@ -150,14 +149,12 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 			break
 		}
 
-		// Fetch batch of unvalidated jobs (oldest first).
+		// Fetch batch of unvalidated emails (oldest first).
 		rows, err := db.QueryContext(ctx, `
-			SELECT id, emails
-			FROM enrich_jobs
-			WHERE status = 'completed'
-			  AND mx_valid IS NULL
-			  AND array_length(emails, 1) > 0
-			ORDER BY completed_at ASC
+			SELECT id, email
+			FROM emails
+			WHERE validation_status = 'pending'
+			ORDER BY created_at ASC
 			LIMIT 100
 		`)
 		if err != nil {
@@ -166,17 +163,15 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 			continue
 		}
 
-		type job struct {
-			id     string
-			emails []string
+		type emailRow struct {
+			id    int64
+			email string
 		}
-		var batch []job
+		var batch []emailRow
 		for rows.Next() {
-			var j job
-			var emails pq.StringArray
-			if err := rows.Scan(&j.id, &emails); err == nil {
-				j.emails = emails
-				batch = append(batch, j)
+			var e emailRow
+			if err := rows.Scan(&e.id, &e.email); err == nil {
+				batch = append(batch, e)
 			}
 		}
 		rows.Close()
@@ -186,25 +181,51 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 			return // Done — no more unvalidated records.
 		}
 
-		for _, j := range batch {
+		for _, e := range batch {
 			if ctx.Err() != nil {
 				return
 			}
 
-			validEmails := client.FilterValid(ctx, j.emails)
-			removed += len(j.emails) - len(validEmails)
-			mxValid := len(validEmails) > 0 && len(validEmails) == len(j.emails)
-			db.ExecContext(ctx, `
-				UPDATE enrich_jobs SET emails = $1, mx_valid = $2, updated_at = NOW()
-				WHERE id = $3
-			`, pq.Array(validEmails), mxValid, j.id)
+			result, checkErr := client.Check(ctx, e.email)
+			if checkErr != nil {
+				// Fail-open: mark as unknown on API error.
+				db.ExecContext(ctx, `UPDATE emails SET validation_status = 'unknown', validated_at = NOW() WHERE id = $1`, e.id)
+				validated++
+				continue
+			}
+
+			if result.IsGoodEmail() {
+				mxValid := result.MX.AcceptsMail
+				deliverable := result.SMTP.IsDeliverable
+				disposable := result.Misc.IsDisposable
+				roleAccount := result.Misc.IsRoleAccount
+				freeEmail := result.Misc.IsFreeProvider
+				catchAll := result.SMTP.IsCatchAll
+				db.ExecContext(ctx, `
+					UPDATE emails SET
+						validation_status = 'valid',
+						mx_valid = $1, deliverable = $2, disposable = $3,
+						role_account = $4, free_email = $5, catch_all = $6,
+						validated_at = NOW()
+					WHERE id = $7
+				`, mxValid, deliverable, disposable, roleAccount, freeEmail, catchAll, e.id)
+			} else {
+				db.ExecContext(ctx, `
+					UPDATE emails SET
+						validation_status = 'invalid',
+						reason = $1,
+						validated_at = NOW()
+					WHERE id = $2
+				`, result.IsReachable, e.id)
+				removed++
+			}
 
 			validated++
 			if validated%500 == 0 {
 				slog.Info("backfill: progress", "validated", validated, "removed", removed)
 			}
 
-			// Rate limit — don't hammer Mordibouncer API.
+			// Rate limit.
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

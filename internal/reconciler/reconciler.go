@@ -1,9 +1,6 @@
 // Package reconciler provides a unified project-level reconciler that runs
 // in the manager container. It monitors all pipeline stages, heals zombie jobs,
 // manages throughput balance, and provides project health metrics.
-//
-// The per-stage reconcilers (in serp.go / enrich.go) handle fast, local recovery.
-// This reconciler handles cross-stage coordination and project-level decisions.
 package reconciler
 
 import (
@@ -41,14 +38,10 @@ type Snapshot struct {
 	EnrichFailed     int
 	EnrichDead       int
 
-	// Websites
-	WebsitesPending int
-	WebsitesTotal   int
-
 	// Redis queues
-	QueueQueries int64
-	QueueSerp    int64
-	QueueEnrich  int64
+	QueueQueries   int64
+	QueueSerpBuf   int64
+	QueueEnrichBuf int64
 
 	// Redis memory
 	RedisUsedMB float64
@@ -78,7 +71,7 @@ func New(db *sql.DB, redisClient *redis.Client) *ProjectReconciler {
 	return &ProjectReconciler{db: db, redis: redisClient}
 }
 
-// Snapshot returns the latest pipeline snapshot (thread-safe).
+// GetSnapshot returns the latest pipeline snapshot (thread-safe).
 func (r *ProjectReconciler) GetSnapshot() Snapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -132,14 +125,14 @@ func (r *ProjectReconciler) tick(ctx context.Context) {
 	// Run healing actions.
 	r.healZombieQueries(ctx, snap)
 	r.healStaleSerp(ctx, snap)
-	r.healEnrichBacklog(ctx, snap)
+	r.markStaleWorkers()
 
 	// Log health summary.
 	slog.Info("project-reconciler: tick",
 		"queries", fmt.Sprintf("%d pending / %d processing / %d done", snap.QueriesPending, snap.QueriesProcessing, snap.QueriesCompleted),
 		"serp", fmt.Sprintf("%d new / %d done / %d failed", snap.SerpNew, snap.SerpCompleted, snap.SerpFailed),
 		"enrich", fmt.Sprintf("%d pending / %d done / %d dead", snap.EnrichPending, snap.EnrichCompleted, snap.EnrichDead),
-		"queues", fmt.Sprintf("q:%d s:%d e:%d", snap.QueueQueries, snap.QueueSerp, snap.QueueEnrich),
+		"queues", fmt.Sprintf("q:%d sb:%d eb:%d", snap.QueueQueries, snap.QueueSerpBuf, snap.QueueEnrichBuf),
 		"emails", snap.EmailsTotal,
 		"redis_mb", fmt.Sprintf("%.0f", snap.RedisUsedMB),
 		"rate", fmt.Sprintf("serp:%d/h enrich:%d/h emails:%d/h", snap.SerpPerHour, snap.EnrichPerHour, snap.EmailsPerHour),
@@ -147,11 +140,10 @@ func (r *ProjectReconciler) tick(ctx context.Context) {
 }
 
 // collectSnapshot gathers metrics from DB and Redis.
-// All queries use indexed columns and small LIMITs where needed.
 func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 	snap := Snapshot{Taken: time.Now()}
 
-	// Queries — use index on status column.
+	// Queries.
 	r.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'pending'),
@@ -161,7 +153,7 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 		FROM queries
 	`).Scan(&snap.QueriesPending, &snap.QueriesProcessing, &snap.QueriesCompleted, &snap.QueriesError)
 
-	// SERP jobs — use idx_serp_jobs_status.
+	// SERP jobs.
 	r.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'new'),
@@ -171,7 +163,7 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 		FROM serp_jobs
 	`).Scan(&snap.SerpNew, &snap.SerpProcessing, &snap.SerpCompleted, &snap.SerpFailed)
 
-	// Enrich jobs — use idx_enrich_status_domain.
+	// Enrichment jobs.
 	r.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'pending'),
@@ -179,25 +171,17 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 			COUNT(*) FILTER (WHERE status = 'completed'),
 			COUNT(*) FILTER (WHERE status = 'failed'),
 			COUNT(*) FILTER (WHERE status = 'dead')
-		FROM enrich_jobs
+		FROM enrichment_jobs
 	`).Scan(&snap.EnrichPending, &snap.EnrichProcessing, &snap.EnrichCompleted, &snap.EnrichFailed, &snap.EnrichDead)
 
-	// Websites pending.
-	r.db.QueryRow(`SELECT COUNT(*) FROM websites WHERE status = 'pending'`).Scan(&snap.WebsitesPending)
-	r.db.QueryRow(`SELECT COUNT(*) FROM websites`).Scan(&snap.WebsitesTotal)
-
-	// Contacts.
-	r.db.QueryRow(`
-		SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
-	`).Scan(&snap.EmailsTotal)
-	r.db.QueryRow(`
-		SELECT COUNT(DISTINCT p) FROM enrich_jobs, unnest(phones) AS p WHERE status = 'completed'
-	`).Scan(&snap.PhonesTotal)
+	// Contacts from normalized tables.
+	r.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&snap.EmailsTotal)
+	r.db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE phone IS NOT NULL AND phone != ''`).Scan(&snap.PhonesTotal)
 
 	// Redis queues.
 	snap.QueueQueries, _ = r.redis.ZCard(ctx, "serp:queue:queries").Result()
-	snap.QueueSerp, _ = r.redis.ZCard(ctx, "serp:queue:serp").Result()
-	snap.QueueEnrich, _ = r.redis.ZCard(ctx, "serp:queue:enrich").Result()
+	snap.QueueSerpBuf, _ = r.redis.LLen(ctx, "serp:buffer").Result()
+	snap.QueueEnrichBuf, _ = r.redis.LLen(ctx, "enrich:buffer").Result()
 
 	// Redis memory.
 	info, _ := r.redis.Info(ctx, "memory").Result()
@@ -207,22 +191,12 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 }
 
 // healZombieQueries resets processing queries that have no active serp_jobs.
-// This is the project-level version — the per-stage reconciler also does this
-// but with smaller batches. The project reconciler handles the bulk.
 func (r *ProjectReconciler) healZombieQueries(ctx context.Context, snap Snapshot) {
 	if snap.QueriesProcessing < 100 {
-		return // not enough to worry about
-	}
-
-	// Only heal if serp queue has capacity.
-	if snap.QueueSerp > 5000 {
 		return
 	}
 
 	limit := 1000
-	if snap.QueueSerp > 2000 {
-		limit = 200
-	}
 
 	res, err := r.db.Exec(fmt.Sprintf(`
 		UPDATE queries SET status = 'pending', updated_at = NOW()
@@ -240,33 +214,21 @@ func (r *ProjectReconciler) healZombieQueries(ctx context.Context, snap Snapshot
 	if err == nil {
 		if n, _ := res.RowsAffected(); n > 0 {
 			slog.Info("project-reconciler: healed zombie queries", "count", n)
-			// Push healed queries to Redis so queryFeeder picks them up.
 			r.requeuePendingQueries(ctx, int(n))
 		}
 	}
 }
 
 // healStaleSerp resets failed serp_jobs that deserve another round.
-// Unlike per-stage reconciler which only handles retry-eligible (status=new, attempt>0),
-// this handles permanently-failed jobs that should get fresh attempts.
 func (r *ProjectReconciler) healStaleSerp(ctx context.Context, snap Snapshot) {
 	if snap.SerpFailed < 100 {
 		return
 	}
-	if snap.QueueSerp > 5000 {
-		return
-	}
 
 	limit := 500
-	if snap.QueueSerp > 2000 {
-		limit = 100
-	}
-
-	// Reset old failed jobs (>1 hour old) for fresh retry.
-	// Only those that haven't been retried recently.
 	res, err := r.db.Exec(fmt.Sprintf(`
 		UPDATE serp_jobs SET status = 'new', attempt_count = 0, error_msg = '',
-			locked_by = NULL, next_attempt_at = NULL, updated_at = NOW()
+			locked_by = NULL, next_attempt_at = NULL, picked_at = NULL, updated_at = NOW()
 		WHERE id IN (
 			SELECT id FROM serp_jobs
 			WHERE status = 'failed'
@@ -281,72 +243,13 @@ func (r *ProjectReconciler) healStaleSerp(ctx context.Context, snap Snapshot) {
 	}
 }
 
-// healEnrichBacklog ensures the enrich Redis queue stays fed from DB
-// without exceeding the 50K cap.
-func (r *ProjectReconciler) healEnrichBacklog(ctx context.Context, snap Snapshot) {
-	// If enrich queue is low and there are pending websites not yet in enrich_jobs,
-	// the per-stage reconciler handles this. But if enrich queue is empty and
-	// there are pending enrich_jobs in DB, we need to push them.
-	if snap.QueueEnrich > 10000 || snap.EnrichPending == 0 {
-		return
-	}
-
-	// Feed pending enrich_jobs into Redis queue (up to cap).
-	feedLimit := 50000 - int(snap.QueueEnrich)
-	if feedLimit > 5000 {
-		feedLimit = 5000 // max 5K per tick to avoid Redis pressure
-	}
-	if feedLimit <= 0 {
-		return
-	}
-
-	rows, err := r.db.Query(`
-		SELECT id, url, url_hash, parent_job_id FROM enrich_jobs
-		WHERE status = 'pending' AND locked_by IS NULL
-		ORDER BY created_at
-		LIMIT $1
-	`, feedLimit)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-
-	type enrichJob struct {
-		ID        string         `json:"id"`
-		URL       string         `json:"url"`
-		Method    string         `json:"method"`
-		Priority  int            `json:"priority"`
-		CreatedAt time.Time      `json:"created_at"`
-		Meta      map[string]any `json:"meta"`
-	}
-
-	fed := 0
-	pipe := r.redis.Pipeline()
-	for rows.Next() {
-		var id, pageURL, urlHash string
-		var queryID int64
-		if err := rows.Scan(&id, &pageURL, &urlHash, &queryID); err == nil {
-			short := urlHash
-			if len(short) > 8 {
-				short = short[:8]
-			}
-			job := enrichJob{
-				ID:        fmt.Sprintf("web-%d-%s", queryID, short),
-				URL:       pageURL,
-				Method:    "GET",
-				Priority:  3,
-				CreatedAt: time.Now(),
-				Meta:      map[string]any{"query_id": queryID},
-			}
-			data, _ := json.Marshal(job)
-			score := float64(time.Now().UnixMicro())
-			pipe.ZAdd(ctx, "serp:queue:enrich", redis.Z{Score: score, Member: string(data)})
-			fed++
+// markStaleWorkers flags workers whose heartbeat is older than 2 minutes as dead.
+func (r *ProjectReconciler) markStaleWorkers() {
+	res, err := r.db.Exec(`UPDATE workers SET status = 'dead' WHERE status != 'dead' AND last_heartbeat < NOW() - INTERVAL '2 minutes'`)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			slog.Info("project-reconciler: marked stale workers as dead", "count", n)
 		}
-	}
-	if fed > 0 {
-		pipe.Exec(ctx)
-		slog.Info("project-reconciler: fed enrich queue from DB", "count", fed)
 	}
 }
 
@@ -384,7 +287,6 @@ func (r *ProjectReconciler) requeuePendingQueries(ctx context.Context, limit int
 func extractRedisField(info, field string) string {
 	for i := 0; i < len(info); i++ {
 		if i+len(field) < len(info) && info[i:i+len(field)] == field {
-			// Find value after ':'
 			j := i + len(field)
 			if j < len(info) && info[j] == ':' {
 				j++

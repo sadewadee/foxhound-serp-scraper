@@ -13,7 +13,6 @@ import (
 )
 
 func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
-	// Access control: if allowedChatIDs is configured, reject unauthorized users.
 	if len(b.allowedChatIDs) > 0 && !b.allowedChatIDs[msg.Chat.ID] {
 		b.sendMessage(msg.Chat.ID, "Unauthorized. Your chat ID: "+fmt.Sprintf("%d", msg.Chat.ID))
 		return
@@ -21,14 +20,12 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) {
 
 	text := strings.TrimSpace(msg.Text)
 
-	// Extract command and args.
 	cmd := text
 	args := ""
 	if i := strings.Index(text, " "); i > 0 {
 		cmd = text[:i]
 		args = strings.TrimSpace(text[i+1:])
 	}
-	// Strip @botname suffix from command.
 	if i := strings.Index(cmd, "@"); i > 0 {
 		cmd = cmd[:i]
 	}
@@ -73,7 +70,7 @@ Available commands:
 /export — Export contacts as CSV (filter: gmail, bali, yoga…)
 /categories — Top 20 business categories
 /retry — Retry failed queries
-/reset — Reset dedup sets`
+/reset — Reset buffers`
 
 	b.sendMessage(msg.Chat.ID, text)
 }
@@ -117,7 +114,6 @@ func (b *Bot) handleScrape(msg *Message, args string) {
 func (b *Bot) handleGenerate(msg *Message, args string) {
 	country := strings.TrimSpace(args)
 	if country == "" {
-		// List available countries.
 		countries := query.CountryList()
 		text := "*Available countries:*\n\n"
 		for _, c := range countries {
@@ -162,16 +158,11 @@ func (b *Bot) handleGenerate(msg *Message, args string) {
 	b.sendMessage(msg.Chat.ID, text)
 }
 
-// ────────────────────────────────────────────────────────────────────
-// /status — Live dashboard with rates, totals, ETA
-// ────────────────────────────────────────────────────────────────────
-
+// /status
 func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
-	// ── Active workers (Redis lock keys) ──
 	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
 	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
 
-	// ── Queries ──
 	var qPending, qProcessing, qCompleted int
 	b.db.QueryRow(`
 		SELECT
@@ -181,7 +172,6 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		FROM queries
 	`).Scan(&qPending, &qProcessing, &qCompleted)
 
-	// ── SERP (current hour + prev hour for comparison) ──
 	var serpCompleted, serpFailed, serpHour, serpPrevHour int
 	b.db.QueryRow(`
 		SELECT
@@ -192,7 +182,6 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		FROM serp_jobs
 	`).Scan(&serpCompleted, &serpFailed, &serpHour, &serpPrevHour)
 
-	// ── Enrich (current hour + prev hour) ──
 	var enCompleted, enFailed, enDead, enHour, enPrevHour int
 	b.db.QueryRow(`
 		SELECT
@@ -201,34 +190,33 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 			COUNT(*) FILTER (WHERE status = 'dead'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
-		FROM enrich_jobs
+		FROM enrichment_jobs
 	`).Scan(&enCompleted, &enFailed, &enDead, &enHour, &enPrevHour)
 
-	// ── Emails (current hour + prev hour + today + yesterday + total) ──
+	// Emails from normalized table.
 	var emailsHour, emailsPrevHour, emailsToday, emailsYesterday, emailsTotal int
 	b.db.QueryRow(`
 		SELECT
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > date_trunc('day', NOW())),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed')
+			(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'),
+			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
+			(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
+			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
+			(SELECT COUNT(*) FROM emails)
 	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsYesterday, &emailsTotal)
 
-	// ── Queues ──
-	qSerp, _ := b.redis.ZCard(ctx, "serp:queue:serp").Result()
-	qEnrich, _ := b.redis.ZCard(ctx, "serp:queue:enrich").Result()
+	// Queues.
+	serpBuf, _ := b.redis.LLen(ctx, "serp:buffer").Result()
+	enrichBuf, _ := b.redis.LLen(ctx, "enrich:buffer").Result()
 
-	// ── Top email providers ──
+	// Top email providers.
 	type provider struct {
 		name  string
 		count int
 	}
 	var providers []provider
 	providerRows, _ := b.db.Query(`
-		SELECT split_part(e, '@', 2), COUNT(*)
-		FROM enrich_jobs, unnest(emails) AS e
-		WHERE status = 'completed'
+		SELECT domain, COUNT(*)
+		FROM emails
 		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
 	`)
 	if providerRows != nil {
@@ -240,20 +228,20 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		providerRows.Close()
 	}
 
-	// ── Email yield rate + validation stats ──
+	// Email yield rate + validation stats.
 	var enrichWithEmail, validatedCount int
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0`).Scan(&enrichWithEmail)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND mx_valid = true AND array_length(emails, 1) > 0`).Scan(&validatedCount)
+	b.db.QueryRow(`SELECT COUNT(DISTINCT be.business_id) FROM business_emails be`).Scan(&enrichWithEmail)
+	b.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE validation_status = 'valid'`).Scan(&validatedCount)
 	yieldPct := 0.0
 	if enCompleted > 0 {
 		yieldPct = float64(enrichWithEmail) / float64(enCompleted) * 100
 	}
 	validPct := 0.0
-	if enrichWithEmail > 0 {
-		validPct = float64(validatedCount) / float64(enrichWithEmail) * 100
+	if emailsTotal > 0 {
+		validPct = float64(validatedCount) / float64(emailsTotal) * 100
 	}
 
-	// ── ETA ──
+	// ETA.
 	var etaStr string
 	if emailsHour > 0 {
 		remaining := 10_000_000 - emailsTotal
@@ -267,7 +255,7 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		etaStr = "--"
 	}
 
-	// ── Build message ──
+	// Build message.
 	lines := []string{
 		fmt.Sprintf("*Dashboard* (%s)", time.Now().Format("15:04 MST")),
 		"",
@@ -296,17 +284,16 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		}
 	}
 
-	// ── Target providers (gmail, yahoo, hotmail, outlook) ──
+	// Target providers.
 	type targetProv struct {
 		domain string
 		count  int
 	}
 	var targets []targetProv
 	targetRows, tErr := b.db.Query(`
-		SELECT split_part(e, '@', 2), COUNT(*)
-		FROM enrich_jobs, unnest(emails) AS e
-		WHERE status = 'completed'
-			AND split_part(e, '@', 2) IN ('gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com')
+		SELECT domain, COUNT(*)
+		FROM emails
+		WHERE domain IN ('gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com')
 		GROUP BY 1
 	`)
 	if tErr == nil && targetRows != nil {
@@ -328,16 +315,16 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		lines = append(lines, "  "+strings.Join(parts, "  "))
 	}
 
-	// ── Top 3 categories ──
+	// Top 3 categories.
 	type catCount struct {
 		name  string
 		count int
 	}
 	var topCats []catCount
 	catRows, cErr := b.db.Query(`
-		SELECT business_category, COUNT(*)
-		FROM enrich_jobs
-		WHERE status = 'completed' AND business_category != '' AND business_category IS NOT NULL
+		SELECT category, COUNT(*)
+		FROM business_listings
+		WHERE category IS NOT NULL AND category != ''
 		GROUP BY 1 ORDER BY 2 DESC LIMIT 3
 	`)
 	if cErr == nil && catRows != nil {
@@ -355,14 +342,14 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		}
 	}
 
-	// ── Success rate ──
+	// Success rate.
 	successRate := 0.0
 	if enCompleted+enDead > 0 {
 		successRate = float64(enCompleted) / float64(enCompleted+enDead) * 100
 	}
 	lines = append(lines, "", fmt.Sprintf("_Success rate:_ %.1f%% (completed / completed+dead)", successRate))
 
-	// ── Per-engine SERP rates (last hour) — engine column may not exist ──
+	// Per-engine SERP rates.
 	type engineRate struct {
 		engine string
 		count  int
@@ -392,32 +379,28 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 	lines = append(lines, "",
 		"_Pipeline:_",
 		fmt.Sprintf("  Queries: %s pending, %s processing, %d done", fmtK(qPending), fmtK(qProcessing), qCompleted),
-		fmt.Sprintf("  Queues: serp=%s  enrich=%s", fmtK(int(qSerp)), fmtK(int(qEnrich))),
+		fmt.Sprintf("  Buffers: serp=%s  enrich=%s", fmtK(int(serpBuf)), fmtK(int(enrichBuf))),
 	)
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
-// ────────────────────────────────────────────────────────────────────
-// /analytics — Historical analytics: 1hr, 24hr, 7d with comparisons
-// ────────────────────────────────────────────────────────────────────
-
+// /analytics
 func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
-	// ── Hourly breakdown (last 6 hours) ──
 	type hourBucket struct {
-		hour    string
-		enrich  int
-		emails  int
-		serp    int
+		hour   string
+		enrich int
+		emails int
+		serp   int
 	}
 	var hours []hourBucket
 	hourRows, _ := b.db.Query(`
 		SELECT
 			to_char(h, 'HH24:MI') as hr,
-			(SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'
+			(SELECT COUNT(*) FROM enrichment_jobs WHERE status = 'completed'
 				AND completed_at >= h AND completed_at < h + INTERVAL '1 hour'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e
-				WHERE status = 'completed' AND completed_at >= h AND completed_at < h + INTERVAL '1 hour'),
+			(SELECT COUNT(*) FROM emails
+				WHERE created_at >= h AND created_at < h + INTERVAL '1 hour'),
 			(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
 				AND updated_at >= h AND updated_at < h + INTERVAL '1 hour')
 		FROM generate_series(
@@ -436,7 +419,6 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		hourRows.Close()
 	}
 
-	// ── Daily breakdown (last 7 days) ──
 	type dayBucket struct {
 		day    string
 		enrich int
@@ -447,10 +429,10 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 	dayRows, _ := b.db.Query(`
 		SELECT
 			to_char(d, 'Mon DD') as dy,
-			(SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'
+			(SELECT COUNT(*) FROM enrichment_jobs WHERE status = 'completed'
 				AND completed_at >= d AND completed_at < d + INTERVAL '1 day'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e
-				WHERE status = 'completed' AND completed_at >= d AND completed_at < d + INTERVAL '1 day'),
+			(SELECT COUNT(*) FROM emails
+				WHERE created_at >= d AND created_at < d + INTERVAL '1 day'),
 			(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
 				AND updated_at >= d AND updated_at < d + INTERVAL '1 day')
 		FROM generate_series(
@@ -469,18 +451,13 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		dayRows.Close()
 	}
 
-	// ── Summary comparisons ──
 	var emailsToday, emailsYesterday, emails7d, emailsPrev7d int
 	b.db.QueryRow(`
 		SELECT
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
-				AND completed_at > date_trunc('day', NOW())),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
-				AND completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
-				AND completed_at > NOW() - INTERVAL '7 days'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'
-				AND completed_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days')
+			(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
+			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
+			(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '7 days'),
+			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days')
 	`).Scan(&emailsToday, &emailsYesterday, &emails7d, &emailsPrev7d)
 
 	var enrichToday, enrichYesterday int
@@ -488,30 +465,29 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		SELECT
 			COUNT(*) FILTER (WHERE completed_at > date_trunc('day', NOW())),
 			COUNT(*) FILTER (WHERE completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW()))
-		FROM enrich_jobs WHERE status = 'completed'
+		FROM enrichment_jobs WHERE status = 'completed'
 	`).Scan(&enrichToday, &enrichYesterday)
 
 	var emailsTotal, validatedTotal int
-	b.db.QueryRow(`SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'`).Scan(&emailsTotal)
-	b.db.QueryRow(`SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND mx_valid = true AND array_length(emails, 1) > 0`).Scan(&validatedTotal)
+	b.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&emailsTotal)
+	b.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE validation_status = 'valid'`).Scan(&validatedTotal)
 	pctOf10M := float64(emailsTotal) / 10_000_000 * 100
 
-	// ── Dead job breakdown ──
+	// Dead job breakdown.
 	var dead404, dead403, deadOther int
 	b.db.QueryRow(`
 		SELECT
 			COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 404%'),
 			COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 403%'),
 			COUNT(*) FILTER (WHERE error_msg NOT LIKE 'HTTP 404%' AND error_msg NOT LIKE 'HTTP 403%')
-		FROM enrich_jobs WHERE status = 'dead'
+		FROM enrichment_jobs WHERE status = 'dead'
 	`).Scan(&dead404, &dead403, &deadOther)
 
-	// ── Build message ──
+	// Build message.
 	lines := []string{
 		fmt.Sprintf("*Analytics* (%s)", time.Now().Format("15:04 MST")),
 	}
 
-	// Hourly chart
 	lines = append(lines, "", "_Last 6 hours (emails/hr):_")
 	hourMax := 1
 	for _, h := range hours {
@@ -524,7 +500,6 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		lines = append(lines, fmt.Sprintf("  `%s` %s *%d*", h.hour, bar, h.emails))
 	}
 
-	// Daily chart
 	lines = append(lines, "", "_Last 7 days (emails/day):_")
 	dayMax := 1
 	for _, d := range days {
@@ -537,17 +512,15 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		lines = append(lines, fmt.Sprintf("  `%s` %s *%s*", d.day, bar, fmtK(d.emails)))
 	}
 
-	// Comparisons
 	lines = append(lines, "",
 		"_Comparisons:_",
-		fmt.Sprintf("  Today vs yesterday:"),
+		"  Today vs yesterday:",
 		fmt.Sprintf("    Emails: *%s* vs %s %s", fmtK(emailsToday), fmtK(emailsYesterday), delta(emailsToday, emailsYesterday)),
 		fmt.Sprintf("    Enrich: *%s* vs %s %s", fmtK(enrichToday), fmtK(enrichYesterday), delta(enrichToday, enrichYesterday)),
-		fmt.Sprintf("  This week vs last week:"),
+		"  This week vs last week:",
 		fmt.Sprintf("    Emails: *%s* vs %s %s", fmtK(emails7d), fmtK(emailsPrev7d), delta(emails7d, emailsPrev7d)),
 	)
 
-	// Progress + validation
 	validPctA := 0.0
 	if emailsTotal > 0 {
 		validPctA = float64(validatedTotal) / float64(emailsTotal) * 100
@@ -555,19 +528,18 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 	lines = append(lines, "",
 		"_Progress to 10M:_",
 		fmt.Sprintf("  Total: *%s* (%.2f%%)", fmtK(emailsTotal), pctOf10M),
-		fmt.Sprintf("  Validated (Mordibouncer): *%s* (%.1f%%)", fmtK(validatedTotal), validPctA),
+		fmt.Sprintf("  Validated: *%s* (%.1f%%)", fmtK(validatedTotal), validPctA),
 		progressBar(emailsTotal, 10_000_000),
 	)
 
-	// Dead breakdown
 	lines = append(lines, "",
 		"_Dead jobs breakdown:_",
-		fmt.Sprintf("  404 Not Found: %s (contact pages don't exist)", fmtK(dead404)),
-		fmt.Sprintf("  403 Forbidden: %s (site blocks scraper)", fmtK(dead403)),
+		fmt.Sprintf("  404 Not Found: %s", fmtK(dead404)),
+		fmt.Sprintf("  403 Forbidden: %s", fmtK(dead403)),
 		fmt.Sprintf("  Other: %s", fmtK(deadOther)),
 	)
 
-	// ── Gmail trend (7 days) ──
+	// Gmail trend.
 	type gmailDay struct {
 		day   string
 		count int
@@ -576,10 +548,9 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 	gmailRows, gmErr := b.db.Query(`
 		SELECT
 			to_char(d, 'Mon DD') AS dy,
-			(SELECT COUNT(*) FROM enrich_jobs, unnest(emails) AS e
-				WHERE status = 'completed'
-				AND e LIKE '%@gmail.com'
-				AND completed_at >= d AND completed_at < d + INTERVAL '1 day')
+			(SELECT COUNT(*) FROM emails
+				WHERE domain = 'gmail.com'
+				AND created_at >= d AND created_at < d + INTERVAL '1 day')
 		FROM generate_series(
 			date_trunc('day', NOW()) - INTERVAL '6 days',
 			date_trunc('day', NOW()),
@@ -609,16 +580,16 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		}
 	}
 
-	// ── Category top 5 with bar chart ──
+	// Category top 5.
 	type catStat struct {
 		name  string
 		count int
 	}
 	var catStats []catStat
 	catStatRows, csErr := b.db.Query(`
-		SELECT business_category, COUNT(*)
-		FROM enrich_jobs
-		WHERE status = 'completed' AND business_category != '' AND business_category IS NOT NULL
+		SELECT category, COUNT(*)
+		FROM business_listings
+		WHERE category IS NOT NULL AND category != ''
 		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
 	`)
 	if csErr == nil && catStatRows != nil {
@@ -644,10 +615,6 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Existing handlers (unchanged)
-// ────────────────────────────────────────────────────────────────────
-
 func (b *Bot) handleQueries(msg *Message) {
 	counts, err := b.queryRepo.CountByStatus()
 	if err != nil {
@@ -661,40 +628,33 @@ func (b *Bot) handleQueries(msg *Message) {
 	}
 
 	text := fmt.Sprintf("*Query Stats*\n\nTotal: *%d*\nPending: %d\nProcessing: %d\nDone: %d\nError: %d",
-		total,
-		counts["pending"],
-		counts["processing"],
-		counts["completed"],
-		counts["error"],
-	)
+		total, counts["pending"], counts["processing"], counts["completed"], counts["error"])
 	b.sendMessage(msg.Chat.ID, text)
 }
 
 func (b *Bot) handleContacts(msg *Message) {
-	var total, withEmail, uniqueDomains, lastHour, last24h int
+	var totalBiz, withEmail, uniqueDomains, lastHour, last24h int
 
-	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'").Scan(&total)
-	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0").Scan(&withEmail)
-	b.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'").Scan(&uniqueDomains)
-	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
-	b.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
+	b.db.QueryRow("SELECT COUNT(*) FROM business_listings").Scan(&totalBiz)
+	b.db.QueryRow("SELECT COUNT(DISTINCT be.business_id) FROM business_emails be").Scan(&withEmail)
+	b.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM business_listings").Scan(&uniqueDomains)
+	b.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
+	b.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
 
 	lines := []string{
 		"*Contact Stats*",
 		"",
-		fmt.Sprintf("Total: *%d*", total),
+		fmt.Sprintf("Total businesses: *%d*", totalBiz),
 		fmt.Sprintf("With email: %d", withEmail),
 		fmt.Sprintf("Domains: %d", uniqueDomains),
-		fmt.Sprintf("Last hour: %d", lastHour),
-		fmt.Sprintf("Last 24h: %d", last24h),
+		fmt.Sprintf("Emails last hour: %d", lastHour),
+		fmt.Sprintf("Emails last 24h: %d", last24h),
 	}
 
-	// Top email providers.
 	providerRows, _ := b.db.Query(`
-		SELECT split_part(e, '@', 2) AS provider, COUNT(*) AS cnt
-		FROM enrich_jobs, unnest(emails) AS e
-		WHERE status = 'completed'
-		GROUP BY provider ORDER BY cnt DESC LIMIT 5
+		SELECT domain, COUNT(*) AS cnt
+		FROM emails
+		GROUP BY domain ORDER BY cnt DESC LIMIT 5
 	`)
 	if providerRows != nil {
 		defer providerRows.Close()
@@ -713,28 +673,26 @@ func (b *Bot) handleContacts(msg *Message) {
 func (b *Bot) handleExport(msg *Message, args string) {
 	filter := strings.TrimSpace(strings.ToLower(args))
 
-	// Build WHERE clause based on filter arg.
-	whereClause := "status = 'completed' AND array_length(emails, 1) > 0"
+	whereClause := "EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id)"
 	filterLabel := "all"
 
 	switch {
 	case filter == "gmail":
-		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@gmail.com')"
+		whereClause += " AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.domain = 'gmail.com')"
 		filterLabel = "gmail"
 	case filter == "yahoo":
-		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@yahoo.com')"
+		whereClause += " AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.domain = 'yahoo.com')"
 		filterLabel = "yahoo"
 	case filter == "hotmail":
-		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@hotmail.com')"
+		whereClause += " AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.domain = 'hotmail.com')"
 		filterLabel = "hotmail"
 	case filter == "outlook":
-		whereClause += " AND EXISTS (SELECT 1 FROM unnest(emails) e WHERE e LIKE '%@outlook.com')"
+		whereClause += " AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.domain = 'outlook.com')"
 		filterLabel = "outlook"
 	case filter != "":
-		// Treat as location or category filter.
 		safe := strings.ReplaceAll(filter, "'", "''")
 		whereClause += fmt.Sprintf(
-			" AND (location ILIKE '%%%s%%' OR address ILIKE '%%%s%%' OR business_category ILIKE '%%%s%%')",
+			" AND (bl.location ILIKE '%%%s%%' OR bl.address ILIKE '%%%s%%' OR bl.category ILIKE '%%%s%%')",
 			safe, safe, safe,
 		)
 		filterLabel = filter
@@ -744,20 +702,23 @@ func (b *Bot) handleExport(msg *Message, args string) {
 
 	rows, err := b.db.Query(fmt.Sprintf(`
 		SELECT
-			emails, phones, domain, url,
-			COALESCE(contact_name, ''),
-			COALESCE(business_name, ''),
-			COALESCE(business_category, ''),
-			COALESCE(page_title, ''),
-			COALESCE(website, ''),
-			COALESCE(address, ''),
-			COALESCE(location, ''),
-			COALESCE(opening_hours, ''),
-			COALESCE(rating, ''),
-			social_links
-		FROM enrich_jobs
+			COALESCE(
+				(SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id),
+				'{}'
+			) AS emails,
+			COALESCE(bl.phone, ''), bl.domain, bl.url,
+			COALESCE(bl.business_name, ''),
+			COALESCE(bl.category, ''),
+			COALESCE(bl.page_title, ''),
+			COALESCE(bl.website, ''),
+			COALESCE(bl.address, ''),
+			COALESCE(bl.location, ''),
+			COALESCE(bl.opening_hours, ''),
+			COALESCE(bl.rating, ''),
+			bl.social_links
+		FROM business_listings bl
 		WHERE %s
-		ORDER BY completed_at DESC LIMIT 50000
+		ORDER BY bl.created_at DESC LIMIT 50000
 	`, whereClause))
 	if err != nil {
 		b.sendMessage(msg.Chat.ID, "Error: "+err.Error())
@@ -766,27 +727,27 @@ func (b *Bot) handleExport(msg *Message, args string) {
 	defer rows.Close()
 
 	var buf strings.Builder
-	buf.WriteString("emails,phones,domain,url,contact_name,business_name,category,page_title,website,address,location,opening_hours,rating,social_links\n")
+	buf.WriteString("emails,phone,domain,url,business_name,category,page_title,website,address,location,opening_hours,rating,social_links\n")
 
 	count := 0
 	for rows.Next() {
-		var emails, phones []string
-		var domain, url, contactName, bizName, category, pageTitle, website, address, location, hours, rating string
+		var emails []string
+		var phone, domain, url, bizName, category, pageTitle, website, address, location, hours, rating string
 		var socialLinksJSON []byte
 		rows.Scan(
-			pq.Array(&emails), pq.Array(&phones), &domain, &url,
-			&contactName, &bizName, &category, &pageTitle, &website,
+			pq.Array(&emails), &phone, &domain, &url,
+			&bizName, &category, &pageTitle, &website,
 			&address, &location, &hours, &rating, &socialLinksJSON,
 		)
-		fmt.Fprintf(&buf, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+		fmt.Fprintf(&buf, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
 			csvEscape(strings.Join(emails, ";")),
-			csvEscape(strings.Join(phones, ";")),
+			csvEscape(phone),
 			csvEscape(domain), csvEscape(url),
-			csvEscape(contactName), csvEscape(bizName),
-			csvEscape(category), csvEscape(pageTitle),
-			csvEscape(website), csvEscape(address),
-			csvEscape(location), csvEscape(hours),
-			csvEscape(rating), csvEscape(string(socialLinksJSON)),
+			csvEscape(bizName), csvEscape(category),
+			csvEscape(pageTitle), csvEscape(website),
+			csvEscape(address), csvEscape(location),
+			csvEscape(hours), csvEscape(rating),
+			csvEscape(string(socialLinksJSON)),
 		)
 		count++
 	}
@@ -823,22 +784,18 @@ func (b *Bot) handleRetry(msg *Message) {
 }
 
 func (b *Bot) handleReset(ctx context.Context, msg *Message) {
-	lines := []string{"*Dedup Reset*", ""}
+	lines := []string{"*Buffer Reset*", ""}
 
-	for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
-		n, _ := b.redis.SCard(ctx, key).Result()
+	for _, key := range []string{"serp:buffer", "enrich:buffer"} {
+		n, _ := b.redis.LLen(ctx, key).Result()
 		b.redis.Del(ctx, key)
-		short := key[len("serp:dedup:"):]
-		lines = append(lines, fmt.Sprintf("%s: %d cleared", short, n))
+		lines = append(lines, fmt.Sprintf("%s: %d cleared", key, n))
 	}
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
-// ────────────────────────────────────────────────────────────────────
-// /categories — Top 20 business categories
-// ────────────────────────────────────────────────────────────────────
-
+// /categories
 func (b *Bot) handleCategories(msg *Message) {
 	type catRow struct {
 		name  string
@@ -846,9 +803,9 @@ func (b *Bot) handleCategories(msg *Message) {
 	}
 	var cats []catRow
 	rows, err := b.db.Query(`
-		SELECT business_category, COUNT(*)
-		FROM enrich_jobs
-		WHERE status = 'completed' AND business_category != '' AND business_category IS NOT NULL
+		SELECT category, COUNT(*)
+		FROM business_listings
+		WHERE category IS NOT NULL AND category != ''
 		GROUP BY 1 ORDER BY 2 DESC LIMIT 20
 	`)
 	if err != nil {
@@ -876,9 +833,7 @@ func (b *Bot) handleCategories(msg *Message) {
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
 }
 
-// ────────────────────────────────────────────────────────────────────
 // Helpers
-// ────────────────────────────────────────────────────────────────────
 
 func csvEscape(s string) string {
 	if strings.ContainsAny(s, ",\"\n") {
@@ -887,7 +842,6 @@ func csvEscape(s string) string {
 	return s
 }
 
-// delta returns a formatted change indicator like "+15%" or "-8%".
 func delta(current, previous int) string {
 	if previous == 0 {
 		if current > 0 {
@@ -904,7 +858,6 @@ func delta(current, previous int) string {
 	return "(=)"
 }
 
-// fmtK formats large numbers as "123K" or "1.2M" for readability.
 func fmtK(n int) string {
 	if n >= 1_000_000 {
 		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
@@ -918,7 +871,6 @@ func fmtK(n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-// chartBar returns a simple text bar for Telegram monospace display.
 func chartBar(value, maxValue int) string {
 	if maxValue == 0 {
 		return ""
@@ -930,15 +882,13 @@ func chartBar(value, maxValue int) string {
 	if barLen > 8 {
 		barLen = 8
 	}
-	return strings.Repeat("█", barLen) + strings.Repeat("░", 8-barLen)
+	return strings.Repeat("\xe2\x96\x88", barLen) + strings.Repeat("\xe2\x96\x91", 8-barLen)
 }
 
-// progressBar returns a 10M progress bar.
 func progressBar(current, target int) string {
 	pct := current * 20 / target
 	if pct > 20 {
 		pct = 20
 	}
-	return "  `[" + strings.Repeat("█", pct) + strings.Repeat("░", 20-pct) + "]`"
+	return "  `[" + strings.Repeat("\xe2\x96\x88", pct) + strings.Repeat("\xe2\x96\x91", 20-pct) + "]`"
 }
-

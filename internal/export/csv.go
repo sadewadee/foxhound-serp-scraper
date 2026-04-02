@@ -19,15 +19,21 @@ type CSVOptions struct {
 // ExportCSV exports enriched contacts from PostgreSQL to a CSV file.
 func ExportCSV(db *sql.DB, opts CSVOptions) (int, error) {
 	query := `
-		SELECT emails, phones, domain, url, social_links, address
-		FROM enrich_jobs
-		WHERE status = 'completed' AND array_length(emails, 1) > 0
-		ORDER BY id ASC
+		SELECT
+			COALESCE(
+				(SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id),
+				'{}'
+			) AS emails,
+			COALESCE(bl.phone, '') AS phone,
+			bl.domain, bl.url, bl.social_links, COALESCE(bl.address, '')
+		FROM business_listings bl
+		WHERE EXISTS (SELECT 1 FROM business_emails be WHERE be.business_id = bl.id)
+		ORDER BY bl.id ASC
 	`
 
 	rows, err := db.Query(query)
 	if err != nil {
-		return 0, fmt.Errorf("export: query enrich_jobs: %w", err)
+		return 0, fmt.Errorf("export: query business_listings: %w", err)
 	}
 	defer rows.Close()
 
@@ -41,20 +47,20 @@ func ExportCSV(db *sql.DB, opts CSVOptions) (int, error) {
 	defer w.Flush()
 
 	// Write header.
-	header := []string{"emails", "phones", "domain", "url", "social_links", "address"}
+	header := []string{"emails", "phone", "domain", "url", "social_links", "address"}
 	if err := w.Write(header); err != nil {
 		return 0, fmt.Errorf("export: writing header: %w", err)
 	}
 
 	count := 0
 	for rows.Next() {
-		var emails, phones []string
-		var domain, url, address string
+		var emails []string
+		var phone, domain, url, address string
 		var socialLinksJSON []byte
 
 		if err := rows.Scan(
 			pq.Array(&emails),
-			pq.Array(&phones),
+			&phone,
 			&domain,
 			&url,
 			&socialLinksJSON,
@@ -65,7 +71,7 @@ func ExportCSV(db *sql.DB, opts CSVOptions) (int, error) {
 
 		record := []string{
 			strings.Join(emails, ";"),
-			strings.Join(phones, ";"),
+			phone,
 			domain,
 			url,
 			string(socialLinksJSON),

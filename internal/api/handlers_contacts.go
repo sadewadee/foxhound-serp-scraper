@@ -22,44 +22,49 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	offset := (page - 1) * perPage
 
 	// Build WHERE clause from filters.
-	where := "WHERE status = 'completed'"
+	where := "WHERE 1=1"
 	args := []any{}
 	argIdx := 1
 
 	if domain := q.Get("domain"); domain != "" {
-		where += fmt.Sprintf(" AND domain = $%d", argIdx)
+		where += fmt.Sprintf(" AND bl.domain = $%d", argIdx)
 		args = append(args, domain)
 		argIdx++
 	}
 	if hasEmail := q.Get("has_email"); hasEmail == "true" {
-		where += " AND array_length(emails, 1) > 0"
+		where += " AND EXISTS (SELECT 1 FROM business_emails be WHERE be.business_id = bl.id)"
 	}
 	if email := q.Get("email"); email != "" {
-		where += fmt.Sprintf(" AND $%d = ANY(emails)", argIdx)
+		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.email = $%d)", argIdx)
 		args = append(args, email)
 		argIdx++
 	}
 	if provider := q.Get("email_provider"); provider != "" {
-		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM unnest(emails) AS e WHERE e LIKE $%d)", argIdx)
+		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.email LIKE $%d)", argIdx)
 		args = append(args, "%@"+provider)
 		argIdx++
 	}
 
 	// Count total.
 	var total int
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM enrich_jobs %s", where)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
 	s.db.QueryRow(countQuery, args...).Scan(&total)
 
 	// Fetch rows.
 	dataQuery := fmt.Sprintf(`
-		SELECT id, COALESCE(contact_name,''), COALESCE(business_name,''),
-		       COALESCE(business_category,''), COALESCE(description,''),
-		       COALESCE(website,''), emails, phones, domain, url, social_links,
-		       COALESCE(address,''), COALESCE(location,''),
-		       COALESCE(opening_hours,''), COALESCE(rating,''),
-		       COALESCE(page_title,''), status, created_at
-		FROM enrich_jobs %s
-		ORDER BY id DESC
+		SELECT bl.id, COALESCE(bl.business_name,''), COALESCE(bl.category,''),
+		       COALESCE(bl.description,''), COALESCE(bl.website,''),
+		       bl.domain, bl.url, bl.social_links,
+		       COALESCE(bl.address,''), COALESCE(bl.location,''),
+		       COALESCE(bl.opening_hours,''), COALESCE(bl.rating,''),
+		       COALESCE(bl.page_title,''), bl.created_at,
+		       COALESCE(
+		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id),
+		         '{}'
+		       ) AS emails,
+		       COALESCE(bl.phone, '') AS phone
+		FROM business_listings bl %s
+		ORDER BY bl.id DESC
 		LIMIT $%d OFFSET $%d
 	`, where, argIdx, argIdx+1)
 	args = append(args, perPage, offset)
@@ -74,26 +79,32 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 
 	var contacts []map[string]any
 	for rows.Next() {
-		var id string
-		var contactName, businessName, businessCategory, description, website string
-		var emails, phones []string
-		var domain, url, address, location, openingHours, rating, pageTitle, status string
+		var id int64
+		var businessName, category, description, website string
+		var domain, url, address, location, openingHours, rating, pageTitle, phone string
 		var socialLinksJSON []byte
 		var createdAt time.Time
+		var emails []string
 
-		rows.Scan(&id, &contactName, &businessName, &businessCategory, &description, &website,
-			pq.Array(&emails), pq.Array(&phones), &domain, &url, &socialLinksJSON,
-			&address, &location, &openingHours, &rating, &pageTitle, &status, &createdAt)
+		rows.Scan(&id, &businessName, &category, &description, &website,
+			&domain, &url, &socialLinksJSON,
+			&address, &location, &openingHours, &rating, &pageTitle, &createdAt,
+			pq.Array(&emails), &phone)
+
+		var phones []string
+		if phone != "" {
+			phones = []string{phone}
+		}
 
 		contacts = append(contacts, map[string]any{
-			"id": id, "contact_name": contactName,
-			"business_name": businessName, "business_category": businessCategory,
+			"id": id,
+			"business_name": businessName, "business_category": category,
 			"description": description, "website": website,
 			"emails": emails, "phones": phones, "domain": domain,
 			"url": url, "social_links": json.RawMessage(socialLinksJSON),
 			"address": address, "location": location, "opening_hours": openingHours,
 			"rating": rating, "page_title": pageTitle,
-			"status": status, "created_at": createdAt,
+			"created_at": createdAt,
 		})
 	}
 
@@ -112,12 +123,8 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 		format = "json"
 	}
 
-	where := "WHERE status = 'completed'"
-	if q.Get("has_email") == "true" {
-		where += " AND array_length(emails, 1) > 0"
-	}
+	where := "WHERE EXISTS (SELECT 1 FROM business_emails be WHERE be.business_id = bl.id)"
 	if provider := q.Get("email_provider"); provider != "" {
-		// Only allow alphanumeric + dots to prevent SQL injection.
 		safe := true
 		for _, c := range provider {
 			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.') {
@@ -126,16 +133,20 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if safe {
-			where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM unnest(emails) AS e WHERE e LIKE '%%@%s')", provider)
+			where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.email LIKE '%%@%s')", provider)
 		}
 	}
 
 	exportQuery := fmt.Sprintf(`
-		SELECT COALESCE(contact_name,''), COALESCE(business_name,''),
-		       COALESCE(business_category,''), COALESCE(website,''),
-		       emails, phones, domain, social_links,
-		       COALESCE(address,''), COALESCE(location,'')
-		FROM enrich_jobs %s ORDER BY id ASC
+		SELECT COALESCE(bl.business_name,''), COALESCE(bl.category,''),
+		       COALESCE(bl.website,''), bl.domain, bl.social_links,
+		       COALESCE(bl.address,''), COALESCE(bl.location,''),
+		       COALESCE(bl.phone,''),
+		       COALESCE(
+		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id),
+		         '{}'
+		       ) AS emails
+		FROM business_listings bl %s ORDER BY bl.id ASC
 	`, where)
 
 	rows, err := s.db.Query(exportQuery)
@@ -149,70 +160,64 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		w.Header().Set("Content-Disposition", "attachment; filename=contacts.csv")
-		fmt.Fprintln(w, "contact_name,business_name,business_category,website,emails,phones,domain,social_links,address,location")
+		fmt.Fprintln(w, "business_name,category,website,emails,domain,social_links,address,location,phone")
 		for rows.Next() {
-			var contactName, businessName, businessCategory, website string
-			var emails, phones []string
-			var domain, address, location string
+			var businessName, category, website, domain, address, location, phone string
 			var socialLinksJSON []byte
-			rows.Scan(&contactName, &businessName, &businessCategory, &website,
-				pq.Array(&emails), pq.Array(&phones), &domain, &socialLinksJSON,
-				&address, &location)
-			fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-				csvEscape(contactName), csvEscape(businessName), csvEscape(businessCategory),
+			var emails []string
+			rows.Scan(&businessName, &category, &website, &domain, &socialLinksJSON,
+				&address, &location, &phone, pq.Array(&emails))
+			fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+				csvEscape(businessName), csvEscape(category),
 				csvEscape(website), csvEscape(strings.Join(emails, ";")),
-				csvEscape(strings.Join(phones, ";")), csvEscape(domain),
-				csvEscape(string(socialLinksJSON)), csvEscape(address), csvEscape(location))
+				csvEscape(domain), csvEscape(string(socialLinksJSON)),
+				csvEscape(address), csvEscape(location), csvEscape(phone))
 		}
 		return
 	}
 
-	// JSON export — stream to avoid accumulating the full result set in memory.
+	// JSON export.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("["))
 	enc := json.NewEncoder(w)
 	first := true
 	for rows.Next() {
-		var contactName, businessName, businessCategory, website string
-		var emails, phones []string
-		var domain, address, location string
+		var businessName, category, website, domain, address, location, phone string
 		var socialLinksJSON []byte
-		rows.Scan(&contactName, &businessName, &businessCategory, &website,
-			pq.Array(&emails), pq.Array(&phones), &domain, &socialLinksJSON,
-			&address, &location)
+		var emails []string
+		rows.Scan(&businessName, &category, &website, &domain, &socialLinksJSON,
+			&address, &location, &phone, pq.Array(&emails))
 		if !first {
 			w.Write([]byte(","))
 		}
 		first = false
 		enc.Encode(map[string]any{
-			"contact_name": contactName, "business_name": businessName,
-			"business_category": businessCategory, "website": website,
-			"emails": emails, "phones": phones, "domain": domain,
+			"business_name": businessName, "business_category": category,
+			"website": website, "emails": emails, "domain": domain,
 			"social_links": json.RawMessage(socialLinksJSON),
-			"address": address, "location": location,
+			"address": address, "location": location, "phone": phone,
 		})
 	}
 	w.Write([]byte("]"))
 }
 
 func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
-	var total, withEmail, uniqueDomains, uniqueEmails, lastHour, last24h int
+	var totalBiz, withEmail, uniqueDomains, totalEmails, lastHour, last24h int
 
-	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed'").Scan(&total)
-	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND array_length(emails, 1) > 0").Scan(&withEmail)
-	s.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM enrich_jobs WHERE status = 'completed'").Scan(&uniqueDomains)
-	s.db.QueryRow("SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'").Scan(&uniqueEmails)
-	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
-	s.db.QueryRow("SELECT COUNT(*) FROM enrich_jobs WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
+	s.db.QueryRow("SELECT COUNT(*) FROM business_listings").Scan(&totalBiz)
+	s.db.QueryRow("SELECT COUNT(DISTINCT bl.id) FROM business_listings bl JOIN business_emails be ON be.business_id = bl.id").Scan(&withEmail)
+	s.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM business_listings").Scan(&uniqueDomains)
+	s.db.QueryRow("SELECT COUNT(*) FROM emails").Scan(&totalEmails)
+	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
+	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
 
 	// Top email providers.
 	providers := map[string]int{}
 	providerRows, _ := s.db.Query(`
-		SELECT split_part(e, '@', 2) AS provider, COUNT(*) AS cnt
-		FROM enrich_jobs, unnest(emails) AS e
-		WHERE status = 'completed'
-		GROUP BY provider
+		SELECT domain, COUNT(*) AS cnt
+		FROM emails
+		GROUP BY domain
 		ORDER BY cnt DESC
 		LIMIT 10
 	`)
@@ -227,10 +232,10 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"total":          total,
+		"total":          totalBiz,
 		"with_email":     withEmail,
 		"unique_domains": uniqueDomains,
-		"unique_emails":  uniqueEmails,
+		"unique_emails":  totalEmails,
 		"last_hour":      lastHour,
 		"last_24h":       last24h,
 		"providers":      providers,
@@ -239,8 +244,8 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs    []string `json:"ids"`
-		Domain string   `json:"domain"`
+		IDs    []int64 `json:"ids"`
+		Domain string  `json:"domain"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -261,9 +266,9 @@ func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 	var res sql.Result
 	var err error
 	if req.Domain != "" {
-		res, err = s.db.Exec("DELETE FROM enrich_jobs WHERE domain = $1", req.Domain)
+		res, err = s.db.Exec("DELETE FROM business_listings WHERE domain = $1", req.Domain)
 	} else {
-		res, err = s.db.Exec("DELETE FROM enrich_jobs WHERE id = ANY($1)", pq.Array(req.IDs))
+		res, err = s.db.Exec("DELETE FROM business_listings WHERE id = ANY($1)", pq.Array(req.IDs))
 	}
 	if err != nil {
 		slog.Error("handler error", "error", err)
@@ -276,12 +281,12 @@ func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(`
-		SELECT domain, COUNT(*) as contact_count,
-		       COUNT(CASE WHEN array_length(emails, 1) > 0 THEN 1 END) as email_count
-		FROM enrich_jobs
-		WHERE status = 'completed'
-		GROUP BY domain
-		ORDER BY contact_count DESC
+		SELECT bl.domain,
+		       COUNT(DISTINCT be.email_id) as email_count
+		FROM business_listings bl
+		LEFT JOIN business_emails be ON be.business_id = bl.id
+		GROUP BY bl.domain
+		ORDER BY email_count DESC
 		LIMIT 500
 	`)
 	if err != nil {
@@ -294,15 +299,37 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 	var domains []map[string]any
 	for rows.Next() {
 		var domain string
-		var contactCount, emailCount int
-		rows.Scan(&domain, &contactCount, &emailCount)
+		var emailCount int
+		rows.Scan(&domain, &emailCount)
 		domains = append(domains, map[string]any{
-			"domain": domain, "contacts": contactCount, "emails": emailCount,
+			"domain": domain, "emails": emailCount,
 		})
 	}
 	writeJSON(w, http.StatusOK, domains)
 }
 
 func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, []any{})
+	rows, err := s.db.Query(`
+		SELECT category, COUNT(*) AS cnt
+		FROM business_listings
+		WHERE category IS NOT NULL AND category != ''
+		GROUP BY category ORDER BY cnt DESC LIMIT 50
+	`)
+	if err != nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	defer rows.Close()
+
+	var cats []map[string]any
+	for rows.Next() {
+		var cat string
+		var cnt int
+		rows.Scan(&cat, &cnt)
+		cats = append(cats, map[string]any{"category": cat, "count": cnt})
+	}
+	if cats == nil {
+		cats = []map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, cats)
 }

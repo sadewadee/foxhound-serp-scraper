@@ -8,14 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/lib/pq"
 
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/fetch"
@@ -23,67 +22,41 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/directory"
-	"github.com/sadewadee/serp-scraper/internal/persist"
+	"github.com/sadewadee/serp-scraper/internal/feeder"
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
 	"github.com/sadewadee/serp-scraper/internal/validate"
 )
 
-// contactPagePaths are common paths that contain contact information.
-// Reduced to 4 highest-yield paths to minimize 404 waste.
-var contactPagePaths = []string{
-	"/contact",
-	"/contact-us",
-	"/about",
-	"/about-us",
-}
-
-// blockedDomains are sites with aggressive bot detection or no useful email content.
-// Fetching these wastes crawl budget — they never yield personal wellness emails.
 var blockedDomains = map[string]bool{
-	// Directories with bot detection
 	"www.yelp.com": true, "m.yelp.com": true,
 	"www.tripadvisor.com": true, "www.tripadvisor.co.uk": true, "www.tripadvisor.co.id": true,
 	"www.tripadvisor.de": true, "www.tripadvisor.fr": true, "www.tripadvisor.com.au": true,
-	// Job boards
 	"www.indeed.com": true, "de.indeed.com": true, "id.indeed.com": true,
 	"www.ziprecruiter.com": true, "www.simplyhired.com": true,
 	"www.glassdoor.com": true, "www.glassdoor.co.uk": true, "www.glassdoor.de": true,
-	// Social media (no scrapeable emails)
 	"www.linkedin.com": true,
 	"www.facebook.com": true, "m.facebook.com": true,
 	"www.instagram.com": true,
 	"twitter.com": true, "x.com": true,
-	"www.tiktok.com": true,
-	"www.youtube.com": true,
-	"www.pinterest.com": true,
-	"www.reddit.com": true,
-	// Q&A / research
-	"www.quora.com": true,
-	"www.researchgate.net": true,
+	"www.tiktok.com": true, "www.youtube.com": true,
+	"www.pinterest.com": true, "www.reddit.com": true,
+	"www.quora.com": true, "www.researchgate.net": true,
 	"pmc.ncbi.nlm.nih.gov": true,
 	"journals.sagepub.com": true, "www.tandfonline.com": true,
-	// Aggregators / no personal emails
-	"rocketreach.co": true,
+	"rocketreach.co":      true,
 	"www.amazon.com": true, "www.walmart.com": true,
 	"www.booking.com": true, "www.airbnb.com": true,
-	"www.bbb.org": true,
-	"maps.google.com": true,
+	"www.bbb.org": true, "maps.google.com": true,
 	"www.yellowpages.com": true, "www.whitepages.com": true,
 }
 
-// isSkipDomain returns true for domains that should not be fetched.
 func isSkipDomain(domain string) bool {
 	if blockedDomains[domain] {
 		return true
 	}
-	// Academic, government, military — not wellness/fitness target.
-	// Includes international variants.
 	for _, suffix := range []string{
-		".edu", ".gov", ".mil",
-		".ac.uk", ".gov.uk", ".edu.au", ".gov.au",
-		".ac.id", ".go.id",
-		".edu.sg", ".gov.sg",
-		".ac.jp", ".go.jp",
+		".edu", ".gov", ".mil", ".ac.uk", ".gov.uk", ".edu.au", ".gov.au",
+		".ac.id", ".go.id", ".edu.sg", ".gov.sg", ".ac.jp", ".go.jp",
 	} {
 		if strings.HasSuffix(domain, suffix) {
 			return true
@@ -92,34 +65,26 @@ func isSkipDomain(domain string) bool {
 	return false
 }
 
-// EnrichStage runs Stage 4: Contact enrichment workers.
-// Hot path is zero-DB: all claims via Redis SETNX, results pushed to
-// Redis lists, persister drains to DB in background batches.
 type EnrichStage struct {
 	cfg       *config.Config
 	db        *sql.DB
 	dedup     *dedup.Store
-	validator *validate.MordibouncerClient // nil if not configured
+	validator *validate.MordibouncerClient
 
-	// Shared browser state — all workers share one browser process (pool of tabs).
 	browserMu     sync.Mutex
 	sharedBrowser *fetch.CamoufoxFetcher
 	lifecycle     *internalScraper.BrowserLifecycle
-
-	// Beta: domain scorer for stealth→browser auto-escalation (nil when disabled).
-	domainScorer *fetch.DomainScorer
+	domainScorer  *fetch.DomainScorer
 
 	pagesProcessed atomic.Int64
 	emailsFound    atomic.Int64
 	phonesFound    atomic.Int64
 
-	// Beta metrics (domain scorer).
-	betaDSStatic  atomic.Int64 // fetches routed to stealth
-	betaDSCaution atomic.Int64 // fetches routed to stealth-cautious (5s timeout)
-	betaDSBrowser atomic.Int64 // fetches escalated directly to browser
+	betaDSStatic  atomic.Int64
+	betaDSCaution atomic.Int64
+	betaDSBrowser atomic.Int64
 }
 
-// NewEnrichStage creates a new contact enrichment stage.
 func NewEnrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *EnrichStage {
 	browserFactory := func(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		return internalScraper.NewBrowserWithPool(cfg, cfg.Enrich.Concurrency)
@@ -138,10 +103,9 @@ func NewEnrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Enri
 	}
 }
 
-// Run starts contact enrichment workers. Blocks until ctx is cancelled.
 func (c *EnrichStage) Run(ctx context.Context) error {
-	// Requeue stuck processing jobs from previous run (startup only — uses DB).
-	res, err := c.db.Exec(`UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, updated_at = NOW() WHERE status = 'processing'`)
+	// Requeue stuck processing jobs from previous run.
+	res, err := c.db.Exec(`UPDATE enrichment_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, picked_at = NULL, updated_at = NOW() WHERE status = 'processing'`)
 	if err != nil {
 		slog.Warn("enrich: requeue stuck jobs failed", "error", err)
 	} else {
@@ -154,10 +118,9 @@ func (c *EnrichStage) Run(ctx context.Context) error {
 	numWorkers := c.cfg.Enrich.Concurrency
 	slog.Info("enrich: starting workers", "count", numWorkers)
 
-	// Start healthcheck heartbeat.
 	go touchHealthFile(ctx, "/tmp/worker-healthy")
+	go c.heartbeat(ctx)
 
-	// One shared browser for all workers (fallback for JS-heavy sites).
 	browser, err := internalScraper.NewBrowserWithPool(c.cfg, numWorkers)
 	if err != nil {
 		slog.Warn("enrich: shared browser init failed, stealth-only mode", "error", err)
@@ -175,8 +138,11 @@ func (c *EnrichStage) Run(ctx context.Context) error {
 		slog.Info("enrich: shared browser ready", "pool_size", numWorkers)
 	}
 
-	// Start reconciler — resets stuck jobs and re-queues orphaned DB records.
 	go c.reconciler(ctx)
+
+	// Start the DB-to-Redis buffer feeder.
+	enrichFeeder := feeder.NewEnrichFeeder(c.db, c.dedup.Client())
+	go enrichFeeder.Run(ctx)
 
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -195,7 +161,36 @@ func (c *EnrichStage) Run(ctx context.Context) error {
 	return nil
 }
 
-// reconciler runs periodically to handle recovery (NOT hot path — uses DB).
+// heartbeat upserts the workers table every 30s so the reconciler and
+// Telegram /status command can report worker health.
+func (c *EnrichStage) heartbeat(ctx context.Context) {
+	host, _ := os.Hostname()
+	if len(host) > 12 {
+		host = host[:12]
+	}
+	workerID := fmt.Sprintf("enrich-%s", host)
+
+	// Register on startup.
+	c.db.Exec(`INSERT INTO workers (worker_id, worker_type, status, last_heartbeat, started_at)
+		VALUES ($1, 'enrich', 'idle', NOW(), NOW())
+		ON CONFLICT (worker_id) DO UPDATE SET status = 'idle', last_heartbeat = NOW(), started_at = NOW()`,
+		workerID)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			c.db.Exec(`UPDATE workers SET status = 'dead', last_heartbeat = NOW() WHERE worker_id = $1`, workerID)
+			return
+		case <-ticker.C:
+			c.db.Exec(`UPDATE workers SET status = 'working', pages_processed = $1, emails_found = $2, last_heartbeat = NOW() WHERE worker_id = $3`,
+				c.pagesProcessed.Load(), c.emailsFound.Load(), workerID)
+		}
+	}
+}
+
 func (c *EnrichStage) reconciler(ctx context.Context) {
 	interval := time.Duration(c.cfg.Fetch.ReconcilerIntervalMs) * time.Millisecond
 	ticker := time.NewTicker(interval)
@@ -208,82 +203,26 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		queueKey := "serp:queue:enrich"
-
-		// 1. Reset stuck processing jobs (>5 min) and immediately re-queue.
-		// Respect enrich queue cap.
-		stuckDepth, _ := c.dedup.Client().ZCard(ctx, queueKey).Result()
-		stuckLimit := 200
-		if stuckDepth > 50000 {
-			stuckLimit = 0
-		}
-		stuckRows, err := c.db.Query(`
-			UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, updated_at = NOW()
+		// 1. Reset stuck processing jobs (>5 min).
+		res, err := c.db.Exec(`
+			UPDATE enrichment_jobs SET status = 'pending', locked_by = NULL, locked_at = NULL, picked_at = NULL, updated_at = NOW()
 			WHERE id IN (
-				SELECT id FROM enrich_jobs
+				SELECT id FROM enrichment_jobs
 				WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
-				LIMIT $1
+				LIMIT 200
 			)
-			RETURNING id, url, url_hash, parent_job_id
-		`, stuckLimit)
+		`)
 		if err == nil {
-			n := 0
-			for stuckRows.Next() {
-				var id, pageURL, urlHash string
-				var queryID int64
-				if err := stuckRows.Scan(&id, &pageURL, &urlHash, &queryID); err == nil {
-					c.dedup.Client().Del(ctx, "enrich:lock:"+urlHash) // clear stale lock
-					c.pushToEnrichQueue(ctx, queueKey, pageURL, urlHash, queryID)
-					n++
-				}
-			}
-			stuckRows.Close()
-			if n > 0 {
-				slog.Info("enrich: reconciler reset+requeued stuck jobs", "count", n)
+			if n, _ := res.RowsAffected(); n > 0 {
+				slog.Info("enrich: reconciler reset stuck jobs", "count", n)
 			}
 		}
 
-		// 2. Re-queue orphaned pending jobs (DB exists but missing from Redis).
-		// Respect enrich queue cap — only re-queue when below 50K.
-		enrichDepth, _ := c.dedup.Client().ZCard(ctx, queueKey).Result()
-		batchLimit := int64(1000)
-		if enrichDepth > 50000 {
-			batchLimit = 0 // skip re-queue when queue is full
-		} else if enrichDepth > 40000 {
-			batchLimit = 200 // slow refill near cap
-		}
-		orphanRows, err := c.db.Query(`
-			UPDATE enrich_jobs SET updated_at = NOW()
+		// 2. Resurrect dead jobs with transient errors (hourly).
+		deadRes, _ := c.db.Exec(`
+			UPDATE enrichment_jobs SET status = 'pending', attempt_count = 0, locked_by = NULL, picked_at = NULL, updated_at = NOW()
 			WHERE id IN (
-				SELECT id FROM enrich_jobs
-				WHERE status = 'pending' AND locked_by IS NULL
-				  AND updated_at < NOW() - INTERVAL '2 minutes'
-				LIMIT $1
-			)
-			RETURNING id, url, url_hash, parent_job_id
-		`, batchLimit)
-		if err == nil {
-			requeued := 0
-			for orphanRows.Next() {
-				var id, pageURL, urlHash string
-				var queryID int64
-				if err := orphanRows.Scan(&id, &pageURL, &urlHash, &queryID); err == nil {
-					c.pushToEnrichQueue(ctx, queueKey, pageURL, urlHash, queryID)
-					requeued++
-				}
-			}
-			orphanRows.Close()
-			if requeued > 0 {
-				slog.Info("enrich: reconciler re-queued orphaned pending jobs", "count", requeued)
-			}
-		}
-
-		// 3. Resurrect dead jobs with transient errors (hourly).
-		// Skip if queue already over cap.
-		deadRows, deadErr := c.db.Query(`
-			UPDATE enrich_jobs SET status = 'pending', attempt_count = 0, locked_by = NULL, updated_at = NOW()
-			WHERE id IN (
-				SELECT id FROM enrich_jobs
+				SELECT id FROM enrichment_jobs
 				WHERE status = 'dead'
 				  AND updated_at < NOW() - INTERVAL '1 hour'
 				  AND error_msg NOT LIKE 'HTTP 403%'
@@ -294,55 +233,33 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				  AND error_msg NOT LIKE '%x509%'
 				  AND error_msg NOT LIKE '%no such host%'
 				  AND error_msg NOT LIKE '%server misbehaving%'
-				LIMIT $1
+				LIMIT 1000
 			)
-			RETURNING id, url, url_hash, parent_job_id
-		`, batchLimit)
-		if deadErr == nil {
-			n := 0
-			for deadRows.Next() {
-				var id, pageURL, urlHash string
-				var queryID int64
-				if err := deadRows.Scan(&id, &pageURL, &urlHash, &queryID); err == nil {
-					c.pushToEnrichQueue(ctx, queueKey, pageURL, urlHash, queryID)
-					n++
-				}
-			}
-			deadRows.Close()
-			if n > 0 {
+		`)
+		if deadRes != nil {
+			if n, _ := deadRes.RowsAffected(); n > 0 {
 				slog.Info("enrich: reconciler resurrected dead jobs", "count", n)
 			}
 		}
 
-		// 4. Re-queue failed jobs whose retry window has elapsed.
-		failedRows, err := c.db.Query(`
-			UPDATE enrich_jobs SET status = 'pending', locked_by = NULL, updated_at = NOW()
+		// 3. Re-queue failed jobs whose retry window has elapsed.
+		failedRes, _ := c.db.Exec(`
+			UPDATE enrichment_jobs SET status = 'pending', locked_by = NULL, picked_at = NULL, updated_at = NOW()
 			WHERE id IN (
-				SELECT id FROM enrich_jobs
+				SELECT id FROM enrichment_jobs
 				WHERE status = 'failed'
 				  AND next_attempt_at IS NOT NULL AND next_attempt_at <= NOW()
 				  AND attempt_count < max_attempts
-				LIMIT $1
+				LIMIT 1000
 			)
-			RETURNING id, url, url_hash, parent_job_id
-		`, batchLimit)
-		if err == nil {
-			retried := 0
-			for failedRows.Next() {
-				var id, pageURL, urlHash string
-				var queryID int64
-				if err := failedRows.Scan(&id, &pageURL, &urlHash, &queryID); err == nil {
-					c.pushToEnrichQueue(ctx, queueKey, pageURL, urlHash, queryID)
-					retried++
-				}
-			}
-			failedRows.Close()
-			if retried > 0 {
-				slog.Info("enrich: reconciler re-queued failed retries", "count", retried)
+		`)
+		if failedRes != nil {
+			if n, _ := failedRes.RowsAffected(); n > 0 {
+				slog.Info("enrich: reconciler re-queued failed retries", "count", n)
 			}
 		}
 
-		// Beta metrics report (only when domain scorer is active).
+		// Beta metrics.
 		if c.domainScorer != nil {
 			dsStatic := c.betaDSStatic.Load()
 			dsCaution := c.betaDSCaution.Load()
@@ -353,17 +270,13 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				escalatePct = float64(dsBrowser) / float64(dsTotal) * 100
 			}
 			slog.Info("beta-metrics: enrich",
-				"ds_static", dsStatic,
-				"ds_caution", dsCaution,
-				"ds_browser", dsBrowser,
+				"ds_static", dsStatic, "ds_caution", dsCaution, "ds_browser", dsBrowser,
 				"ds_escalate_pct", fmt.Sprintf("%.1f%%", escalatePct),
 			)
 		}
 	}
 }
 
-// worker is the hot-path goroutine. Zero DB calls — claims via Redis SETNX,
-// results pushed to Redis lists for persister to drain.
 func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 	host, _ := os.Hostname()
 	if len(host) > 12 {
@@ -378,7 +291,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 
 	defer stealth.Close()
 
-	queueKey := "serp:queue:enrich"
 	redisClient := c.dedup.Client()
 
 	for {
@@ -386,7 +298,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			return
 		}
 
-		// Recycle stealth fetcher periodically.
 		stealthCount++
 		if stealthCount >= stealthRecycleAfter {
 			stealth.Close()
@@ -395,76 +306,56 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			slog.Debug("enrich: stealth recycled", "worker", workerID)
 		}
 
-		// Pop from Redis enrich queue.
-		job, err := popFromQueue(ctx, redisClient, queueKey)
+		// BLPOP from enrich:buffer.
+		result, err := redisClient.BLPop(ctx, 5*time.Second, feeder.EnrichBufferKey).Result()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			slog.Debug("enrich: pop failed", "worker", workerID, "error", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
-				continue
-			}
+			continue
 		}
-		if job == nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(5 * time.Second):
-				continue
-			}
+		if len(result) < 2 {
+			continue
+		}
+
+		var job feeder.EnrichBufferItem
+		if err := json.Unmarshal([]byte(result[1]), &job); err != nil {
+			slog.Warn("enrich: invalid job in buffer", "error", err)
+			continue
 		}
 
 		pageURL := job.URL
-		domain := dedup.ExtractDomain(pageURL)
+		domain := job.Domain
+		if domain == "" {
+			domain = dedup.ExtractDomain(pageURL)
+		}
 		if domain == "" {
 			continue
 		}
 
-		// Skip domains that always block or are off-target — mark dead so reconciler doesn't re-queue.
-		if isSkipDomain(domain) {
-			urlHash, _ := job.Meta["url_hash"].(string)
-			if urlHash == "" {
-				urlHash = dedup.HashURL(pageURL)
-			}
-			result := persist.EnrichResult{
-				URLHash:     urlHash,
-				Status:      "dead",
-				ErrorMsg:    "blocked domain: " + domain,
-				IsPermanent: true,
-				AttemptIncr: 1,
-			}
-			data, _ := json.Marshal(result)
-			redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
-			continue
-		}
-
-		// Domain-level dedup: queue contact pages for new domains.
-		if c.cfg.Enrich.ContactPages {
-			isDomainNew, dedupErr := c.dedup.Add(ctx, dedup.KeyDomains, domain)
-			if dedupErr != nil {
-				slog.Warn("enrich: domain dedup failed", "error", dedupErr)
-			} else if isDomainNew {
-				c.queueContactPages(ctx, pageURL, domain, job)
-			}
-		}
-
-		// Extract url_hash from meta.
-		urlHash, _ := job.Meta["url_hash"].(string)
+		urlHash := job.URLHash
 		if urlHash == "" {
 			urlHash = dedup.HashURL(pageURL)
 		}
 
-		// Redis SETNX claim — only one worker wins. If already claimed, skip.
+		// Skip blocked domains — mark dead.
+		if isSkipDomain(domain) {
+			c.db.Exec(`UPDATE enrichment_jobs SET status = 'dead', error_msg = $1, updated_at = NOW() WHERE url_hash = $2`,
+				"blocked domain: "+domain, urlHash)
+			continue
+		}
+
+		// Redis SETNX claim.
 		ok, claimErr := redisClient.SetNX(ctx, "enrich:lock:"+urlHash, workerIDStr, 5*time.Minute).Result()
 		if claimErr != nil || !ok {
 			continue
 		}
 
-		// Fetch page — with optional domain scorer (beta).
+		// DB claim: mark processing.
+		c.db.Exec(`UPDATE enrichment_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW() WHERE url_hash = $2 AND status = 'pending'`,
+			workerIDStr, urlHash)
+
+		// Fetch page.
 		timeout := time.Duration(c.cfg.Enrich.TimeoutMs) * time.Millisecond
 		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
@@ -474,7 +365,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 
 		var body string
 		if c.domainScorer != nil && currentBrowser != nil {
-			// Beta: domain scorer decides fetch strategy per domain.
 			action := c.domainScorer.Recommend(domain)
 			switch action {
 			case fetch.ActionBrowserDirect:
@@ -487,7 +377,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 				}
 			case fetch.ActionStaticCautious:
 				c.betaDSCaution.Add(1)
-				// Cautious: 5s timeout on stealth, then fallback to browser.
 				cautionCtx, cautionCancel := context.WithTimeout(fetchCtx, 5*time.Second)
 				body, err = internalScraper.FetchPage(cautionCtx, stealth, currentBrowser, pageURL, job.ID)
 				cautionCancel()
@@ -506,7 +395,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		}
 		cancel()
 
-		// Check lifecycle after every fetch attempt.
 		if currentBrowser != nil && c.lifecycle.IncrementAndCheck() {
 			slog.Info("enrich: page reuse limit reached, restarting browser", "worker", workerID)
 			c.browserMu.Lock()
@@ -516,7 +404,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 				oldBrowser := c.sharedBrowser
 				c.sharedBrowser = nil
 				c.browserMu.Unlock()
-
 				newBrowser, restartErr := c.lifecycle.Restart(oldBrowser)
 				c.browserMu.Lock()
 				if restartErr != nil {
@@ -532,30 +419,30 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			errMsg := err.Error()
 			slog.Debug("enrich: fetch failed", "url", pageURL, "error", errMsg)
 
-			// Push failure to Redis result queue (persister handles DB update).
-			result := persist.EnrichResult{
-				URLHash:     urlHash,
-				Status:      "failed",
-				ErrorMsg:    errMsg,
-				AttemptIncr: 1,
-				IsPermanent: isPermanentError(errMsg),
+			if isPermanentError(errMsg) {
+				c.db.Exec(`UPDATE enrichment_jobs SET status = 'dead', attempt_count = attempt_count + 1, error_msg = $1, updated_at = NOW() WHERE url_hash = $2`,
+					errMsg, urlHash)
+			} else {
+				c.db.Exec(`UPDATE enrichment_jobs SET
+					attempt_count = attempt_count + 1,
+					error_msg = $1,
+					status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'dead' ELSE 'failed' END,
+					next_attempt_at = CASE WHEN attempt_count + 1 >= max_attempts THEN NULL
+						ELSE NOW() + interval '1 second' * 30 * power(2, attempt_count) END,
+					locked_by = NULL, picked_at = NULL, updated_at = NOW()
+				WHERE url_hash = $2`, errMsg, urlHash)
 			}
-			data, _ := json.Marshal(result)
-			redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
-			redisClient.Del(ctx, "enrich:lock:"+urlHash) // release lock
+			redisClient.Del(ctx, "enrich:lock:"+urlHash)
 			continue
 		}
 
 		c.pagesProcessed.Add(1)
 
-		// Directory path: extract business listings, queue individual URLs.
-		// Respect enrich queue cap — skip directory expansion when over limit.
-		dirDepth, _ := redisClient.ZCard(ctx, queueKey).Result()
-		if directory.IsDirectory(pageURL) && dirDepth <= 50000 {
+		// Directory path: extract business listings.
+		if directory.IsDirectory(pageURL) {
 			listings := directory.ExtractListings(pageURL, []byte(body))
 			if len(listings) > 0 {
-				slog.Info("enrich: directory listings extracted",
-					"url", pageURL, "count", len(listings), "worker", workerID)
+				slog.Info("enrich: directory listings extracted", "url", pageURL, "count", len(listings), "worker", workerID)
 			}
 
 			var rawEmails, rawPhones []string
@@ -566,69 +453,34 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 				if l.Phone != "" {
 					rawPhones = append(rawPhones, l.Phone)
 				}
-				// Queue individual listing URLs for full enrichment.
+				// Queue individual listing URLs via DB INSERT (trigger creates enrichment_jobs).
 				if l.URL != "" {
-					listingHash := dedup.HashURL(l.URL)
 					listingDomain := dedup.ExtractDomain(l.URL)
-					if listingDomain == "" {
-						continue
+					if listingDomain != "" {
+						c.db.Exec(`INSERT INTO serp_results (url, url_hash, domain, source_query_id)
+							VALUES ($1, $2, $3, $4) ON CONFLICT (url_hash) DO NOTHING`,
+							l.URL, dedup.HashURL(l.URL), listingDomain, job.ParentQueryID)
 					}
-					qID := queryIDFromMeta(job.Meta)
-
-					// Push directory listing to persister (DB INSERT deferred).
-					dirResult := persist.EnrichResult{
-						URLHash:     listingHash,
-						Status:      "directory_listing",
-						Website:     listingDomain, // reuse: domain
-						Address:     l.URL,         // reuse: url
-						AttemptIncr: int(qID),      // reuse: queryID
-					}
-					dirData, _ := json.Marshal(dirResult)
-					redisClient.RPush(ctx, persist.KeyResultEnrich, string(dirData))
-
-					// Push to enrich queue immediately.
-					pushData := &foxhound.Job{
-						ID:        fmt.Sprintf("enrich-%s", listingHash[:12]),
-						URL:       l.URL,
-						Method:    "GET",
-						Priority:  foxhound.PriorityNormal,
-						CreatedAt: time.Now(),
-						Meta:      map[string]any{"query_id": qID, "url_hash": listingHash},
-					}
-					data, _ := json.Marshal(pushData)
-					micros := pushData.CreatedAt.UnixMicro()
-					score := -(float64(pushData.Priority) * 1_000_000_000) + float64(micros)
-					redisClient.ZAdd(ctx, queueKey, redis.Z{Score: score, Member: string(data)})
 				}
 			}
 
 			allEmails := internalScraper.FilterEmails(rawEmails)
 			allPhones := internalScraper.FilterPhones(rawPhones)
-
-			// Mordibouncer validation for directory emails too.
 			if c.validator != nil && len(allEmails) > 0 {
 				allEmails = c.validateEmails(ctx, allEmails)
 			}
-
 			socialLinks := buildSocialLinks(nil)
+			socialJSON, _ := json.Marshal(socialLinks)
 
-			// Push directory completion to persister.
-			result := persist.EnrichResult{
-				URLHash:     urlHash,
-				Status:      "completed",
-				Emails:      allEmails,
-				Phones:      allPhones,
-				SocialLinks: socialLinks,
-			}
-			data, _ := json.Marshal(result)
-			redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
-			redisClient.Del(ctx, "enrich:lock:"+urlHash) // release lock
+			c.db.Exec(`UPDATE enrichment_jobs SET
+				status = 'completed', raw_emails = $1, raw_phones = $2, raw_social = $3,
+				completed_at = NOW(), updated_at = NOW()
+			WHERE url_hash = $4`,
+				pq.Array(allEmails), pq.Array(allPhones), socialJSON, urlHash)
 
+			redisClient.Del(ctx, "enrich:lock:"+urlHash)
 			c.emailsFound.Add(int64(len(allEmails)))
 			c.phonesFound.Add(int64(len(allPhones)))
-
-			slog.Debug("enrich: directory page done",
-				"url", pageURL, "listings", len(listings), "worker", workerID)
 			continue
 		}
 
@@ -637,116 +489,37 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		emails := internalScraper.FilterEmails(cd.Emails)
 		phones := internalScraper.FilterPhones(cd.Phones)
 
-		// Mordibouncer validation (highest priority — SMTP-level check).
-		// Falls back to MX validation if Mordibouncer is not configured.
-		var mxValid *bool
 		if c.validator != nil && len(emails) > 0 {
 			emails = c.validateEmails(ctx, emails)
-			if len(emails) > 0 {
-				v := true
-				mxValid = &v
-			}
 		} else if c.cfg.Enrich.ValidateMX && len(emails) > 0 {
-			v := internalScraper.ValidateMX(emails[0])
-			mxValid = &v
-			if !v {
+			if !internalScraper.ValidateMX(emails[0]) {
 				emails = nil
 			}
 		}
 
 		socialLinks := buildSocialLinks(cd)
-		websiteURL := fmt.Sprintf("https://%s", dedup.ExtractDomain(pageURL))
+		socialJSON, _ := json.Marshal(socialLinks)
 
-		// Push completion to Redis result queue (persister handles DB update).
-		result := persist.EnrichResult{
-			URLHash:          urlHash,
-			Status:           "completed",
-			Emails:           emails,
-			Phones:           phones,
-			SocialLinks:      socialLinks,
-			ContactName:      cd.ContactName,
-			BusinessName:     cd.BusinessName,
-			BusinessCategory: cd.BusinessCategory,
-			Description:      cd.Description,
-			Website:          websiteURL,
-			Address:          cd.Address,
-			Location:         cd.Location,
-			OpeningHours:     cd.OpeningHours,
-			Rating:           cd.Rating,
-			PageTitle:        cd.PageTitle,
-			MXValid:          mxValid,
-		}
-		data, _ := json.Marshal(result)
-		redisClient.RPush(ctx, persist.KeyResultEnrich, string(data))
-		redisClient.Del(ctx, "enrich:lock:"+urlHash) // release lock
+		// DB direct write — trigger handles normalization + contact pages.
+		c.db.Exec(`UPDATE enrichment_jobs SET
+			status = 'completed',
+			raw_emails = $1, raw_phones = $2, raw_social = $3,
+			raw_business_name = $4, raw_category = $5, raw_address = $6,
+			raw_page_title = $7,
+			locked_by = NULL, completed_at = NOW(), updated_at = NOW()
+		WHERE url_hash = $8`,
+			pq.Array(emails), pq.Array(phones), socialJSON,
+			cd.BusinessName, cd.BusinessCategory, cd.Address,
+			cd.PageTitle, urlHash)
 
+		redisClient.Del(ctx, "enrich:lock:"+urlHash)
 		c.emailsFound.Add(int64(len(emails)))
 		c.phonesFound.Add(int64(len(phones)))
 
-		slog.Debug("enrich: page done",
-			"url", pageURL,
-			"emails", len(emails),
-			"phones", len(phones),
-			"worker", workerID)
+		slog.Debug("enrich: page done", "url", pageURL, "emails", len(emails), "phones", len(phones), "worker", workerID)
 	}
 }
 
-// queueContactPages generates contact page candidate URLs and queues them.
-// Zero DB — pushes to Redis result queue for persister + enrich queue for workers.
-func (c *EnrichStage) queueContactPages(ctx context.Context, pageURL, domain string, job *foxhound.Job) {
-	u, err := url.Parse(pageURL)
-	if err != nil {
-		return
-	}
-
-	queryID := queryIDFromMeta(job.Meta)
-
-	queueKey := "serp:queue:enrich"
-	redisClient := c.dedup.Client()
-
-	// Backpressure: skip contact page expansion when enrich queue is over cap.
-	depth, _ := redisClient.ZCard(ctx, queueKey).Result()
-	if depth > 50000 {
-		return
-	}
-
-	for _, path := range contactPagePaths {
-		contactURL := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, path)
-		contactHash := dedup.HashURL(contactURL)
-
-		// Push contact page creation to persister (DB INSERTs deferred).
-		cpResult := persist.EnrichResult{
-			URLHash:     contactHash,
-			Status:      "contact_page",
-			Website:     domain,      // reuse: domain
-			Address:     contactURL,  // reuse: url
-			AttemptIncr: int(queryID), // reuse: queryID
-		}
-		cpData, _ := json.Marshal(cpResult)
-		redisClient.RPush(ctx, persist.KeyResultEnrich, string(cpData))
-
-		// Push to enrich queue immediately.
-		pushData := &foxhound.Job{
-			ID:        fmt.Sprintf("enrich-%s", contactHash[:12]),
-			URL:       contactURL,
-			Method:    "GET",
-			Priority:  foxhound.PriorityNormal,
-			CreatedAt: time.Now(),
-			Meta: map[string]any{
-				"query_id": queryID,
-				"url_hash": contactHash,
-			},
-		}
-		data, _ := json.Marshal(pushData)
-		micros := pushData.CreatedAt.UnixMicro()
-		score := -(float64(pushData.Priority) * 1_000_000_000) + float64(micros)
-		redisClient.ZAdd(ctx, queueKey, redis.Z{Score: score, Member: string(data)})
-	}
-
-	slog.Debug("enrich: contact pages queued", "domain", domain, "count", len(contactPagePaths))
-}
-
-// buildSocialLinks converts ContactData social fields into a map for JSONB storage.
 func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 	links := map[string]string{}
 	if cd == nil {
@@ -770,52 +543,12 @@ func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 	return links
 }
 
-// validateEmails delegates to MordibouncerClient.FilterValid (10s per-email timeout, fail-open).
 func (c *EnrichStage) validateEmails(ctx context.Context, emails []string) []string {
 	return c.validator.FilterValid(ctx, emails)
 }
 
-// queryIDFromMeta extracts query_id from job metadata (handles float64 from JSON unmarshal).
-func queryIDFromMeta(meta map[string]any) int64 {
-	if qid, ok := meta["query_id"]; ok {
-		switch v := qid.(type) {
-		case float64:
-			return int64(v)
-		case int64:
-			return v
-		}
-	}
-	return 0
-}
-
-// popFromQueue pops a job from a Redis sorted set queue (ZPOPMIN).
-func popFromQueue(ctx context.Context, client *redis.Client, queueKey string) (*foxhound.Job, error) {
-	results, err := client.ZPopMin(ctx, queueKey, 1).Result()
-	if err != nil {
-		return nil, err
-	}
-	if len(results) == 0 {
-		return nil, nil
-	}
-
-	raw, ok := results[0].Member.(string)
-	if !ok {
-		return nil, fmt.Errorf("unexpected member type %T", results[0].Member)
-	}
-
-	var job foxhound.Job
-	if err := json.Unmarshal([]byte(raw), &job); err != nil {
-		return nil, fmt.Errorf("unmarshal job: %w", err)
-	}
-	return &job, nil
-}
-
 func fetchStealthOnly(ctx context.Context, stealth *fetch.StealthFetcher, pageURL, jobID string) (string, error) {
-	resp, err := stealth.Fetch(ctx, &foxhound.Job{
-		ID:     jobID,
-		URL:    pageURL,
-		Method: "GET",
-	})
+	resp, err := stealth.Fetch(ctx, &foxhound.Job{ID: jobID, URL: pageURL, Method: "GET"})
 	if err != nil {
 		return "", err
 	}
@@ -828,35 +561,8 @@ func fetchStealthOnly(ctx context.Context, stealth *fetch.StealthFetcher, pageUR
 	return string(resp.Body), nil
 }
 
-// pushToEnrichQueue pushes a job to the Redis enrich queue.
-func (c *EnrichStage) pushToEnrichQueue(ctx context.Context, queueKey, pageURL, urlHash string, queryID int64) {
-	pushData := &foxhound.Job{
-		ID:        fmt.Sprintf("enrich-%s", urlHash[:12]),
-		URL:       pageURL,
-		Method:    "GET",
-		Priority:  foxhound.PriorityNormal,
-		CreatedAt: time.Now(),
-		Meta:      map[string]any{"query_id": queryID, "url_hash": urlHash},
-	}
-	data, _ := json.Marshal(pushData)
-	micros := pushData.CreatedAt.UnixMicro()
-	score := -(float64(pushData.Priority) * 1_000_000_000) + float64(micros)
-	c.dedup.Client().ZAdd(ctx, queueKey, redis.Z{Score: score, Member: string(data)})
-}
-
-// isPermanentError returns true for HTTP errors that will never succeed on retry.
-// NOTE: HTTP 403 removed — with rotating proxy, a different IP may succeed.
-// Blocked domains are handled by isSkipDomain() before fetching.
 func isPermanentError(errMsg string) bool {
-	permanent := []string{
-		"HTTP 404",
-		"HTTP 410",
-		"HTTP 451",
-		"certificate",
-		"x509",
-		"no such host",
-		"server misbehaving",
-	}
+	permanent := []string{"HTTP 404", "HTTP 410", "HTTP 451", "certificate", "x509", "no such host", "server misbehaving"}
 	lower := strings.ToLower(errMsg)
 	for _, p := range permanent {
 		if strings.Contains(lower, strings.ToLower(p)) {
@@ -866,17 +572,6 @@ func isPermanentError(errMsg string) bool {
 	return false
 }
 
-// PagesProcessed returns the count of processed pages.
-func (c *EnrichStage) PagesProcessed() int64 {
-	return c.pagesProcessed.Load()
-}
-
-// EmailsFound returns the count of discovered emails.
-func (c *EnrichStage) EmailsFound() int64 {
-	return c.emailsFound.Load()
-}
-
-// PhonesFound returns the count of discovered phones.
-func (c *EnrichStage) PhonesFound() int64 {
-	return c.phonesFound.Load()
-}
+func (c *EnrichStage) PagesProcessed() int64 { return c.pagesProcessed.Load() }
+func (c *EnrichStage) EmailsFound() int64    { return c.emailsFound.Load() }
+func (c *EnrichStage) PhonesFound() int64    { return c.phonesFound.Load() }

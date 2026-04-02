@@ -18,7 +18,8 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 	// Table counts.
 	tables := map[string]string{
 		"queries": "queries", "serp_jobs": "serp_jobs",
-		"websites": "websites", "enrich_jobs": "enrich_jobs",
+		"enrichment_jobs": "enrichment_jobs", "emails": "emails",
+		"business_listings": "business_listings",
 	}
 	for key, table := range tables {
 		var total int
@@ -26,23 +27,15 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 		stats[key+"_total"] = total
 	}
 
-	// Queue depths from Redis.
-	queues := []string{"serp:queue:queries", "serp:queue:serp", "serp:queue:enrich"}
+	// Queue depths from Redis (buffers are LISTs, queries queue is sorted set).
 	queueStats := map[string]int64{}
-	for _, q := range queues {
-		depth, _ := s.redis.ZCard(ctx, q).Result()
-		queueStats[q] = depth
-	}
+	qDepth, _ := s.redis.ZCard(ctx, "serp:queue:queries").Result()
+	queueStats["serp:queue:queries"] = qDepth
+	serpBuf, _ := s.redis.LLen(ctx, "serp:buffer").Result()
+	queueStats["serp:buffer"] = serpBuf
+	enrichBuf, _ := s.redis.LLen(ctx, "enrich:buffer").Result()
+	queueStats["enrich:buffer"] = enrichBuf
 	stats["queues"] = queueStats
-
-	// Dedup sizes.
-	dedups := []string{"serp:dedup:urls", "serp:dedup:domains"}
-	dedupStats := map[string]int64{}
-	for _, d := range dedups {
-		size, _ := s.redis.SCard(ctx, d).Result()
-		dedupStats[d] = size
-	}
-	stats["dedup"] = dedupStats
 
 	writeJSON(w, http.StatusOK, stats)
 }
@@ -50,7 +43,7 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
-	// ── Queries ──
+	// -- Queries --
 	queries := map[string]int{}
 	qRows, _ := s.db.Query(`SELECT status, COUNT(*) FROM queries GROUP BY status`)
 	if qRows != nil {
@@ -68,7 +61,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	queries["total"] = qTotal
 
-	// ── SERP Jobs ──
+	// -- SERP Jobs --
 	serp := map[string]any{}
 	var serpTotal, serpNew, serpProcessing, serpCompleted, serpFailed int
 	var serpURLsFound, serpPerHour, serpToday int
@@ -93,19 +86,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	serp["rate_per_hour"] = serpPerHour
 	serp["today"] = serpToday
 
-	// ── Websites ──
-	var webTotal, webPending, webCompleted int
-	s.db.QueryRow(`
-		SELECT COUNT(*),
-			COUNT(*) FILTER (WHERE status = 'pending'),
-			COUNT(*) FILTER (WHERE status = 'completed')
-		FROM websites
-	`).Scan(&webTotal, &webPending, &webCompleted)
-	websites := map[string]int{
-		"total": webTotal, "pending": webPending, "completed": webCompleted,
-	}
-
-	// ── Enrich Jobs ──
+	// -- Enrich Jobs --
 	enrich := map[string]any{}
 	var enrichTotal, enrichPending, enrichProcessing, enrichCompleted, enrichFailed, enrichDead int
 	var enrichPerHour, enrichToday int
@@ -119,7 +100,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			COUNT(*) FILTER (WHERE status = 'dead'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
 			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
-		FROM enrich_jobs
+		FROM enrichment_jobs
 	`).Scan(&enrichTotal, &enrichPending, &enrichProcessing, &enrichCompleted, &enrichFailed, &enrichDead, &enrichPerHour, &enrichToday)
 	enrich["total"] = enrichTotal
 	enrich["pending"] = enrichPending
@@ -130,22 +111,15 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	enrich["rate_per_hour"] = enrichPerHour
 	enrich["today"] = enrichToday
 
-	// ── Contacts (from completed enrich_jobs) ──
+	// -- Contacts (from normalized tables) --
 	contacts := map[string]any{}
-	var totalWithEmail, totalEmails, uniqueEmails, emailsToday, emailsLastHour, uniqueDomains int
-	s.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE array_length(emails, 1) > 0),
-			(SELECT COUNT(e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours'),
-			(SELECT COUNT(DISTINCT e) FROM enrich_jobs, unnest(emails) AS e WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			COUNT(DISTINCT domain) FILTER (WHERE status = 'completed')
-		FROM enrich_jobs
-		WHERE status = 'completed'
-	`).Scan(&totalWithEmail, &totalEmails, &uniqueEmails, &emailsToday, &emailsLastHour, &uniqueDomains)
+	var totalEmails, uniqueEmails, emailsToday, emailsLastHour, uniqueDomains int
+	s.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&totalEmails)
+	uniqueEmails = totalEmails // emails table has UNIQUE constraint, so total == unique
+	s.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
+	s.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsLastHour)
+	s.db.QueryRow(`SELECT COUNT(DISTINCT domain) FROM business_listings`).Scan(&uniqueDomains)
 
-	contacts["total_with_email"] = totalWithEmail
 	contacts["total_emails"] = totalEmails
 	contacts["unique_emails"] = uniqueEmails
 	contacts["emails_today"] = emailsToday
@@ -153,10 +127,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	// Top email providers.
 	providerRows, _ := s.db.Query(`
-		SELECT split_part(e, '@', 2) AS provider, COUNT(*) AS cnt
-		FROM enrich_jobs, unnest(emails) AS e
-		WHERE status = 'completed'
-		GROUP BY provider ORDER BY cnt DESC LIMIT 10
+		SELECT domain, COUNT(*) AS cnt
+		FROM emails
+		GROUP BY domain ORDER BY cnt DESC LIMIT 10
 	`)
 	providers := map[string]int{}
 	if providerRows != nil {
@@ -171,64 +144,53 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	contacts["providers"] = providers
 	contacts["unique_domains"] = uniqueDomains
 
-	// ── Queues (Redis) ──
+	// -- Queues (Redis) --
 	queueMap := map[string]int64{}
-	for _, q := range []string{"serp:queue:queries", "serp:queue:serp", "serp:queue:enrich"} {
-		depth, _ := s.redis.ZCard(ctx, q).Result()
-		queueMap[q] = depth
-	}
-
-	// ── Dedup (Redis) ──
-	dedupMap := map[string]int64{}
-	for _, d := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
-		size, _ := s.redis.SCard(ctx, d).Result()
-		dedupMap[d] = size
-	}
+	qd, _ := s.redis.ZCard(ctx, "serp:queue:queries").Result()
+	queueMap["serp:queue:queries"] = qd
+	sb, _ := s.redis.LLen(ctx, "serp:buffer").Result()
+	queueMap["serp:buffer"] = sb
+	eb, _ := s.redis.LLen(ctx, "enrich:buffer").Result()
+	queueMap["enrich:buffer"] = eb
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"queries":  queries,
 		"serp":     serp,
-		"websites": websites,
 		"enrich":   enrich,
 		"contacts": contacts,
 		"queues":   queueMap,
-		"dedup":    dedupMap,
 	})
 }
 
 func (s *Server) handlePipelineReset(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Dedup  bool `json:"dedup"`
 		Queues bool `json:"queues"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	if !req.Dedup && !req.Queues {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "specify dedup and/or queues to reset"})
+	if !req.Queues {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "specify queues to reset"})
 		return
 	}
 	ctx := context.Background()
 	cleared := map[string]int64{}
-	if req.Dedup {
-		for _, key := range []string{"serp:dedup:urls", "serp:dedup:domains"} {
-			n, _ := s.redis.SCard(ctx, key).Result()
-			s.redis.Del(ctx, key)
-			cleared[key] = n
-		}
+	// Clear buffers.
+	for _, key := range []string{"serp:buffer", "enrich:buffer"} {
+		n, _ := s.redis.LLen(ctx, key).Result()
+		s.redis.Del(ctx, key)
+		cleared[key] = n
 	}
-	if req.Queues {
-		for _, key := range []string{"serp:queue:queries", "serp:queue:serp", "serp:queue:enrich"} {
-			n, _ := s.redis.ZCard(ctx, key).Result()
-			s.redis.Del(ctx, key)
-			cleared[key] = n
-		}
-	}
+	// Clear query queue.
+	n, _ := s.redis.ZCard(ctx, "serp:queue:queries").Result()
+	s.redis.Del(ctx, "serp:queue:queries")
+	cleared["serp:queue:queries"] = n
+
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": cleared})
 }
 
-// ── Debug ──
+// -- Debug --
 
 func (s *Server) handleDebugSerpJobs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -299,8 +261,8 @@ func (s *Server) handleDebugEnrichJobs(w http.ResponseWriter, r *http.Request) {
 
 	query := fmt.Sprintf(`
 		SELECT id, domain, url, status, attempt_count, max_attempts,
-		       COALESCE(error_msg,''), emails, phones, created_at, updated_at
-		FROM enrich_jobs %s
+		       COALESCE(error_msg,''), raw_emails, raw_phones, created_at, updated_at
+		FROM enrichment_jobs %s
 		ORDER BY created_at DESC
 		LIMIT $%d
 	`, where, argIdx)
@@ -332,7 +294,7 @@ func (s *Server) handleDebugEnrichJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, jobs)
 }
 
-// ── Health ──
+// -- Health --
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	health := map[string]string{"status": "ok"}

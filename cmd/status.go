@@ -42,20 +42,13 @@ func RunStatus(cfg *config.Config) error {
 	}
 
 	printTable("Queries", status.Queries)
-	printTable("SERP Seeds", status.Seeds)
-	printTable("Websites", status.Websites)
-	printTable("Contacts", status.Contacts)
+	printTable("SERP Jobs", status.Seeds)
+	printTable("Enrichment", status.Enrich)
 
 	fmt.Println()
-	fmt.Println("--- Redis Queues ---")
+	fmt.Println("--- Redis Buffers ---")
 	for _, q := range status.Queues {
 		fmt.Printf("  %-30s depth: %d\n", q.Name, q.Depth)
-	}
-
-	fmt.Println()
-	fmt.Println("--- Dedup Sets ---")
-	for _, d := range status.Dedup {
-		fmt.Printf("  %-30s size: %d\n", d.Name, d.Size)
 	}
 
 	return nil
