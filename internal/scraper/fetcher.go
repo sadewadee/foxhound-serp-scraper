@@ -20,13 +20,8 @@ import (
 // NewSERPBrowser creates a Camoufox browser optimized for Google SERP scraping.
 // Uses persistent session, page pooling, and geo-matched identity.
 func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
-	// Generate identity with geo-matching if proxy is set.
-	idOpts := []identity.Option{identity.WithBrowser(identity.BrowserFirefox)}
-	if cfg.Proxy.URL != "" {
-		// Geo-match identity to proxy for consistent timezone/locale.
-		idOpts = append(idOpts, identity.WithCountry("ID")) // Default Indonesia
-	}
-	profile := identity.Generate(idOpts...)
+	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+	bp := behavior.CarefulProfile().Jitter()
 
 	headless := "virtual"
 	if !cfg.Fetch.Headless {
@@ -40,17 +35,14 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		fetch.WithHeadless(headless),
 		fetch.WithBlockImages(cfg.Fetch.BlockImages),
 		fetch.WithBrowserTimeout(browserTimeout),
-
-		// Session persistence — maintain cookies across requests.
-		// Google won't re-captcha every page if session persists.
 		fetch.WithPersistSession(true),
-
-		// Rotate browser after N requests to avoid fingerprint accumulation.
-		// Uses half of SERP max since single-browser mode is more conservative.
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests / 2),
-
-		// Page pooling — reuse warm pages, eliminates ~3s overhead per request.
 		fetch.WithPoolSize(3),
+		// Anti-detection (foxhound v0.0.9):
+		fetch.WithBehaviorProfile(bp),
+		fetch.WithPageReuseLimit(100),
+		fetch.WithStorageState("/tmp/serp-session-single.json"),
+		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithBrowserProxy(cfg.Proxy.URL))
@@ -68,16 +60,16 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 // share a single browser process — each goroutine acquires a pool slot, fetches,
 // then releases. MaxBrowserRequests is set to 200 to match the lifecycle limit.
 func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetcher, error) {
-	idOpts := []identity.Option{identity.WithBrowser(identity.BrowserFirefox)}
-	if cfg.Proxy.URL != "" {
-		idOpts = append(idOpts, identity.WithCountry("ID"))
-	}
-	profile := identity.Generate(idOpts...)
+	// Random identity (no hardcoded country — diverse profiles avoid clustering).
+	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
 
 	headless := "virtual"
 	if !cfg.Fetch.Headless {
 		headless = "false"
 	}
+
+	// Jittered CarefulProfile — max stealth mouse/scroll/keyboard, ±15% per session.
+	bp := behavior.CarefulProfile().Jitter()
 
 	browserTimeout := time.Duration(cfg.Fetch.BrowserTimeoutSec) * time.Second
 
@@ -89,6 +81,11 @@ func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFe
 		fetch.WithPersistSession(true),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests),
 		fetch.WithPoolSize(poolSize),
+		// Anti-detection (foxhound v0.0.9):
+		fetch.WithBehaviorProfile(bp),                // careful mouse/scroll/keyboard
+		fetch.WithPageReuseLimit(100),                 // recycle pages to avoid state buildup
+		fetch.WithStorageState("/tmp/serp-session.json"), // persist session across restarts
+		fetch.WithBrowserCookies(googleConsentCookies()), // skip consent banner
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithBrowserProxy(cfg.Proxy.URL))
@@ -119,13 +116,13 @@ func NewBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 //   Cookies/state cleared between uses (no session bleed)
 func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetcher, error) {
 	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+	bp := behavior.ModerateProfile().Jitter() // moderate for enrich (faster, less stealth needed)
 
 	headless := "virtual"
 	if !cfg.Fetch.Headless {
 		headless = "false"
 	}
 
-	// Enrich browser uses half the SERP timeout — pages are simpler than Google SERPs.
 	enrichTimeout := time.Duration(cfg.Fetch.BrowserTimeoutSec/2) * time.Second
 	if enrichTimeout < 15*time.Second {
 		enrichTimeout = 15 * time.Second
@@ -137,6 +134,10 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 		fetch.WithBlockImages(cfg.Fetch.BlockImages),
 		fetch.WithBrowserTimeout(enrichTimeout),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.EnrichMaxRequests),
+		// Anti-detection:
+		fetch.WithBehaviorProfile(bp),
+		fetch.WithPageReuseLimit(150),
+		fetch.WithStorageState("/tmp/enrich-session.json"),
 	}
 	if poolSize > 0 {
 		opts = append(opts, fetch.WithPoolSize(poolSize))
@@ -155,11 +156,8 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 // NewStealth creates a TLS-impersonating HTTP fetcher for website scraping.
 // Geo-matches identity to proxy country to avoid detection from IP/identity mismatch.
 func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
-	var idOpts []identity.Option
-	if cfg.Proxy.URL != "" {
-		idOpts = append(idOpts, identity.WithCountry("ID"))
-	}
-	profile := identity.Generate(idOpts...)
+	// Random identity for diversity — rotating proxy exits in different countries.
+	profile := identity.Generate()
 
 	opts := []fetch.StealthOption{
 		fetch.WithIdentity(profile),
@@ -303,6 +301,7 @@ func FetchWithBrowser(ctx context.Context, browser *fetch.CamoufoxFetcher, pageU
 // Only 1 tab — rate-limited to protect server IP.
 func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+	bp := behavior.CarefulProfile().Jitter()
 
 	headless := "virtual"
 	if !cfg.Fetch.Headless {
@@ -315,8 +314,13 @@ func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		fetch.WithBlockImages(true),
 		fetch.WithBrowserTimeout(60 * time.Second),
 		fetch.WithPersistSession(true),
-		fetch.WithMaxBrowserRequests(100), // conservative — protect server IP
-		fetch.WithPoolSize(1),             // single tab to limit rate
+		fetch.WithMaxBrowserRequests(100),
+		fetch.WithPoolSize(1),
+		// Anti-detection (same as proxy browser):
+		fetch.WithBehaviorProfile(bp),
+		fetch.WithPageReuseLimit(50),
+		fetch.WithStorageState("/tmp/serp-direct-session.json"),
+		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	// NO proxy — uses server IP directly.
 
@@ -326,6 +330,15 @@ func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 	}
 	slog.Info("fetch: created direct (no-proxy) SERP browser")
 	return browser, nil
+}
+
+// googleConsentCookies returns pre-baked cookies that tell Google
+// "user already accepted cookies". Eliminates consent banner entirely.
+func googleConsentCookies() []fetch.BrowserCookie {
+	return []fetch.BrowserCookie{
+		{Name: "SOCS", Value: "CAISHAgBEhJnd3NfMjAyMzA4MDktMF9SQzEaAmVuIAEaBgiA_LGYBA", Domain: ".google.com", Path: "/"},
+		{Name: "CONSENT", Value: "YES+cb.20230809-04-p0.en+FX+410", Domain: ".google.com", Path: "/"},
+	}
 }
 
 // FetchWithBrowserString fetches a page using only the browser, returns string body.

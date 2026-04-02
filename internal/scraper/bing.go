@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/PuerkitoBio/goquery"
 
@@ -73,9 +72,7 @@ func (b *BingEngine) ParseResults(body []byte) ([]string, error) {
 }
 
 func (b *BingEngine) FetchSteps() []foxhound.JobStep {
-	return []foxhound.JobStep{
-		{Action: foxhound.JobStepWait, Selector: "#b_results", Duration: 10 * time.Second, Optional: true},
-	}
+	return nil // stealth HTTP — no browser steps needed
 }
 
 func (b *BingEngine) IsCaptchaPage(body []byte) bool {
@@ -92,9 +89,9 @@ func (b *BingEngine) ExcludedDomains() []string {
 
 func (b *BingEngine) MaxPages() int { return 5 }
 
-// NeedsBrowser returns true — Bing serves captcha pages to stealth HTTP.
-// Requires browser with JS to pass Bing's bot detection.
-func (b *BingEngine) NeedsBrowser() bool { return true }
+// NeedsBrowser returns false — Bing works via stealth HTTP with proxy.
+// Browser fingerprint triggers Cloudflare Turnstile; stealth avoids it.
+func (b *BingEngine) NeedsBrowser() bool { return false }
 
 // isBingDomain returns true if the URL belongs to a Bing/Microsoft property.
 func isBingDomain(rawURL string) bool {
