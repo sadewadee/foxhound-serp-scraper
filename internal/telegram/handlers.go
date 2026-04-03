@@ -204,6 +204,22 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 			(SELECT COUNT(*) FROM emails)
 	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsYesterday, &emailsTotal)
 
+	// Worker count from DB.
+	var serpWorkers, enrichWorkers int
+	b.db.QueryRow(`SELECT
+		COUNT(*) FILTER (WHERE worker_type='serp' AND status='working'),
+		COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working')
+	FROM workers`).Scan(&serpWorkers, &enrichWorkers)
+
+	// Current rate from DB timestamps (5-min window * 12 = hourly projection).
+	var emailRate5m, serpRate5m, urlRate5m, enrichRate5m int
+	b.db.QueryRow(`SELECT
+		(SELECT COUNT(*) * 12 FROM emails WHERE created_at > NOW() - INTERVAL '5 minutes'),
+		(SELECT COUNT(*) * 12 FROM serp_jobs WHERE status='completed' AND updated_at > NOW() - INTERVAL '5 minutes'),
+		(SELECT COUNT(*) * 12 FROM serp_results WHERE created_at > NOW() - INTERVAL '5 minutes'),
+		(SELECT COUNT(*) * 12 FROM enrichment_jobs WHERE status='completed' AND completed_at > NOW() - INTERVAL '5 minutes')
+	`).Scan(&emailRate5m, &serpRate5m, &urlRate5m, &enrichRate5m)
+
 	// Queues.
 	serpBuf, _ := b.redis.LLen(ctx, "serp:buffer").Result()
 	enrichBuf, _ := b.redis.LLen(ctx, "enrich:buffer").Result()
@@ -260,6 +276,11 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		fmt.Sprintf("*Dashboard* (%s)", time.Now().Format("15:04 MST")),
 		"",
 		fmt.Sprintf("_Active:_ SERP: *%d* locks  Enrich: *%d* locks", len(serpLocks), len(enrichLocks)),
+		fmt.Sprintf("_Workers:_ SERP *%d* online  Enrich *%d* online", serpWorkers, enrichWorkers),
+		"",
+		"_Current Rate (5min window):_",
+		fmt.Sprintf("  SERP: *%s*/h  URLs: *%s*/h", fmtK(serpRate5m), fmtK(urlRate5m)),
+		fmt.Sprintf("  Enrich: *%s*/h  Emails: *%s*/h", fmtK(enrichRate5m), fmtK(emailRate5m)),
 		"",
 		"_Rates (this hr vs prev hr):_",
 		fmt.Sprintf("  SERP: *%d*/hr %s", serpHour, delta(serpHour, serpPrevHour)),
@@ -609,6 +630,35 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		for _, cs := range catStats {
 			bar := chartBar(cs.count, catMax)
 			lines = append(lines, fmt.Sprintf("  %s *%s* %s", bar, fmtK(cs.count), cs.name))
+		}
+	}
+
+	// Per-worker throughput from delta.
+	type workerRate struct {
+		id      string
+		wtype   string
+		pagesH  int
+		emailsH int
+	}
+	var wRates []workerRate
+	wRows, wErr := b.db.Query(`
+		SELECT worker_id, worker_type,
+			pages_delta * 120, emails_delta * 120
+		FROM workers WHERE status='working'
+		ORDER BY worker_type, emails_delta DESC
+	`)
+	if wErr == nil && wRows != nil {
+		for wRows.Next() {
+			var wr workerRate
+			wRows.Scan(&wr.id, &wr.wtype, &wr.pagesH, &wr.emailsH)
+			wRates = append(wRates, wr)
+		}
+		wRows.Close()
+	}
+	if len(wRates) > 0 {
+		lines = append(lines, "", "_Worker Throughput (30s delta):_")
+		for _, wr := range wRates {
+			lines = append(lines, fmt.Sprintf("  %s  %d pg/h  %d em/h", wr.id, wr.pagesH, wr.emailsH))
 		}
 	}
 

@@ -102,23 +102,9 @@ func (r *ProjectReconciler) Run(ctx context.Context) {
 func (r *ProjectReconciler) tick(ctx context.Context) {
 	snap := r.collectSnapshot(ctx)
 
-	// Compute throughput from previous snapshot.
-	r.mu.RLock()
-	prev := r.snapshot
-	r.mu.RUnlock()
-
-	if !prev.Taken.IsZero() {
-		elapsed := snap.Taken.Sub(prev.Taken).Hours()
-		if elapsed > 0 {
-			snap.SerpPerHour = int(float64(snap.SerpCompleted-prev.SerpCompleted) / elapsed)
-			snap.EnrichPerHour = int(float64(snap.EnrichCompleted-prev.EnrichCompleted) / elapsed)
-			snap.EmailsPerHour = int(float64(snap.EmailsTotal-prev.EmailsTotal) / elapsed)
-		}
-	}
-
 	// Store snapshot.
 	r.mu.Lock()
-	r.prev = prev
+	r.prev = r.snapshot
 	r.snapshot = snap
 	r.mu.Unlock()
 
@@ -177,6 +163,11 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 	// Contacts from normalized tables.
 	r.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&snap.EmailsTotal)
 	r.db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE phone IS NOT NULL AND phone != ''`).Scan(&snap.PhonesTotal)
+
+	// Throughput rates from DB timestamps (5-min window * 12 = hourly projection).
+	r.db.QueryRow(`SELECT COUNT(*) * 12 FROM emails WHERE created_at > NOW() - INTERVAL '5 minutes'`).Scan(&snap.EmailsPerHour)
+	r.db.QueryRow(`SELECT COUNT(*) * 12 FROM serp_results WHERE created_at > NOW() - INTERVAL '5 minutes'`).Scan(&snap.SerpPerHour)
+	r.db.QueryRow(`SELECT COUNT(*) * 12 FROM enrichment_jobs WHERE completed_at > NOW() - INTERVAL '5 minutes' AND status='completed'`).Scan(&snap.EnrichPerHour)
 
 	// Redis queues.
 	snap.QueueQueries, _ = r.redis.ZCard(ctx, "serp:queue:queries").Result()

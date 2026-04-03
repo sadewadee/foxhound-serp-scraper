@@ -185,8 +185,16 @@ func (c *EnrichStage) heartbeat(ctx context.Context) {
 			c.db.Exec(`UPDATE workers SET status = 'dead', last_heartbeat = NOW() WHERE worker_id = $1`, workerID)
 			return
 		case <-ticker.C:
-			c.db.Exec(`UPDATE workers SET status = 'working', pages_processed = $1, emails_found = $2, last_heartbeat = NOW() WHERE worker_id = $3`,
-				c.pagesProcessed.Load(), c.emailsFound.Load(), workerID)
+			pages := c.pagesProcessed.Load()
+			emails := c.emailsFound.Load()
+			c.db.Exec(`UPDATE workers SET
+				pages_delta = $1 - pages_prev,
+				emails_delta = $2 - emails_prev,
+				pages_prev = $1, emails_prev = $2,
+				pages_processed = $1, emails_found = $2,
+				delta_at = NOW(), last_heartbeat = NOW(),
+				status = 'working'
+			WHERE worker_id = $3`, pages, emails, workerID)
 		}
 	}
 }

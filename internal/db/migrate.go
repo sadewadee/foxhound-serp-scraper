@@ -187,6 +187,19 @@ func runMigrations(db *sql.DB) error {
 		return fmt.Errorf("db: backfill email domain/local_part: %w", err)
 	}
 
+	// Add delta tracking columns to workers for per-heartbeat rate calculation.
+	for _, stmt := range []string{
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_prev BIGINT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_prev BIGINT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_delta INT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_delta INT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS delta_at TIMESTAMPTZ`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("db: worker delta columns: %w", err)
+		}
+	}
+
 	// --- Triggers ---
 
 	// Trigger 1: serp_results INSERT -> create enrichment_job.
