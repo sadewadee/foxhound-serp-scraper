@@ -147,6 +147,8 @@ services:
       TZ: "${TZ:-Asia/Jakarta}"
     shm_size: "512mb"
     command: ["run", "-stage", "serp", "-workers", "${SERP_CONCURRENCY:-4}"]
+    volumes:
+      - serp_sessions:/home/scraper/.sessions
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
       interval: 30s
@@ -239,6 +241,8 @@ volumes:
   postgres_data:
     driver: local
   redis_data:
+    driver: local
+  serp_sessions:
     driver: local
 
 networks:

@@ -119,6 +119,16 @@ func (s *SERPStage) Run(ctx context.Context) error {
 
 	slog.Info("serp: starting", "concurrency", concurrency)
 
+	// Warm-up: visit Google homepage to establish cookies before real traffic.
+	// This builds initial trust with Google's session system.
+	slog.Info("serp: warming up browser — visiting google.com")
+	browser.Fetch(ctx, &foxhound.Job{
+		ID: "warmup", URL: "https://www.google.com/", Method: "GET",
+		FetchMode: foxhound.FetchBrowser,
+	})
+	time.Sleep(3 * time.Second)
+	slog.Info("serp: warm-up done")
+
 	go touchHealthFile(ctx, "/tmp/worker-healthy")
 	go s.heartbeat(ctx)
 	go s.reconciler(ctx)

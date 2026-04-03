@@ -33,15 +33,10 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
-		fetch.WithBlockImages(cfg.Fetch.BlockImages),
 		fetch.WithBrowserTimeout(browserTimeout),
-		fetch.WithPersistSession(true),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests / 2),
-		fetch.WithPoolSize(3),
-		// Anti-detection (foxhound v0.0.9):
 		fetch.WithBehaviorProfile(bp),
-		fetch.WithPageReuseLimit(100),
-		fetch.WithStorageState("/tmp/serp-session-single.json"),
+		fetch.WithUserDataDir("/home/scraper/.sessions/serp-profile-single"),
 		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	if cfg.Proxy.URL != "" {
@@ -76,16 +71,16 @@ func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFe
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
-		fetch.WithBlockImages(cfg.Fetch.BlockImages),
+		// NO BlockImages for SERP — Google detects missing subresource loading.
+		// Real browsers always load images; blocking is a bot signal.
 		fetch.WithBrowserTimeout(browserTimeout),
-		fetch.WithPersistSession(true),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests),
-		fetch.WithPoolSize(poolSize),
-		// Anti-detection (foxhound v0.0.9):
-		fetch.WithBehaviorProfile(bp),                // careful mouse/scroll/keyboard
-		fetch.WithPageReuseLimit(100),                 // recycle pages to avoid state buildup
-		fetch.WithStorageState("/tmp/serp-session.json"), // persist session across restarts
+		// Anti-detection (foxhound v0.0.10):
+		fetch.WithBehaviorProfile(bp),                    // careful mouse/scroll/keyboard
+		fetch.WithUserDataDir("/home/scraper/.sessions/serp-profile"), // full browser profile persistence (cookies, localStorage, cache)
 		fetch.WithBrowserCookies(googleConsentCookies()), // skip consent banner
+		// NopeCHA extension stays enabled — v0.0.10 fixes the solve gate.
+		// Extension now actually solves reCAPTCHA/Turnstile when encountered.
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithBrowserProxy(cfg.Proxy.URL))
@@ -311,15 +306,11 @@ func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
-		fetch.WithBlockImages(true),
+		// NO BlockImages — same as proxy browser, avoid detection.
 		fetch.WithBrowserTimeout(60 * time.Second),
-		fetch.WithPersistSession(true),
 		fetch.WithMaxBrowserRequests(100),
-		fetch.WithPoolSize(1),
-		// Anti-detection (same as proxy browser):
 		fetch.WithBehaviorProfile(bp),
-		fetch.WithPageReuseLimit(50),
-		fetch.WithStorageState("/tmp/serp-direct-session.json"),
+		fetch.WithUserDataDir("/home/scraper/.sessions/serp-direct-profile"),
 		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	// NO proxy — uses server IP directly.
