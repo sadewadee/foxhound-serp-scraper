@@ -166,13 +166,10 @@ func runMigrations(db *sql.DB) error {
 		return fmt.Errorf("db: create extension pgcrypto: %w", err)
 	}
 
-	// Drop legacy tables from pre-redesign schema.
-	if _, err := db.Exec(`DROP TABLE IF EXISTS enrich_jobs CASCADE`); err != nil {
-		return fmt.Errorf("db: drop enrich_jobs: %w", err)
-	}
-	if _, err := db.Exec(`DROP TABLE IF EXISTS websites CASCADE`); err != nil {
-		return fmt.Errorf("db: drop websites: %w", err)
-	}
+	// GUARDRAIL: Legacy tables renamed to _backup, NEVER dropped.
+	// Incident 2026-04-03: DROP TABLE destroyed 344K emails. Never again.
+	db.Exec(`ALTER TABLE IF EXISTS enrich_jobs RENAME TO enrich_jobs_backup`)
+	db.Exec(`ALTER TABLE IF EXISTS websites RENAME TO websites_backup`)
 
 	// Add picked_at column to serp_jobs if missing (from redesign).
 	if _, err := db.Exec(`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`); err != nil {
