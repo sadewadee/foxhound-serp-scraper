@@ -47,8 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_serp_jobs_status ON serp_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_serp_engine ON serp_jobs(engine, status);
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_updated_at ON serp_jobs(updated_at) WHERE status = 'completed';
 CREATE INDEX IF NOT EXISTS idx_serp_locked ON serp_jobs(locked_at) WHERE status = 'processing';
-CREATE INDEX IF NOT EXISTS idx_serp_feed ON serp_jobs(created_at) WHERE status = 'new' AND picked_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_serp_stale ON serp_jobs(picked_at) WHERE status = 'new' AND picked_at IS NOT NULL;
+-- idx_serp_feed and idx_serp_stale created in runMigrations (after ALTER ADD COLUMN picked_at).
 
 CREATE TABLE IF NOT EXISTS serp_results (
     id              BIGSERIAL PRIMARY KEY,
