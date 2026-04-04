@@ -177,8 +177,13 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 		rows.Close()
 
 		if len(batch) == 0 {
-			slog.Info("backfill: all existing emails validated", "total_validated", validated, "total_removed", removed)
-			return // Done — no more unvalidated records.
+			slog.Info("backfill: caught up, sleeping 60s", "total_validated", validated, "total_removed", removed)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(60 * time.Second):
+			}
+			continue
 		}
 
 		for _, e := range batch {

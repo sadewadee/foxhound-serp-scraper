@@ -88,6 +88,8 @@ services:
       API_KEY: "${API_KEY}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
+      MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
+      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
       TZ: "${TZ:-Asia/Jakarta}"
     command: ["run", "-stage", "none"]
     healthcheck:

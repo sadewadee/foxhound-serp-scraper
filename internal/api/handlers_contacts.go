@@ -59,7 +59,8 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.opening_hours,''), COALESCE(bl.rating,''),
 		       COALESCE(bl.page_title,''), bl.created_at,
 		       COALESCE(
-		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id),
+		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id
+		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending')),
 		         '{}'
 		       ) AS emails,
 		       COALESCE(bl.phone, '') AS phone
@@ -143,7 +144,8 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.address,''), COALESCE(bl.location,''),
 		       COALESCE(bl.phone,''),
 		       COALESCE(
-		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id),
+		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id
+		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending')),
 		         '{}'
 		       ) AS emails
 		FROM business_listings bl %s ORDER BY bl.id ASC
@@ -204,6 +206,7 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 	var totalBiz, withEmail, uniqueDomains, totalEmails, lastHour, last24h int
+	var validEmails, pendingEmails, invalidEmails int
 
 	s.db.QueryRow("SELECT COUNT(*) FROM business_listings").Scan(&totalBiz)
 	s.db.QueryRow("SELECT COUNT(DISTINCT bl.id) FROM business_listings bl JOIN business_emails be ON be.business_id = bl.id").Scan(&withEmail)
@@ -211,6 +214,9 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 	s.db.QueryRow("SELECT COUNT(*) FROM emails").Scan(&totalEmails)
 	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
 	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
+	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE validation_status = 'valid'").Scan(&validEmails)
+	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE validation_status = 'pending'").Scan(&pendingEmails)
+	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE validation_status = 'invalid'").Scan(&invalidEmails)
 
 	// Top email providers.
 	providers := map[string]int{}
@@ -239,6 +245,11 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 		"last_hour":      lastHour,
 		"last_24h":       last24h,
 		"providers":      providers,
+		"validation": map[string]int{
+			"valid":   validEmails,
+			"pending": pendingEmails,
+			"invalid": invalidEmails,
+		},
 	})
 }
 

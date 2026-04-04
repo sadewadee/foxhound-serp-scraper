@@ -24,7 +24,6 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/directory"
 	"github.com/sadewadee/serp-scraper/internal/feeder"
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
-	"github.com/sadewadee/serp-scraper/internal/validate"
 )
 
 var blockedDomains = map[string]bool{
@@ -66,10 +65,9 @@ func isSkipDomain(domain string) bool {
 }
 
 type EnrichStage struct {
-	cfg       *config.Config
-	db        *sql.DB
-	dedup     *dedup.Store
-	validator *validate.MordibouncerClient
+	cfg   *config.Config
+	db    *sql.DB
+	dedup *dedup.Store
 
 	browserMu     sync.Mutex
 	sharedBrowser *fetch.CamoufoxFetcher
@@ -89,15 +87,10 @@ func NewEnrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Enri
 	browserFactory := func(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		return internalScraper.NewBrowserWithPool(cfg, cfg.Enrich.Concurrency)
 	}
-	validator := validate.NewMordibouncer(&cfg.Mordibouncer)
-	if validator != nil {
-		slog.Info("enrich: Mordibouncer email validation enabled", "api", cfg.Mordibouncer.APIURL)
-	}
 	return &EnrichStage{
 		cfg:          cfg,
 		db:           database,
 		dedup:        dd,
-		validator:    validator,
 		lifecycle:    internalScraper.NewBrowserLifecycle(cfg, browserFactory, "enrich"),
 		domainScorer: internalScraper.NewDomainScorer(cfg),
 	}
@@ -474,9 +467,6 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 
 			allEmails := internalScraper.FilterEmails(rawEmails)
 			allPhones := internalScraper.FilterPhones(rawPhones)
-			if c.validator != nil && len(allEmails) > 0 {
-				allEmails = c.validateEmails(ctx, allEmails)
-			}
 			socialLinks := buildSocialLinks(nil)
 			socialJSON, _ := json.Marshal(socialLinks)
 
@@ -497,9 +487,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		emails := internalScraper.FilterEmails(cd.Emails)
 		phones := internalScraper.FilterPhones(cd.Phones)
 
-		if c.validator != nil && len(emails) > 0 {
-			emails = c.validateEmails(ctx, emails)
-		} else if c.cfg.Enrich.ValidateMX && len(emails) > 0 {
+		if c.cfg.Enrich.ValidateMX && len(emails) > 0 {
 			if !internalScraper.ValidateMX(emails[0]) {
 				emails = nil
 			}
@@ -549,10 +537,6 @@ func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 		links["whatsapp"] = cd.WhatsApp
 	}
 	return links
-}
-
-func (c *EnrichStage) validateEmails(ctx context.Context, emails []string) []string {
-	return c.validator.FilterValid(ctx, emails)
 }
 
 func fetchStealthOnly(ctx context.Context, stealth *fetch.StealthFetcher, pageURL, jobID string) (string, error) {
