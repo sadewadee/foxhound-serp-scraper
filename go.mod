@@ -7,7 +7,7 @@ require (
 	github.com/lib/pq v1.11.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0
-	github.com/sadewadee/foxhound v0.0.11
+	github.com/sadewadee/foxhound v0.0.13
 	gopkg.in/yaml.v3 v3.0.1
 )
 
