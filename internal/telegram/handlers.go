@@ -204,12 +204,17 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 			(SELECT COUNT(*) FROM emails)
 	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsYesterday, &emailsTotal)
 
-	// Worker count from DB.
-	var serpWorkers, enrichWorkers int
+	// Worker count from DB: online (heartbeat recent), busy (delta>0), idle (delta=0), dead.
+	var serpOnline, serpBusy, serpDead, enrichOnline, enrichBusy, enrichDead, totalWorkers int
 	b.db.QueryRow(`SELECT
-		COUNT(*) FILTER (WHERE worker_type='serp' AND status='working'),
-		COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working')
-	FROM workers`).Scan(&serpWorkers, &enrichWorkers)
+		COUNT(*) FILTER (WHERE worker_type='serp' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes'),
+		COUNT(*) FILTER (WHERE worker_type='serp' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes' AND pages_delta > 0),
+		COUNT(*) FILTER (WHERE worker_type='serp' AND (status='dead' OR last_heartbeat < NOW() - INTERVAL '2 minutes')),
+		COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes'),
+		COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes' AND pages_delta > 0),
+		COUNT(*) FILTER (WHERE worker_type='enrich' AND (status='dead' OR last_heartbeat < NOW() - INTERVAL '2 minutes')),
+		COUNT(*)
+	FROM workers`).Scan(&serpOnline, &serpBusy, &serpDead, &enrichOnline, &enrichBusy, &enrichDead, &totalWorkers)
 
 	// Current rate from DB timestamps (5-min window * 12 = hourly projection).
 	var emailRate5m, serpRate5m, urlRate5m, enrichRate5m int
@@ -276,7 +281,9 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		fmt.Sprintf("*Dashboard* (%s)", time.Now().Format("15:04 MST")),
 		"",
 		fmt.Sprintf("_Active:_ SERP: *%d* locks  Enrich: *%d* locks", len(serpLocks), len(enrichLocks)),
-		fmt.Sprintf("_Workers:_ SERP *%d* online  Enrich *%d* online", serpWorkers, enrichWorkers),
+		fmt.Sprintf("_Workers (%d total):_", totalWorkers),
+		fmt.Sprintf("  SERP: *%d* online (%d busy, %d idle) %d dead", serpOnline, serpBusy, serpOnline-serpBusy, serpDead),
+		fmt.Sprintf("  Enrich: *%d* online (%d busy, %d idle) %d dead", enrichOnline, enrichBusy, enrichOnline-enrichBusy, enrichDead),
 		"",
 		"_Current Rate (5min window):_",
 		fmt.Sprintf("  SERP: *%s*/h  URLs: *%s*/h", fmtK(serpRate5m), fmtK(urlRate5m)),
