@@ -78,7 +78,9 @@ func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPSt
 		circuitBreaker: scraper.NewCircuitBreaker(cfg),
 		fatigue:        scraper.NewSessionFatigue(cfg),
 	}
-	s.lifecycle = scraper.NewBrowserLifecycle(cfg, scraper.NewSERPBrowser, "serp")
+	s.lifecycle = scraper.NewBrowserLifecycle(cfg, func(c *config.Config) (*fetch.CamoufoxFetcher, error) {
+		return scraper.NewSERPBrowserWithPool(c, c.SERP.Concurrency)
+	}, "serp")
 	return s
 }
 
@@ -346,8 +348,10 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			continue
 		}
 
-		// DB claim: mark processing.
-		s.db.Exec(`UPDATE serp_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW() WHERE id = $2 AND status = 'new'`, workerID, job.ID)
+		// DB claim: set locked_by on the job the feeder already marked 'processing'.
+		// The feeder transitions status new→processing when pushing to serp:buffer,
+		// so we match on 'processing' (not 'new') to set ownership.
+		s.db.Exec(`UPDATE serp_jobs SET locked_by = $1, locked_at = NOW(), updated_at = NOW() WHERE id = $2 AND status = 'processing'`, workerID, job.ID)
 
 		// --- Fetch SERP page ---
 		var body []byte

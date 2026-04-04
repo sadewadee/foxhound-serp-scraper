@@ -36,7 +36,10 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		fetch.WithBrowserTimeout(browserTimeout),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests / 2),
 		fetch.WithBehaviorProfile(bp),
-		fetch.WithUserDataDir("/home/scraper/.sessions/serp-profile-single"),
+		// No WithUserDataDir — persistent context serializes all page operations
+		// through a single Playwright channel, killing concurrency.
+		// Use StorageState for cookie/session persistence across restarts instead.
+		fetch.WithStorageState("/home/scraper/.sessions/serp-session.json"),
 		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	if cfg.Proxy.URL != "" {
@@ -77,8 +80,15 @@ func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFe
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests),
 		// Anti-detection (foxhound v0.0.10):
 		fetch.WithBehaviorProfile(bp),                    // careful mouse/scroll/keyboard
-		fetch.WithUserDataDir("/home/scraper/.sessions/serp-profile"), // full browser profile persistence (cookies, localStorage, cache)
 		fetch.WithBrowserCookies(googleConsentCookies()), // skip consent banner
+		// Page pool: each tab worker gets its own isolated BrowserContext+Page.
+		// WithUserDataDir uses LaunchPersistentContext which funnels ALL pages
+		// through a single context — Playwright serializes operations and one
+		// slow/stuck page blocks every other goroutine. Pool mode gives true
+		// concurrency with per-slot context isolation.
+		fetch.WithPoolSize(poolSize),
+		fetch.WithPageReuseLimit(150),
+		fetch.WithStorageState("/home/scraper/.sessions/serp-session.json"),
 		// NopeCHA extension stays enabled — v0.0.10 fixes the solve gate.
 		// Extension now actually solves reCAPTCHA/Turnstile when encountered.
 	}
@@ -310,7 +320,8 @@ func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		fetch.WithBrowserTimeout(60 * time.Second),
 		fetch.WithMaxBrowserRequests(100),
 		fetch.WithBehaviorProfile(bp),
-		fetch.WithUserDataDir("/home/scraper/.sessions/serp-direct-profile"),
+		// No WithUserDataDir — single persistent context kills concurrency.
+		fetch.WithStorageState("/home/scraper/.sessions/serp-direct-session.json"),
 		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	// NO proxy — uses server IP directly.
