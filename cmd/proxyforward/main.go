@@ -102,7 +102,8 @@ func (p *pool) fetch() ([]socks5Proxy, error) {
 	return proxies, nil
 }
 
-// refresh fetches new proxies and appends to the pool.
+// refresh fetches new proxies and replaces the pool.
+// 1024proxy credentials expire quickly, so we never append to stale entries.
 func (p *pool) refresh() {
 	fresh, err := p.fetch()
 	if err != nil {
@@ -114,8 +115,9 @@ func (p *pool) refresh() {
 		return
 	}
 	p.mu.Lock()
-	p.proxies = append(p.proxies, fresh...)
-	slog.Info("proxyforward: pool refreshed", "added", len(fresh), "total", len(p.proxies))
+	p.proxies = fresh
+	p.idx = 0
+	slog.Info("proxyforward: pool replaced", "count", len(fresh))
 	p.mu.Unlock()
 }
 
@@ -146,7 +148,8 @@ func (p *pool) size() int {
 	return len(p.proxies)
 }
 
-// backgroundRefresh periodically tops up the pool.
+// backgroundRefresh periodically replaces the pool with fresh proxies.
+// 1024proxy credentials have short TTL, so always refresh even if pool is full.
 func (p *pool) backgroundRefresh(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -155,9 +158,7 @@ func (p *pool) backgroundRefresh(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if p.size() < p.poolSize {
-				p.refresh()
-			}
+			p.refresh()
 		}
 	}
 }
