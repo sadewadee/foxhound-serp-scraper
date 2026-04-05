@@ -61,7 +61,12 @@ func (p *pool) fetch() ([]socks5Proxy, error) {
 	if !strings.Contains(url, "num=") {
 		url += "&num=" + strconv.Itoa(p.poolSize)
 	}
-	resp, err := p.client.Get(url)
+	req, reqErr := http.NewRequest("GET", url, nil)
+	if reqErr != nil {
+		return nil, fmt.Errorf("proxy api request: %w", reqErr)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; proxyforward/1.0)")
+	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("proxy api: %w", err)
 	}
