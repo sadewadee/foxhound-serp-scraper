@@ -36,6 +36,7 @@ type socks5Proxy struct {
 func (p socks5Proxy) Addr() string { return net.JoinHostPort(p.Host, p.Port) }
 
 // pool holds a rotating list of SOCKS5 proxies fetched from the API.
+// Proxies are rotated round-robin. New batch is fetched only when pool runs low.
 type pool struct {
 	mu       sync.Mutex
 	proxies  []socks5Proxy
@@ -51,7 +52,7 @@ func newPool(apiURL string, poolSize, minPool int) *pool {
 		apiURL:   apiURL,
 		poolSize: poolSize,
 		minPool:  minPool,
-		client:   &http.Client{Timeout: 15 * time.Second},
+		client:   &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -84,6 +85,11 @@ func (p *pool) fetch() ([]socks5Proxy, error) {
 		if line == "" {
 			continue
 		}
+		// Skip JSON error responses like {"code":2,"data":{},"msg":"..."}
+		if strings.HasPrefix(line, "{") {
+			slog.Warn("proxyforward: API returned error", "response", line)
+			return nil, fmt.Errorf("proxy api error: %s", line)
+		}
 		parts := strings.SplitN(line, ":", 4)
 		if len(parts) < 4 {
 			slog.Warn("proxyforward: skipping malformed line", "line", line)
@@ -102,12 +108,11 @@ func (p *pool) fetch() ([]socks5Proxy, error) {
 	return proxies, nil
 }
 
-// refresh fetches new proxies and replaces the pool.
-// 1024proxy credentials expire quickly, so we never append to stale entries.
-func (p *pool) refresh() {
+// refill fetches new proxies and appends to the pool.
+func (p *pool) refill() {
 	fresh, err := p.fetch()
 	if err != nil {
-		slog.Error("proxyforward: refresh failed", "error", err)
+		slog.Error("proxyforward: refill failed", "error", err)
 		return
 	}
 	if len(fresh) == 0 {
@@ -115,18 +120,18 @@ func (p *pool) refresh() {
 		return
 	}
 	p.mu.Lock()
-	p.proxies = fresh
-	p.idx = 0
-	slog.Info("proxyforward: pool replaced", "count", len(fresh))
+	p.proxies = append(p.proxies, fresh...)
+	slog.Info("proxyforward: pool refilled", "added", len(fresh), "total", len(p.proxies))
 	p.mu.Unlock()
 }
 
-// next returns the next proxy in round-robin order, refreshing if pool is low.
+// next returns the next proxy in round-robin order.
+// Only fetches new batch when pool drops below minPool.
 func (p *pool) next() (socks5Proxy, error) {
 	p.mu.Lock()
-	if len(p.proxies) <= p.minPool {
+	if len(p.proxies) == 0 {
 		p.mu.Unlock()
-		p.refresh()
+		p.refill()
 		p.mu.Lock()
 	}
 	if len(p.proxies) == 0 {
@@ -135,10 +140,15 @@ func (p *pool) next() (socks5Proxy, error) {
 	}
 	px := p.proxies[p.idx%len(p.proxies)]
 	p.idx++
-	// Remove used proxy so each request gets a fresh IP.
-	p.proxies = append(p.proxies[:p.idx-1], p.proxies[p.idx:]...)
-	p.idx = 0
+	if p.idx >= len(p.proxies) {
+		p.idx = 0
+	}
 	p.mu.Unlock()
+
+	// Trigger async refill when pool is getting low (non-blocking).
+	if p.size() <= p.minPool {
+		go p.refill()
+	}
 	return px, nil
 }
 
@@ -146,21 +156,6 @@ func (p *pool) size() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.proxies)
-}
-
-// backgroundRefresh periodically replaces the pool with fresh proxies.
-// 1024proxy credentials have short TTL, so always refresh even if pool is full.
-func (p *pool) backgroundRefresh(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			p.refresh()
-		}
-	}
 }
 
 func dialSOCKS5(px socks5Proxy, target string) (net.Conn, error) {
@@ -205,7 +200,6 @@ func handleConnect(w http.ResponseWriter, r *http.Request, p *pool) {
 		return
 	}
 
-	// Flush any buffered data from the 200 response.
 	clientBuf.Flush()
 
 	go transfer(targetConn, clientConn)
@@ -279,21 +273,19 @@ func main() {
 
 	listenAddr := envOrDefault("PROXY_LISTEN", ":8888")
 	poolSize := envIntOrDefault("PROXY_POOL_SIZE", 20)
-	refreshSec := envIntOrDefault("PROXY_REFRESH_SEC", 30)
 	minPool := envIntOrDefault("PROXY_MIN_POOL", 5)
 
 	slog.Info("proxyforward: starting",
 		"listen", listenAddr,
 		"pool_size", poolSize,
-		"refresh_sec", refreshSec,
 		"min_pool", minPool,
 	)
 
 	p := newPool(apiURL, poolSize, minPool)
-	p.refresh() // initial fill
+	p.refill() // initial fill
 
 	ctx := context.Background()
-	go p.backgroundRefresh(ctx, time.Duration(refreshSec)*time.Second)
+	_ = ctx // reserved for graceful shutdown
 
 	server := &http.Server{
 		Addr: listenAddr,
