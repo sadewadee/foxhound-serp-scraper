@@ -45,6 +45,9 @@ services:
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
 
+      # ── Beta features DISABLED — circuit breaker skips proxy too aggressively ──
+      BETA_FEATURES: "0"
+
       # ── SERP engines + timing ──
       SERP_ENGINES: "${SERP_ENGINES:-all}"
       SERP_DELAY_MS: "${SERP_DELAY_MS:-3000}"
