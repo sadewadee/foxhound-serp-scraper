@@ -60,7 +60,7 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.page_title,''), bl.created_at,
 		       COALESCE(
 		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id
-		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending')),
+		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending', 'unknown')),
 		         '{}'
 		       ) AS emails,
 		       COALESCE(bl.phone, '') AS phone
@@ -145,7 +145,7 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.phone,''),
 		       COALESCE(
 		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id
-		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending')),
+		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending', 'unknown')),
 		         '{}'
 		       ) AS emails
 		FROM business_listings bl %s ORDER BY bl.id ASC

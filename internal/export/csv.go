@@ -22,7 +22,7 @@ func ExportCSV(db *sql.DB, opts CSVOptions) (int, error) {
 		SELECT
 			COALESCE(
 				(SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id
-				 WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending')),
+				 WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending', 'unknown')),
 				'{}'
 			) AS emails,
 			COALESCE(bl.phone, '') AS phone,
@@ -30,7 +30,7 @@ func ExportCSV(db *sql.DB, opts CSVOptions) (int, error) {
 		FROM business_listings bl
 		WHERE EXISTS (
 			SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id
-			WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending')
+			WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending', 'unknown')
 		)
 		ORDER BY bl.id ASC
 	`
