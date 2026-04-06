@@ -140,27 +140,35 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 		FROM queries
 	`).Scan(&snap.QueriesPending, &snap.QueriesProcessing, &snap.QueriesCompleted, &snap.QueriesError)
 
-	// SERP jobs.
-	r.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'new'),
-			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COUNT(*) FILTER (WHERE status = 'dead')
-		FROM serp_jobs
-	`).Scan(&snap.SerpNew, &snap.SerpProcessing, &snap.SerpCompleted, &snap.SerpFailed, &snap.SerpDead)
+	// SERP jobs — bounded by statement_timeout to avoid holding connections on large tables.
+	if tx, txErr := r.db.Begin(); txErr == nil {
+		tx.Exec("SET LOCAL statement_timeout = '5000'")
+		tx.QueryRow(`
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'new'),
+				COUNT(*) FILTER (WHERE status = 'processing'),
+				COUNT(*) FILTER (WHERE status = 'completed'),
+				COUNT(*) FILTER (WHERE status = 'failed'),
+				COUNT(*) FILTER (WHERE status = 'dead')
+			FROM serp_jobs
+		`).Scan(&snap.SerpNew, &snap.SerpProcessing, &snap.SerpCompleted, &snap.SerpFailed, &snap.SerpDead)
+		tx.Commit()
+	}
 
-	// Enrichment jobs.
-	r.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending'),
-			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COUNT(*) FILTER (WHERE status = 'dead')
-		FROM enrichment_jobs
-	`).Scan(&snap.EnrichPending, &snap.EnrichProcessing, &snap.EnrichCompleted, &snap.EnrichFailed, &snap.EnrichDead)
+	// Enrichment jobs — bounded by statement_timeout to avoid holding connections on large tables.
+	if tx, txErr := r.db.Begin(); txErr == nil {
+		tx.Exec("SET LOCAL statement_timeout = '5000'")
+		tx.QueryRow(`
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'pending'),
+				COUNT(*) FILTER (WHERE status = 'processing'),
+				COUNT(*) FILTER (WHERE status = 'completed'),
+				COUNT(*) FILTER (WHERE status = 'failed'),
+				COUNT(*) FILTER (WHERE status = 'dead')
+			FROM enrichment_jobs
+		`).Scan(&snap.EnrichPending, &snap.EnrichProcessing, &snap.EnrichCompleted, &snap.EnrichFailed, &snap.EnrichDead)
+		tx.Commit()
+	}
 
 	// Contacts from normalized tables.
 	r.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&snap.EmailsTotal)

@@ -36,13 +36,13 @@ var blockedDomains = map[string]bool{
 	"www.linkedin.com": true,
 	"www.facebook.com": true, "m.facebook.com": true,
 	"www.instagram.com": true,
-	"twitter.com": true, "x.com": true,
+	"twitter.com":       true, "x.com": true,
 	"www.tiktok.com": true, "www.youtube.com": true,
 	"www.pinterest.com": true, "www.reddit.com": true,
 	"www.quora.com": true, "www.researchgate.net": true,
 	"pmc.ncbi.nlm.nih.gov": true,
 	"journals.sagepub.com": true, "www.tandfonline.com": true,
-	"rocketreach.co":      true,
+	"rocketreach.co": true,
 	"www.amazon.com": true, "www.walmart.com": true,
 	"www.booking.com": true, "www.airbnb.com": true,
 	"www.bbb.org": true, "maps.google.com": true,
@@ -219,12 +219,27 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 			}
 		}
 
-		// 2. Resurrect dead jobs with transient errors (hourly).
+		// 2a. Mark dead jobs with too many attempts as permanently dead (prevent infinite retry).
+		permDeadRes, _ := c.db.Exec(`
+			UPDATE enrichment_jobs SET error_msg = 'permanently dead: max resurrections reached', updated_at = NOW()
+			WHERE status = 'dead'
+			  AND attempt_count >= 15
+			  AND error_msg NOT LIKE 'permanently dead%'
+		`)
+		if permDeadRes != nil {
+			if n, _ := permDeadRes.RowsAffected(); n > 0 {
+				slog.Info("enrich: reconciler marked jobs permanently dead", "count", n)
+			}
+		}
+
+		// 2b. Resurrect dead jobs with transient errors (hourly).
+		// Increment attempt_count (never reset to 0) so they eventually reach the cap.
 		deadRes, _ := c.db.Exec(`
-			UPDATE enrichment_jobs SET status = 'pending', attempt_count = 0, locked_by = NULL, picked_at = NULL, updated_at = NOW()
+			UPDATE enrichment_jobs SET status = 'pending', attempt_count = attempt_count + 1, locked_by = NULL, picked_at = NULL, updated_at = NOW()
 			WHERE id IN (
 				SELECT id FROM enrichment_jobs
 				WHERE status = 'dead'
+				  AND attempt_count < 15
 				  AND updated_at < NOW() - INTERVAL '1 hour'
 				  AND error_msg NOT LIKE 'HTTP 403%'
 				  AND error_msg NOT LIKE 'HTTP 404%'
@@ -234,6 +249,7 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				  AND error_msg NOT LIKE '%x509%'
 				  AND error_msg NOT LIKE '%no such host%'
 				  AND error_msg NOT LIKE '%server misbehaving%'
+				  AND error_msg NOT LIKE 'permanently dead%'
 				LIMIT 1000
 			)
 		`)

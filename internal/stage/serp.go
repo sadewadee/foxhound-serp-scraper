@@ -242,7 +242,7 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 		if pendingCount > 10000 {
 			slog.Info("serp: backpressure — too many pending serp jobs", "count", pendingCount)
 			data, _ := json.Marshal(qMsg)
-			s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(qMsg.ID), Member: string(data)})
+			s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(time.Now().Unix() + 60), Member: string(data)})
 			s.db.Exec(`UPDATE queries SET status = 'pending', updated_at = NOW() WHERE id = $1`, qMsg.ID)
 			select {
 			case <-ctx.Done():
@@ -725,6 +725,9 @@ func (s *SERPStage) expandCompletedQueries() {
 			}
 			if inserted > 0 {
 				expanded++
+				// Mark variant as already expanded so it won't be expanded again (depth-1 limit).
+				s.db.Exec(`UPDATE queries SET expanded_at = NOW() WHERE text_hash = $1 AND expanded_at IS NULL`,
+					dedup.HashQuery(variant))
 			}
 		}
 		s.db.Exec(`UPDATE queries SET expanded_at = NOW() WHERE id = $1`, id)
