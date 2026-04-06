@@ -30,6 +30,7 @@ type Snapshot struct {
 	SerpProcessing int
 	SerpCompleted  int
 	SerpFailed     int
+	SerpDead       int
 
 	// Enrich jobs by status
 	EnrichPending    int
@@ -116,7 +117,7 @@ func (r *ProjectReconciler) tick(ctx context.Context) {
 	// Log health summary.
 	slog.Info("project-reconciler: tick",
 		"queries", fmt.Sprintf("%d pending / %d processing / %d done", snap.QueriesPending, snap.QueriesProcessing, snap.QueriesCompleted),
-		"serp", fmt.Sprintf("%d new / %d done / %d failed", snap.SerpNew, snap.SerpCompleted, snap.SerpFailed),
+		"serp", fmt.Sprintf("%d new / %d done / %d failed / %d dead", snap.SerpNew, snap.SerpCompleted, snap.SerpFailed, snap.SerpDead),
 		"enrich", fmt.Sprintf("%d pending / %d done / %d dead", snap.EnrichPending, snap.EnrichCompleted, snap.EnrichDead),
 		"queues", fmt.Sprintf("q:%d sb:%d eb:%d", snap.QueueQueries, snap.QueueSerpBuf, snap.QueueEnrichBuf),
 		"emails", snap.EmailsTotal,
@@ -145,9 +146,10 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 			COUNT(*) FILTER (WHERE status = 'new'),
 			COUNT(*) FILTER (WHERE status = 'processing'),
 			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'failed')
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE status = 'dead')
 		FROM serp_jobs
-	`).Scan(&snap.SerpNew, &snap.SerpProcessing, &snap.SerpCompleted, &snap.SerpFailed)
+	`).Scan(&snap.SerpNew, &snap.SerpProcessing, &snap.SerpCompleted, &snap.SerpFailed, &snap.SerpDead)
 
 	// Enrichment jobs.
 	r.db.QueryRow(`
@@ -210,19 +212,37 @@ func (r *ProjectReconciler) healZombieQueries(ctx context.Context, snap Snapshot
 	}
 }
 
-// healStaleSerp resets failed serp_jobs that deserve another round.
+// healStaleSerp marks exhausted failed serp_jobs as dead, then resets
+// remaining failed jobs that still have retries left.
 func (r *ProjectReconciler) healStaleSerp(ctx context.Context, snap Snapshot) {
 	if snap.SerpFailed < 100 {
 		return
 	}
 
+	// First: permanently retire jobs that have been retried too many times.
+	// This prevents the infinite retry loop where attempt_count was reset to 0.
+	deadRes, deadErr := r.db.Exec(`
+		UPDATE serp_jobs SET status = 'dead', updated_at = NOW()
+		WHERE status = 'failed'
+		  AND attempt_count >= 10
+		  AND updated_at < NOW() - INTERVAL '1 hour'
+	`)
+	if deadErr == nil {
+		if n, _ := deadRes.RowsAffected(); n > 0 {
+			slog.Info("project-reconciler: retired exhausted serp_jobs to dead", "count", n)
+		}
+	}
+
+	// Then: resurrect jobs that still have retries left.
+	// Increment attempt_count (never reset to 0) so they eventually reach the cap.
 	limit := 500
 	res, err := r.db.Exec(fmt.Sprintf(`
-		UPDATE serp_jobs SET status = 'new', attempt_count = 0, error_msg = '',
+		UPDATE serp_jobs SET status = 'new', attempt_count = attempt_count + 1, error_msg = '',
 			locked_by = NULL, next_attempt_at = NULL, picked_at = NULL, updated_at = NOW()
 		WHERE id IN (
 			SELECT id FROM serp_jobs
 			WHERE status = 'failed'
+			  AND attempt_count < 10
 			  AND updated_at < NOW() - INTERVAL '1 hour'
 			LIMIT %d
 		)

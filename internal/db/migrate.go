@@ -182,6 +182,11 @@ func runMigrations(db *sql.DB) error {
 		return fmt.Errorf("db: create idx_serp_stale: %w", err)
 	}
 
+	// Index for reconciler: retire exhausted failed jobs to 'dead' and resurrect viable ones.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_failed_retry ON serp_jobs(updated_at) WHERE status = 'failed'`); err != nil {
+		return fmt.Errorf("db: create idx_serp_failed_retry: %w", err)
+	}
+
 	// Populate emails.domain and emails.local_part for rows that have NULLs.
 	if _, err := db.Exec(`UPDATE emails SET domain = split_part(email, '@', 2), local_part = split_part(email, '@', 1) WHERE domain IS NULL AND email LIKE '%@%'`); err != nil {
 		return fmt.Errorf("db: backfill email domain/local_part: %w", err)

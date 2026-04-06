@@ -236,8 +236,9 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 		}
 
 		// Backpressure: if too many pending serp jobs, wait.
+		// Use a bounded count (LIMIT 10001) to avoid scanning millions of rows.
 		var pendingCount int
-		s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'new'`).Scan(&pendingCount)
+		s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM serp_jobs WHERE status = 'new' AND created_at > NOW() - INTERVAL '6 hours' LIMIT 10001) sub`).Scan(&pendingCount)
 		if pendingCount > 10000 {
 			slog.Info("serp: backpressure — too many pending serp jobs", "count", pendingCount)
 			data, _ := json.Marshal(qMsg)
@@ -633,8 +634,9 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 		}
 
 		// 3. Requeue zombie processing queries.
+		// Use bounded count to avoid scanning millions of ancient recycled rows.
 		var pendingCount int
-		s.db.QueryRow(`SELECT COUNT(*) FROM serp_jobs WHERE status = 'new'`).Scan(&pendingCount)
+		s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM serp_jobs WHERE status = 'new' AND created_at > NOW() - INTERVAL '6 hours' LIMIT 5001) sub`).Scan(&pendingCount)
 		if pendingCount < 5000 {
 			stuckQRes, _ := s.db.Exec(`
 				UPDATE queries SET status = 'pending', updated_at = NOW()
@@ -791,4 +793,4 @@ func shortHostname() string {
 
 func (s *SERPStage) QueriesProcessed() int64 { return s.queriesProcessed.Load() }
 func (s *SERPStage) URLsFound() int64        { return s.urlsFound.Load() }
-func (s *SERPStage) PagesProcessed() int64    { return s.pagesProcessed.Load() }
+func (s *SERPStage) PagesProcessed() int64   { return s.pagesProcessed.Load() }
