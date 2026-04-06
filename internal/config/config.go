@@ -58,12 +58,12 @@ type SERPConfig struct {
 	ResultsPerPage        int    `yaml:"results_per_page"`
 	DelayBetweenPagesMs   int    `yaml:"delay_between_pages_ms"`
 	DelayBetweenQueriesMs int    `yaml:"delay_between_queries_ms"`
-	Concurrency           int    `yaml:"concurrency"`       // number of tabs (goroutines)
-	SERPDelayMs           int    `yaml:"serp_delay_ms"`     // inter-page delay override (0 = use timing profile)
-	Engines               string `yaml:"engines"`           // "all", "google", "bing", "duckduckgo" (default: "all")
-	GoogleMaxPages        int    `yaml:"google_max_pages"`  // default 3
-	BingMaxPages          int    `yaml:"bing_max_pages"`    // default 5
-	DDGMaxPages           int    `yaml:"ddg_max_pages"`     // default 1
+	Concurrency           int    `yaml:"concurrency"`      // number of tabs (goroutines)
+	SERPDelayMs           int    `yaml:"serp_delay_ms"`    // inter-page delay override (0 = use timing profile)
+	Engines               string `yaml:"engines"`          // "all", "google", "bing", "duckduckgo" (default: "all")
+	GoogleMaxPages        int    `yaml:"google_max_pages"` // default 3
+	BingMaxPages          int    `yaml:"bing_max_pages"`   // default 5
+	DDGMaxPages           int    `yaml:"ddg_max_pages"`    // default 1
 }
 
 type WebsiteConfig struct {
@@ -104,10 +104,10 @@ type FetchConfig struct {
 	ReconcilerIntervalMs int `yaml:"reconciler_interval_ms"` // reconciler tick interval in ms (default 60000)
 
 	// Beta features (foxhound v0.0.7) — set BETA_FEATURES=1 to enable all.
-	BetaFeatures     bool `yaml:"beta_features"`      // master switch for all beta features
-	CircuitBreaker   bool `yaml:"circuit_breaker"`     // per-domain circuit breaker on SERP fetches
-	DomainScorer     bool `yaml:"domain_scorer"`       // Bayesian domain risk scoring on enrich (stealth→browser auto-escalation)
-	SessionFatigue   bool `yaml:"session_fatigue"`     // human-like warmup/fatigue timing on browser
+	BetaFeatures   bool `yaml:"beta_features"`   // master switch for all beta features
+	CircuitBreaker bool `yaml:"circuit_breaker"` // per-domain circuit breaker on SERP fetches
+	DomainScorer   bool `yaml:"domain_scorer"`   // Bayesian domain risk scoring on enrich (stealth→browser auto-escalation)
+	SessionFatigue bool `yaml:"session_fatigue"` // human-like warmup/fatigue timing on browser
 }
 
 type MonitorConfig struct {
@@ -296,7 +296,7 @@ func setDefaults(cfg *Config) {
 		cfg.Fetch.EnrichMaxRequests = 300
 	}
 	if cfg.Fetch.BrowserTimeoutSec == 0 {
-		cfg.Fetch.BrowserTimeoutSec = 60
+		cfg.Fetch.BrowserTimeoutSec = 30
 	}
 	if cfg.Fetch.ReconcilerIntervalMs == 0 {
 		cfg.Fetch.ReconcilerIntervalMs = 60000

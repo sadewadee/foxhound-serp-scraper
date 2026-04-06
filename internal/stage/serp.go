@@ -308,6 +308,13 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 	workerID := fmt.Sprintf("serp-%s-%d", shortHostname(), tabID)
 	slog.Info("serp: tab worker starting", "tab", tabID)
 
+	// Shared stealth fetcher for non-browser engines (Bing, DDG).
+	// Avoids creating a new TLS connection + identity per request.
+	stealth := scraper.NewStealth(s.cfg)
+	stealthCount := 0
+	stealthRecycleAfter := s.cfg.Fetch.StealthRecycleAfter
+	defer stealth.Close()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -413,9 +420,15 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				}
 			}
 		} else {
-			stealth := scraper.NewStealth(s.cfg)
+			// Recycle stealth fetcher periodically to rotate identity/TLS fingerprint.
+			stealthCount++
+			if stealthCount >= stealthRecycleAfter {
+				stealth.Close()
+				stealth = scraper.NewStealth(s.cfg)
+				stealthCount = 0
+				slog.Debug("serp: stealth recycled", "tab", tabID)
+			}
 			body, fetchErr = scraper.FetchSERPStealth(ctx, stealth, job.URL, job.ID)
-			stealth.Close()
 		}
 
 		if fetchErr == nil && eng.IsCaptchaPage(body) {
