@@ -236,10 +236,10 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 		}
 
 		// Backpressure: if too many pending serp jobs, wait.
-		// Use a bounded count (LIMIT 10001) to avoid scanning millions of rows.
+		// Use a bounded count (LIMIT 50001) to avoid scanning millions of rows.
 		var pendingCount int
-		s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM serp_jobs WHERE status = 'new' AND created_at > NOW() - INTERVAL '6 hours' LIMIT 10001) sub`).Scan(&pendingCount)
-		if pendingCount > 10000 {
+		s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM serp_jobs WHERE status = 'new' AND created_at > NOW() - INTERVAL '6 hours' LIMIT 50001) sub`).Scan(&pendingCount)
+		if pendingCount > 50000 {
 			slog.Info("serp: backpressure — too many pending serp jobs", "count", pendingCount)
 			data, _ := json.Marshal(qMsg)
 			s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(time.Now().Unix() + 60), Member: string(data)})
