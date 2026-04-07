@@ -26,6 +26,7 @@ var Niches = []string{
 }
 
 // PersonalNiches target individual practitioners (more likely to have gmail/yahoo).
+// Tight focus on yoga/wellness/fitness — no beauty/hair/nail crossover.
 var PersonalNiches = []string{
 	// Yoga
 	"yoga instructor", "yoga teacher", "yoga therapist",
@@ -35,32 +36,17 @@ var PersonalNiches = []string{
 	// Fitness
 	"personal trainer", "fitness coach", "fitness instructor",
 	"crossfit coach", "strength coach", "conditioning coach",
-	"boxing trainer", "kickboxing instructor",
-	"running coach", "triathlon coach", "swimming coach",
 	// Wellness
 	"wellness coach", "wellness practitioner", "wellness consultant",
-	"health coach", "life coach", "nutrition coach",
-	"nutritionist", "dietitian",
+	"health coach", "holistic health coach",
 	// Mind
 	"meditation teacher", "meditation guide",
 	"breathwork facilitator", "mindfulness coach",
-	"hypnotherapist", "counselor", "therapist",
-	// Body
-	"massage therapist", "sports massage therapist",
+	// Body / healing
 	"reiki practitioner", "reiki healer", "reiki master",
-	"acupuncturist", "chiropractor",
-	"physical therapist", "physiotherapist",
-	"osteopath", "craniosacral therapist",
+	"energy healer", "sound healer",
 	// Traditional
-	"naturopath", "ayurvedic practitioner", "herbalist",
-	"homeopath", "traditional healer",
-	// Movement
-	"dance instructor", "zumba instructor", "barre instructor",
-	"pole instructor", "aerial instructor",
-	// Beauty
-	"esthetician", "skin therapist", "beauty therapist",
-	"lash technician", "makeup artist", "hair stylist",
-	"barber", "nail technician",
+	"ayurvedic practitioner",
 }
 
 // WellnessTemplates — single focused template: "<keyword> <city> contact".
@@ -68,21 +54,9 @@ var WellnessTemplates = []string{
 	"%s %s contact",
 }
 
-// PersonalTemplates target individuals — higher gmail/yahoo yield.
-// Heavy use of site: operators — Bing/DDG honor them reliably.
+// PersonalTemplates — single focused template matching business pattern.
 var PersonalTemplates = []string{
-	"%s %s \"@gmail.com\"", // "yoga instructor bali @gmail.com"
-	"%s %s \"@yahoo.com\"",
-	"%s %s \"@hotmail.com\"",
-	"%s %s \"@outlook.com\"",
-	"%s %s email", // "yoga instructor bali email"
 	"%s %s contact",
-	"site:instagram.com %s %s",   // IG bios often expose email
-	"site:linkedin.com/in %s %s", // LinkedIn public profiles
-	"site:facebook.com %s %s",    // FB page About tabs
-	"hire %s in %s",
-	"freelance %s %s",
-	"independent %s in %s",
 }
 
 // Cities organized by country — includes neighborhoods for major metros.
