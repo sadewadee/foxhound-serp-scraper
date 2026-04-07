@@ -49,14 +49,30 @@ var PersonalNiches = []string{
 	"ayurvedic practitioner",
 }
 
-// WellnessTemplates — single focused template: "<keyword> <city> contact".
+// WellnessTemplates — "<keyword> <city> <operator>" variants.
 var WellnessTemplates = []string{
 	"%s %s contact",
+	"%s %s email",
+	"%s %s \"@gmail.com\"",
+	"%s %s \"@yahoo.com\"",
+	"%s %s \"@hotmail.com\"",
+	"%s %s \"@outlook.com\"",
+	"%s %s \"@icloud.com\"",
+	"%s %s \"@aol.com\"",
+	"%s %s \"@protonmail.com\"",
 }
 
-// PersonalTemplates — single focused template matching business pattern.
+// PersonalTemplates — same operator set as business templates.
 var PersonalTemplates = []string{
 	"%s %s contact",
+	"%s %s email",
+	"%s %s \"@gmail.com\"",
+	"%s %s \"@yahoo.com\"",
+	"%s %s \"@hotmail.com\"",
+	"%s %s \"@outlook.com\"",
+	"%s %s \"@icloud.com\"",
+	"%s %s \"@aol.com\"",
+	"%s %s \"@protonmail.com\"",
 }
 
 // Cities organized by country — includes neighborhoods for major metros.
