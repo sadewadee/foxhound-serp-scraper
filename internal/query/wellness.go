@@ -7,35 +7,22 @@ import (
 	"strings"
 )
 
-// Niches for wellness/fitness industry — business names.
+// Niches — tight focus on yoga/wellness/fitness core.
 var Niches = []string{
-	// Yoga
-	"yoga studio", "bikram yoga", "hot yoga", "vinyasa yoga",
-	"ashtanga yoga", "yin yoga", "aerial yoga", "prenatal yoga",
-	"power yoga", "kundalini yoga", "restorative yoga",
+	// Yoga core
+	"yoga", "yoga studio", "yoga class", "yoga school",
+	"yoga teacher training", "yogafx",
+	// Yoga styles
+	"bikram yoga", "hot yoga", "vinyasa yoga",
+	"ashtanga yoga", "yin yoga", "aerial yoga",
+	"prenatal yoga", "power yoga", "kundalini yoga",
 	// Pilates
-	"pilates studio", "pilates class", "reformer pilates",
-	// Gym & Fitness
-	"gym", "fitness center", "health club", "crossfit", "crossfit box",
-	"boxing gym", "kickboxing gym", "mma gym", "martial arts school",
-	"functional fitness", "boutique gym", "women gym",
-	// Wellness
-	"wellness center", "wellness spa", "wellness retreat",
-	"healing center", "holistic healing", "holistic wellness",
-	"detox center", "ayurveda center",
-	// Mind
-	"meditation center", "meditation class", "mindfulness center",
-	"breathwork studio", "sound healing",
-	// Body
-	"spa", "massage", "day spa", "thai massage", "sports massage",
-	"float tank", "cryotherapy", "infrared sauna",
-	// Movement
-	"dance studio", "barre studio", "pole fitness",
-	// Nutrition
-	"nutrition clinic", "dietitian", "juice bar", "health food store",
-	// Beauty-wellness crossover
-	"beauty salon", "skin clinic", "aesthetics clinic",
-	"hair salon", "nail salon", "barbershop",
+	"pilates", "pilates studio",
+	// Fitness core
+	"gym", "fitness center", "crossfit",
+	// Wellness / healing
+	"wellness", "wellness center", "healing", "healing center",
+	"holistic wellness", "meditation", "meditation center",
 }
 
 // PersonalNiches target individual practitioners (more likely to have gmail/yahoo).
@@ -76,16 +63,9 @@ var PersonalNiches = []string{
 	"barber", "nail technician",
 }
 
-// WellnessTemplates for business search query variations.
-// Biased toward email/contact operators which yield higher email coverage.
+// WellnessTemplates — single focused template: "<keyword> <city> contact".
 var WellnessTemplates = []string{
-	"%s %s contact",        // "yoga studio bali contact"
-	"%s %s email",          // "yoga studio bali email"
-	"%s %s \"@gmail.com\"", // explicit gmail in page
-	"%s in %s",             // "yoga studio in bali"
-	"best %s in %s",        // "best yoga studio in bali"
-	"%s %s book now",       // booking page usually has contact
-	"%s %s phone number",
+	"%s %s contact",
 }
 
 // PersonalTemplates target individuals — higher gmail/yahoo yield.
@@ -395,17 +375,13 @@ func GenerateKeywords(niches, cities []string, templates []string) []string {
 }
 
 // GenerateAllKeywords generates keywords for ALL cities in ALL countries.
-// Combines business templates + personal templates for maximum coverage.
+// Single-template focus: "<niche> <city> contact".
 func GenerateAllKeywords() []string {
 	var allCities []string
 	for _, c := range Cities {
 		allCities = append(allCities, c...)
 	}
-	// Business queries (yoga studio bali, etc).
-	business := GenerateKeywords(Niches, allCities, WellnessTemplates)
-	// Personal queries (yoga instructor bali @gmail.com, etc).
-	personal := GenerateKeywords(PersonalNiches, allCities, PersonalTemplates)
-	return dedupStrings(append(business, personal...))
+	return GenerateKeywords(Niches, allCities, WellnessTemplates)
 }
 
 // GenerateKeywordsForCountry generates keywords for a specific country.
@@ -414,9 +390,7 @@ func GenerateKeywordsForCountry(country string) []string {
 	if !ok {
 		return nil
 	}
-	business := GenerateKeywords(Niches, cities, WellnessTemplates)
-	personal := GenerateKeywords(PersonalNiches, cities, PersonalTemplates)
-	return dedupStrings(append(business, personal...))
+	return GenerateKeywords(Niches, cities, WellnessTemplates)
 }
 
 // dedupStrings removes duplicate strings (case-insensitive).
