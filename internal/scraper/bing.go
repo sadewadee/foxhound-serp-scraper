@@ -46,10 +46,10 @@ func (b *BingEngine) ParseResults(body []byte) ([]string, error) {
 	var urls []string
 	seen := make(map[string]bool)
 
-	doc.Each("li.b_algo", func(_ int, s *goquery.Selection) {
-		// First anchor inside each organic result.
-		link := s.Find("a[href]").First()
-		href, exists := link.Attr("href")
+	// Bing organic results: anchor inside h2 inside li.b_algo.
+	// Picking the first a[href] picks tracking/sitelinks; h2 a is the title link.
+	doc.Each("li.b_algo h2 a", func(_ int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
 		if !exists || href == "" {
 			return
 		}
