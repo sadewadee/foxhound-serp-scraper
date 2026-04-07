@@ -7,22 +7,42 @@ import (
 	"strings"
 )
 
-// Niches — tight focus on yoga/wellness/fitness core.
+// Niches — yoga/wellness/fitness core + on-target expansions.
 var Niches = []string{
 	// Yoga core
 	"yoga", "yoga studio", "yoga class", "yoga school",
-	"yoga teacher training", "yogafx",
+	"yoga center", "yoga shala", "yoga ashram",
+	"yoga teacher training", "yoga ttc", "yoga retreat",
+	"yogafx", "yoga academy", "online yoga",
 	// Yoga styles
 	"bikram yoga", "hot yoga", "vinyasa yoga",
 	"ashtanga yoga", "yin yoga", "aerial yoga",
-	"prenatal yoga", "power yoga", "kundalini yoga",
+	"prenatal yoga", "postnatal yoga", "power yoga",
+	"kundalini yoga", "iyengar yoga", "hatha yoga",
+	"restorative yoga", "jivamukti yoga", "rocket yoga",
+	"acro yoga", "rope yoga", "kids yoga", "chair yoga",
 	// Pilates
-	"pilates", "pilates studio",
+	"pilates", "pilates studio", "pilates class",
+	"reformer pilates", "mat pilates", "clinical pilates",
+	"pilates teacher training",
 	// Fitness core
-	"gym", "fitness center", "crossfit",
+	"gym", "fitness center", "fitness studio", "fitness club",
+	"boutique gym", "crossfit", "crossfit box",
+	"functional fitness", "bootcamp", "hiit class",
+	"barre studio", "spin studio", "boxing gym",
 	// Wellness / healing
-	"wellness", "wellness center", "healing", "healing center",
-	"holistic wellness", "meditation", "meditation center",
+	"wellness", "wellness center", "wellness studio",
+	"wellness retreat", "wellness resort", "wellness clinic",
+	"healing", "healing center", "healing retreat",
+	"holistic wellness", "holistic healing", "holistic center",
+	"mindfulness center", "mindfulness retreat",
+	"meditation", "meditation center", "meditation retreat",
+	"breathwork", "breathwork studio", "sound healing",
+	"sound bath", "reiki healing", "energy healing",
+	"ayurveda", "ayurvedic center", "ayurvedic retreat",
+	// Spa / body wellness
+	"day spa", "wellness spa", "health spa", "thermal spa",
+	"thai massage", "therapeutic massage",
 }
 
 // PersonalNiches target individual practitioners (more likely to have gmail/yahoo).
@@ -30,23 +50,37 @@ var Niches = []string{
 var PersonalNiches = []string{
 	// Yoga
 	"yoga instructor", "yoga teacher", "yoga therapist",
-	"prenatal yoga teacher", "kids yoga teacher",
+	"yoga trainer", "yoga coach", "yoga guru",
+	"prenatal yoga teacher", "postnatal yoga teacher",
+	"kids yoga teacher", "aerial yoga instructor",
+	"hot yoga instructor", "vinyasa yoga teacher",
+	"ashtanga yoga teacher", "kundalini yoga teacher",
+	"iyengar yoga teacher",
 	// Pilates
 	"pilates instructor", "pilates teacher",
+	"reformer pilates instructor", "clinical pilates instructor",
 	// Fitness
 	"personal trainer", "fitness coach", "fitness instructor",
+	"fitness trainer", "online personal trainer",
 	"crossfit coach", "strength coach", "conditioning coach",
+	"functional trainer", "bootcamp instructor",
+	"hiit instructor", "barre instructor", "spin instructor",
+	"boxing trainer",
 	// Wellness
 	"wellness coach", "wellness practitioner", "wellness consultant",
-	"health coach", "holistic health coach",
+	"wellness therapist", "health coach", "holistic health coach",
+	"holistic wellness coach", "holistic practitioner",
 	// Mind
-	"meditation teacher", "meditation guide",
-	"breathwork facilitator", "mindfulness coach",
+	"meditation teacher", "meditation guide", "meditation instructor",
+	"mindfulness teacher", "mindfulness coach",
+	"breathwork facilitator", "breathwork coach",
 	// Body / healing
 	"reiki practitioner", "reiki healer", "reiki master",
-	"energy healer", "sound healer",
+	"energy healer", "energy worker", "crystal healer",
+	"sound healer", "sound therapist",
 	// Traditional
-	"ayurvedic practitioner",
+	"ayurvedic practitioner", "ayurvedic therapist",
+	"ayurvedic doctor", "ayurvedic consultant",
 }
 
 // WellnessTemplates — "<keyword> <city> <operator>" variants.
@@ -81,50 +115,123 @@ var Cities = map[string][]string{
 	"Indonesia": {
 		"Jakarta", "Surabaya", "Bandung", "Medan", "Semarang",
 		"Makassar", "Palembang", "Tangerang", "Depok", "Bekasi",
-		"Denpasar", "Bali", "Ubud", "Canggu", "Seminyak", "Sanur", "Kuta", "Nusa Dua", "Uluwatu",
-		"Yogyakarta", "Malang", "Solo", "Bogor", "Balikpapan",
-		"Manado", "Lombok", "Batam", "Samarinda", "Pontianak",
+		"Tangerang Selatan", "Bogor", "Serang", "Cilegon",
+		// Bali — high wellness tourism
+		"Denpasar", "Bali", "Ubud", "Canggu", "Seminyak",
+		"Sanur", "Kuta", "Nusa Dua", "Uluwatu", "Jimbaran",
+		"Pererenan", "Berawa", "Kerobokan", "Umalas", "Sidemen",
+		"Amed", "Lovina", "Munduk", "Tabanan", "Gianyar",
+		// Java
+		"Yogyakarta", "Malang", "Solo", "Surakarta", "Cirebon",
+		"Purwokerto", "Kediri", "Madiun", "Probolinggo",
+		// Other islands
+		"Balikpapan", "Manado", "Batam", "Samarinda", "Pontianak",
+		"Banjarmasin", "Pekanbaru", "Padang", "Jambi", "Bengkulu",
+		// Lombok / NTB
+		"Lombok", "Senggigi", "Kuta Lombok", "Gili Trawangan",
 		// Jakarta neighborhoods
 		"Kemang", "Senopati", "Menteng", "Kelapa Gading", "PIK Jakarta",
-		"Sudirman", "Kuningan", "Pondok Indah",
+		"Sudirman", "Kuningan", "Pondok Indah", "Cipete", "Tebet",
+		"Cilandak", "Pasar Minggu", "Kebayoran", "SCBD",
+		"BSD", "Alam Sutera", "Gading Serpong",
 	},
-	// United States
+	// United States — highest priority
 	"United States": {
+		// Top 30 metros
 		"New York", "Los Angeles", "Chicago", "Houston", "Phoenix",
 		"San Antonio", "San Diego", "Dallas", "San Jose", "Austin",
-		"San Francisco", "Seattle", "Denver", "Portland", "Miami",
-		"Atlanta", "Boston", "Nashville", "Las Vegas", "Minneapolis",
+		"Jacksonville", "Fort Worth", "Columbus", "Indianapolis",
+		"Charlotte", "San Francisco", "Seattle", "Denver", "Washington DC",
+		"Boston", "El Paso", "Nashville", "Detroit", "Oklahoma City",
+		"Portland", "Las Vegas", "Memphis", "Louisville", "Baltimore",
+		"Milwaukee", "Albuquerque", "Tucson", "Fresno", "Sacramento",
+		"Kansas City", "Mesa", "Atlanta", "Omaha", "Colorado Springs",
+		"Miami", "Raleigh", "Long Beach", "Virginia Beach", "Oakland",
+		"Minneapolis", "Tulsa", "Arlington", "Tampa", "New Orleans",
+		"Cleveland",
+		// Wellness capitals
 		"Scottsdale", "Boulder", "Santa Monica", "Sedona", "Asheville",
-		"Honolulu", "Maui", "Oahu",
+		"Austin", "Portland", "Boulder", "Park City", "Aspen",
+		"Palm Springs", "Ojai", "Big Sur", "Carmel", "Napa",
+		"Sonoma", "Jackson Hole", "Vail", "Taos", "Santa Fe",
+		"Telluride", "Marfa", "Key West", "Martha's Vineyard",
+		// Hawaii
+		"Honolulu", "Maui", "Oahu", "Kauai", "Big Island",
+		"Lahaina", "Kihei", "Wailea", "Paia", "Hanalei",
 		// NYC neighborhoods
-		"Brooklyn", "Manhattan", "Queens", "Williamsburg", "Park Slope",
-		"Upper East Side", "Upper West Side", "SoHo", "Tribeca", "Harlem",
+		"Brooklyn", "Manhattan", "Queens", "Bronx", "Williamsburg",
+		"Park Slope", "Upper East Side", "Upper West Side", "SoHo",
+		"Tribeca", "Harlem", "DUMBO", "Greenpoint", "Bushwick",
+		"Long Island City", "Astoria", "Chelsea", "West Village",
+		"East Village", "NoHo", "Gramercy", "Flatiron",
 		// LA neighborhoods
-		"Venice Beach", "Silver Lake", "West Hollywood", "Santa Monica",
+		"Venice Beach", "Silver Lake", "West Hollywood",
 		"Beverly Hills", "Pasadena", "Glendale", "Culver City",
+		"Los Feliz", "Echo Park", "Highland Park", "Malibu",
+		"Marina del Rey", "Manhattan Beach", "Hermosa Beach",
+		"Redondo Beach", "Topanga", "Studio City", "Sherman Oaks",
 		// Bay Area
 		"Oakland", "Berkeley", "Palo Alto", "Mountain View", "Fremont",
-		// Other metros
-		"Plano", "Frisco", "Irving", "Mesa", "Tempe", "Chandler",
-		"Tampa", "Orlando", "Jacksonville", "Fort Lauderdale",
-		"Charlotte", "Raleigh", "Durham", "Richmond", "Virginia Beach",
-		"Salt Lake City", "Boise", "Tucson", "Albuquerque",
-		"Pittsburgh", "Philadelphia", "Baltimore", "Washington DC",
-		"San Juan",
+		"San Mateo", "Redwood City", "Menlo Park", "Marin",
+		"Mill Valley", "Sausalito", "Tiburon",
+		// Florida
+		"Tampa", "Orlando", "Fort Lauderdale", "West Palm Beach",
+		"Boca Raton", "Delray Beach", "Sarasota", "Naples",
+		"Fort Myers", "Destin", "St Petersburg", "Clearwater",
+		// Texas
+		"Plano", "Frisco", "Irving", "McKinney", "Round Rock",
+		"Sugar Land", "The Woodlands", "Katy",
+		// Arizona / West
+		"Mesa", "Tempe", "Chandler", "Gilbert", "Flagstaff",
+		// South
+		"Durham", "Chapel Hill", "Richmond", "Charleston",
+		"Savannah", "Tallahassee",
+		// Mountain
+		"Salt Lake City", "Boise", "Missoula", "Bozeman",
+		// NE / MidAtlantic
+		"Pittsburgh", "Philadelphia", "Hartford", "Providence",
+		"Princeton", "Hoboken", "Jersey City", "Stamford",
+		"New Haven", "Arlington VA", "Alexandria",
 	},
 	// Canada
 	"Canada": {
 		"Toronto", "Vancouver", "Montreal", "Calgary", "Edmonton",
 		"Ottawa", "Winnipeg", "Quebec City", "Halifax", "Victoria",
 		"Whistler", "Kelowna", "Saskatoon", "Regina",
+		"Mississauga", "Brampton", "Hamilton", "London Ontario",
+		"Surrey BC", "Burnaby", "Richmond BC", "Langley",
+		"Kitchener", "Waterloo", "Oakville", "Burlington",
+		"Markham", "Vaughan", "Richmond Hill", "Oshawa",
+		"Gatineau", "Sherbrooke", "Trois-Rivieres", "Laval",
+		"North Vancouver", "West Vancouver", "Squamish",
+		"Banff", "Canmore", "Jasper", "Tofino", "Ucluelet",
+		"Niagara Falls", "Kingston", "Guelph",
 	},
-	// Australia
+	// Australia — high priority wellness market
 	"Australia": {
+		// Major cities
 		"Sydney", "Melbourne", "Brisbane", "Perth", "Adelaide",
 		"Gold Coast", "Canberra", "Hobart", "Darwin", "Newcastle",
-		"Byron Bay", "Bondi", "Manly", "Surry Hills", "Fitzroy",
-		"Noosa", "Cairns", "Townsville", "Wollongong", "Geelong",
-		"Sunshine Coast", "Fremantle", "Parramatta",
+		// Wellness hotspots
+		"Byron Bay", "Noosa", "Mornington", "Port Macquarie",
+		"Margaret River", "Yamba", "Bellingen", "Kiama",
+		// Sydney suburbs
+		"Bondi", "Bondi Junction", "Manly", "Surry Hills",
+		"Paddington", "Newtown", "Mosman", "Double Bay",
+		"Chatswood", "Parramatta", "Cronulla", "Coogee",
+		// Melbourne suburbs
+		"Fitzroy", "Collingwood", "Brunswick", "Richmond",
+		"St Kilda", "South Yarra", "Carlton", "Prahran",
+		"Hawthorn", "Toorak", "Elwood", "Windsor",
+		// Brisbane / QLD
+		"New Farm", "Fortitude Valley", "West End", "Teneriffe",
+		"Cairns", "Townsville", "Port Douglas", "Airlie Beach",
+		"Sunshine Coast", "Maroochydore", "Caloundra", "Mooloolaba",
+		// WA
+		"Fremantle", "Cottesloe", "Subiaco", "Scarborough",
+		// Other
+		"Wollongong", "Geelong", "Bendigo", "Ballarat",
+		"Launceston", "Toowoomba",
 	},
 	// New Zealand
 	"New Zealand": {
@@ -137,9 +244,19 @@ var Cities = map[string][]string{
 		"Bristol", "Edinburgh", "Glasgow", "Brighton", "Oxford",
 		"Cambridge", "Bath", "Nottingham", "Sheffield", "Cardiff",
 		"Belfast", "York", "Exeter", "Southampton", "Reading",
+		"Newcastle", "Plymouth", "Portsmouth", "Aberdeen", "Dundee",
+		"Inverness", "Stirling", "Swansea", "Newport", "Derby",
+		"Leicester", "Coventry", "Milton Keynes", "Northampton",
+		"Ipswich", "Norwich", "Canterbury", "Bournemouth",
+		"Cheltenham", "Harrogate", "Chester", "Durham", "Lancaster",
+		"St Albans", "Guildford", "Tunbridge Wells", "Winchester",
 		// London neighborhoods
 		"Shoreditch", "Camden", "Hackney", "Notting Hill", "Chelsea",
 		"Islington", "Fulham", "Brixton", "Clapham", "Richmond",
+		"Kensington", "Mayfair", "Marylebone", "Fitzrovia",
+		"Soho", "Covent Garden", "Bloomsbury", "Greenwich",
+		"Hampstead", "Highgate", "Stoke Newington", "Dalston",
+		"Peckham", "Dulwich", "Wimbledon", "Putney", "Wandsworth",
 	},
 	// Ireland
 	"Ireland": {
@@ -151,6 +268,11 @@ var Cities = map[string][]string{
 		"Stuttgart", "Düsseldorf", "Leipzig", "Dresden", "Hannover",
 		"Nuremberg", "Freiburg", "Heidelberg", "Bonn", "Essen",
 		"Dortmund", "Bremen", "Augsburg", "Potsdam",
+		"Münster", "Karlsruhe", "Mannheim", "Wiesbaden", "Mainz",
+		"Aachen", "Kiel", "Lübeck", "Regensburg", "Tübingen",
+		"Weimar", "Erfurt", "Jena", "Konstanz", "Rostock",
+		"Kreuzberg", "Mitte", "Prenzlauer Berg", "Friedrichshain",
+		"Neukölln", "Charlottenburg", "Schwabing",
 	},
 	// Austria
 	"Austria": {
@@ -165,6 +287,11 @@ var Cities = map[string][]string{
 		"Paris", "Lyon", "Marseille", "Toulouse", "Nice",
 		"Bordeaux", "Strasbourg", "Nantes", "Montpellier", "Lille",
 		"Aix-en-Provence", "Cannes", "Biarritz", "Annecy",
+		"Rennes", "Reims", "Le Havre", "Saint-Étienne",
+		"Toulon", "Grenoble", "Dijon", "Angers", "Nîmes",
+		"Villeurbanne", "Tours", "Clermont-Ferrand", "Orléans",
+		"Caen", "Rouen", "Avignon", "Saint-Tropez", "Monaco",
+		"Le Marais", "Montmartre", "Saint-Germain", "Bastille",
 	},
 	// Spain
 	"Spain": {
@@ -227,26 +354,37 @@ var Cities = map[string][]string{
 	"Turkey": {
 		"Istanbul", "Ankara", "Izmir", "Antalya", "Bodrum",
 	},
-	// Southeast Asia
+	// Southeast Asia — big wellness tourism markets
 	"Thailand": {
 		"Bangkok", "Chiang Mai", "Phuket", "Koh Samui", "Pattaya",
 		"Krabi", "Hua Hin", "Pai", "Koh Phangan", "Koh Lanta",
-		"Chiang Rai", "Kanchanaburi",
+		"Chiang Rai", "Kanchanaburi", "Koh Tao", "Ao Nang",
+		"Rawai", "Kata", "Karon", "Kamala", "Patong",
+		"Sukhumvit", "Thonglor", "Ekkamai", "Sathorn", "Silom",
+		"Ari", "Nimman", "Old City Chiang Mai",
 	},
 	"Vietnam": {
 		"Ho Chi Minh City", "Hanoi", "Da Nang", "Hoi An", "Nha Trang",
-		"Phu Quoc", "Dalat", "Hue",
+		"Phu Quoc", "Dalat", "Hue", "Mui Ne", "Can Tho",
+		"Vung Tau", "Sapa", "Ha Long",
+		"District 1", "District 2", "District 7", "Thao Dien",
 	},
 	"Philippines": {
 		"Manila", "Cebu", "Davao", "Makati", "Quezon City",
 		"Siargao", "Palawan", "Boracay", "Tagaytay", "Baguio",
+		"Bohol", "Coron", "El Nido", "Dumaguete", "Iloilo",
+		"BGC", "Taguig", "Alabang", "Ortigas",
 	},
 	"Malaysia": {
 		"Kuala Lumpur", "Penang", "Johor Bahru", "Kota Kinabalu",
 		"Langkawi", "Malacca", "Ipoh", "Kuching",
+		"Shah Alam", "Petaling Jaya", "Subang Jaya", "Cyberjaya",
+		"George Town", "Kota Damansara", "Mont Kiara", "Bangsar",
 	},
 	"Singapore": {
-		"Singapore",
+		"Singapore", "Orchard", "Tanjong Pagar", "Bugis",
+		"Holland Village", "Tiong Bahru", "Katong", "Joo Chiat",
+		"Sentosa", "Jurong", "Woodlands",
 	},
 	"Cambodia": {
 		"Phnom Penh", "Siem Reap", "Kampot",
