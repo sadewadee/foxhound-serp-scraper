@@ -77,26 +77,32 @@ var PersonalNiches = []string{
 }
 
 // WellnessTemplates for business search query variations.
+// Biased toward email/contact operators which yield higher email coverage.
 var WellnessTemplates = []string{
-	"%s %s",           // "yoga studio bali"
-	"%s in %s",        // "yoga studio in bali"
-	"%s near %s",      // "yoga studio near bali"
-	"best %s in %s",   // "best yoga studio in bali"
-	"%s %s contact",   // "yoga studio bali contact"
-	"%s %s email",     // "yoga studio bali email"
+	"%s %s contact",        // "yoga studio bali contact"
+	"%s %s email",          // "yoga studio bali email"
+	"%s %s \"@gmail.com\"", // explicit gmail in page
+	"%s in %s",             // "yoga studio in bali"
+	"best %s in %s",        // "best yoga studio in bali"
+	"%s %s book now",       // booking page usually has contact
+	"%s %s phone number",
 }
 
 // PersonalTemplates target individuals — higher gmail/yahoo yield.
+// Heavy use of site: operators — Bing/DDG honor them reliably.
 var PersonalTemplates = []string{
-	"%s %s",                       // "yoga instructor bali"
-	"%s in %s",                    // "yoga instructor in bali"
-	"%s %s email",                 // "yoga instructor bali email"
-	"%s %s contact",               // "yoga instructor bali contact"
-	"%s %s \"@gmail.com\"",        // "yoga instructor bali" "@gmail.com"
-	"%s %s \"@yahoo.com\"",        // "yoga instructor bali" "@yahoo.com"
-	"hire %s in %s",               // "hire yoga instructor in bali"
-	"freelance %s %s",             // "freelance personal trainer bali"
-	"%s %s instagram",             // "yoga instructor bali instagram" (bio has email)
+	"%s %s \"@gmail.com\"", // "yoga instructor bali @gmail.com"
+	"%s %s \"@yahoo.com\"",
+	"%s %s \"@hotmail.com\"",
+	"%s %s \"@outlook.com\"",
+	"%s %s email", // "yoga instructor bali email"
+	"%s %s contact",
+	"site:instagram.com %s %s",   // IG bios often expose email
+	"site:linkedin.com/in %s %s", // LinkedIn public profiles
+	"site:facebook.com %s %s",    // FB page About tabs
+	"hire %s in %s",
+	"freelance %s %s",
+	"independent %s in %s",
 }
 
 // Cities organized by country — includes neighborhoods for major metros.

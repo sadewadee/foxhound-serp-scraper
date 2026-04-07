@@ -257,13 +257,13 @@ func setDefaults(cfg *Config) {
 		cfg.SERP.Engines = "all"
 	}
 	if cfg.SERP.GoogleMaxPages == 0 {
-		cfg.SERP.GoogleMaxPages = 3
+		cfg.SERP.GoogleMaxPages = 1
 	}
 	if cfg.SERP.BingMaxPages == 0 {
 		cfg.SERP.BingMaxPages = 5
 	}
 	if cfg.SERP.DDGMaxPages == 0 {
-		cfg.SERP.DDGMaxPages = 1
+		cfg.SERP.DDGMaxPages = 3
 	}
 	if cfg.Website.Concurrency == 0 {
 		cfg.Website.Concurrency = 5

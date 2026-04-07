@@ -142,9 +142,9 @@ services:
       # ── SERP engines + timing ──
       SERP_ENGINES: "${SERP_ENGINES:-all}"
       SERP_DELAY_MS: "${SERP_DELAY_MS:-3000}"
-      GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-3}"
+      GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-1}"
       BING_MAX_PAGES: "${BING_MAX_PAGES:-5}"
-      DDG_MAX_PAGES: "${DDG_MAX_PAGES:-1}"
+      DDG_MAX_PAGES: "${DDG_MAX_PAGES:-3}"
       # ── Beta features DISABLED for SERP — circuit breaker skips proxy too aggressively ──
       BETA_FEATURES: "0"
       # ── Persister (batch flush Redis→DB) ──
