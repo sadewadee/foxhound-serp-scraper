@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,9 @@ type SERPStage struct {
 	queriesProcessed atomic.Int64
 	urlsFound        atomic.Int64
 	pagesProcessed   atomic.Int64
+
+	// 429 cooldown: when consecutive 429s exceed threshold, all tabs back off.
+	consecutive429 atomic.Int64
 
 	betaCBSkipped  atomic.Int64
 	betaCBPassed   atomic.Int64
@@ -366,6 +370,20 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		var fetchErr error
 
 		if eng.NeedsBrowser() {
+			// Fix 3: Consecutive 429 cooldown — if too many 429s, back off all tabs.
+			if c429 := s.consecutive429.Load(); c429 >= 5 {
+				cooldown := time.Duration(2) * time.Minute
+				slog.Warn("serp: 429 cooldown — too many rate limits, backing off", "consecutive", c429, "cooldown", cooldown, "tab", tabID)
+				s.redis.Del(ctx, "serp:lock:"+job.ID)
+				s.db.Exec(`UPDATE serp_jobs SET status = 'new', locked_by = NULL, picked_at = NULL, updated_at = NOW() WHERE id = $1`, job.ID)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(cooldown):
+				}
+				continue
+			}
+
 			if s.fatigue != nil {
 				base := s.timing.Delay()
 				adjusted := s.fatigue.AdjustDelay(base)
@@ -386,14 +404,17 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				continue
 			}
 
+			// Fix 1: Per-fetch timeout — prevent browser.Fetch from hanging forever.
+			fetchCtx, fetchCancel := context.WithTimeout(ctx, 45*time.Second)
+
 			if s.circuitBreaker != nil {
 				cbFetcher := s.circuitBreaker.Wrap(browser)
-				probeResp, probeErr := cbFetcher.Fetch(ctx, &foxhound.Job{
+				probeResp, probeErr := cbFetcher.Fetch(fetchCtx, &foxhound.Job{
 					ID: job.ID, URL: job.URL, Method: "GET", FetchMode: foxhound.FetchBrowser,
 				})
 				if probeErr == nil && probeResp != nil && probeResp.StatusCode == 503 {
 					s.betaCBSkipped.Add(1)
-					directBody, directErr := s.fetchDirect(ctx, job.ID, job.URL, eng)
+					directBody, directErr := s.fetchDirect(fetchCtx, job.ID, job.URL, eng)
 					if directErr == nil && directBody != nil {
 						body = directBody
 					} else {
@@ -414,11 +435,12 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			if body == nil && fetchErr == nil {
 				steps := eng.FetchSteps()
 				if len(steps) > 0 {
-					body, fetchErr = scraper.FetchSERPWithEngine(ctx, browser, job.URL, job.ID, steps)
+					body, fetchErr = scraper.FetchSERPWithEngine(fetchCtx, browser, job.URL, job.ID, steps)
 				} else {
-					body, fetchErr = scraper.FetchSERP(ctx, browser, job.URL, job.ID)
+					body, fetchErr = scraper.FetchSERP(fetchCtx, browser, job.URL, job.ID)
 				}
 			}
+			fetchCancel()
 		} else {
 			// Recycle stealth fetcher periodically to rotate identity/TLS fingerprint.
 			stealthCount++
@@ -440,12 +462,29 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			newAttempt, _ := s.redis.Incr(ctx, attemptKey).Result()
 			s.redis.Expire(ctx, attemptKey, 1*time.Hour)
 
+			errStr := fetchErr.Error()
 			slog.Warn("serp: fetch failed", "job", job.ID, "attempt", newAttempt, "tab", tabID, "error", fetchErr)
+
+			// Fix 2: 429 backoff — sleep this tab before picking next job.
+			is429 := strings.Contains(errStr, "429")
+			isCaptcha := strings.Contains(errStr, "captcha")
+			if is429 || isCaptcha {
+				s.consecutive429.Add(1)
+				backoff429 := 30 * time.Second
+				slog.Warn("serp: rate limited, tab backing off", "tab", tabID, "backoff", backoff429)
+				select {
+				case <-ctx.Done():
+				case <-time.After(backoff429):
+				}
+			} else {
+				// Not a 429 — reset consecutive counter.
+				s.consecutive429.Store(0)
+			}
 
 			maxAttempts := int64(5)
 			if newAttempt >= maxAttempts {
 				s.db.Exec(`UPDATE serp_jobs SET status = 'failed', attempt_count = $1, error_msg = $2, locked_by = NULL, updated_at = NOW() WHERE id = $3`,
-					int(newAttempt), fetchErr.Error(), job.ID)
+					int(newAttempt), errStr, job.ID)
 			} else {
 				shift := newAttempt - 1
 				if shift < 0 {
@@ -453,7 +492,7 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				}
 				backoffSec := 30 * (1 << shift)
 				s.db.Exec(`UPDATE serp_jobs SET status = 'new', attempt_count = $1, next_attempt_at = NOW() + interval '1 second' * $2, error_msg = $3, locked_by = NULL, picked_at = NULL, updated_at = NOW() WHERE id = $4`,
-					int(newAttempt), backoffSec, fetchErr.Error(), job.ID)
+					int(newAttempt), backoffSec, errStr, job.ID)
 			}
 
 			s.redis.Del(ctx, "serp:lock:"+job.ID)
@@ -463,6 +502,9 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			}
 			continue
 		}
+
+		// Success — reset 429 cooldown counter.
+		s.consecutive429.Store(0)
 
 		// Parse SERP results.
 		urls, parseErr := eng.ParseResults(body)
