@@ -375,13 +375,17 @@ func GenerateKeywords(niches, cities []string, templates []string) []string {
 }
 
 // GenerateAllKeywords generates keywords for ALL cities in ALL countries.
-// Single-template focus: "<niche> <city> contact".
+// Combines business templates + personal templates for maximum coverage.
 func GenerateAllKeywords() []string {
 	var allCities []string
 	for _, c := range Cities {
 		allCities = append(allCities, c...)
 	}
-	return GenerateKeywords(Niches, allCities, WellnessTemplates)
+	// Business queries (yoga studio bali, etc).
+	business := GenerateKeywords(Niches, allCities, WellnessTemplates)
+	// Personal queries (yoga instructor bali @gmail.com, etc).
+	personal := GenerateKeywords(PersonalNiches, allCities, PersonalTemplates)
+	return dedupStrings(append(business, personal...))
 }
 
 // GenerateKeywordsForCountry generates keywords for a specific country.
@@ -390,7 +394,9 @@ func GenerateKeywordsForCountry(country string) []string {
 	if !ok {
 		return nil
 	}
-	return GenerateKeywords(Niches, cities, WellnessTemplates)
+	business := GenerateKeywords(Niches, cities, WellnessTemplates)
+	personal := GenerateKeywords(PersonalNiches, cities, PersonalTemplates)
+	return dedupStrings(append(business, personal...))
 }
 
 // dedupStrings removes duplicate strings (case-insensitive).
