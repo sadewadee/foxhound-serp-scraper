@@ -448,9 +448,12 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				stealth.Close()
 				stealth = scraper.NewStealth(s.cfg)
 				stealthCount = 0
-				slog.Debug("serp: stealth recycled", "tab", tabID)
+				slog.Info("serp: stealth recycled", "tab", tabID, "engine", job.Engine)
 			}
-			body, fetchErr = scraper.FetchSERPStealth(ctx, stealth, job.URL, job.ID)
+			// Per-fetch timeout for stealth too.
+			stealthCtx, stealthCancel := context.WithTimeout(ctx, 30*time.Second)
+			body, fetchErr = scraper.FetchSERPStealth(stealthCtx, stealth, job.URL, job.ID)
+			stealthCancel()
 		}
 
 		if fetchErr == nil && eng.IsCaptchaPage(body) {

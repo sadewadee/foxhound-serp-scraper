@@ -35,12 +35,17 @@ func NewSERPFeeder(db *sql.DB, redisClient *redis.Client) *SERPFeeder {
 	return &SERPFeeder{db: db, redis: redisClient}
 }
 
+// engines to round-robin across.
+var feedEngines = []string{"google", "bing", "duckduckgo"}
+
 // Run starts the SERP feeder loop. Blocks until ctx is cancelled.
 func (f *SERPFeeder) Run(ctx context.Context) {
 	slog.Info("serp-feeder: starting")
 
 	// Start stale-pick reconciler in background.
 	go f.reconcileStale(ctx)
+
+	engineIdx := 0
 
 	for {
 		select {
@@ -61,37 +66,16 @@ func (f *SERPFeeder) Run(ctx context.Context) {
 			continue
 		}
 
-		// Atomically claim unclaimed jobs from DB.
-		rows, err := f.db.QueryContext(ctx, `
-			UPDATE serp_jobs SET status = 'processing', locked_at = NOW(), picked_at = NOW()
-			WHERE id IN (
-				SELECT id FROM serp_jobs
-				WHERE status = 'new'
-				  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-				ORDER BY priority DESC, created_at
-				LIMIT 50
-				FOR UPDATE SKIP LOCKED
-			)
-			RETURNING id, search_url, parent_job_id, page_num, COALESCE(engine, 'google')
-		`)
-		if err != nil {
-			slog.Warn("serp-feeder: query failed", "error", err)
-			sleepCtx(ctx, 2*time.Second)
-			continue
-		}
+		// Round-robin: pick from one engine at a time.
+		engine := feedEngines[engineIdx%len(feedEngines)]
+		engineIdx++
 
-		var items []SERPBufferItem
-		for rows.Next() {
-			var item SERPBufferItem
-			if err := rows.Scan(&item.ID, &item.URL, &item.QueryID, &item.PageNum, &item.Engine); err != nil {
-				continue
-			}
-			items = append(items, item)
-		}
-		rows.Close()
-
+		items := f.claimJobs(ctx, engine)
 		if len(items) == 0 {
-			sleepCtx(ctx, 2*time.Second)
+			// If all 3 engines return 0 in a row, sleep briefly.
+			if engineIdx%len(feedEngines) == 0 {
+				sleepCtx(ctx, 2*time.Second)
+			}
 			continue
 		}
 
@@ -101,8 +85,40 @@ func (f *SERPFeeder) Run(ctx context.Context) {
 			f.redis.RPush(ctx, SERPBufferKey, string(data))
 		}
 
-		slog.Debug("serp-feeder: pushed to buffer", "count", len(items))
+		slog.Info("serp-feeder: pushed to buffer", "engine", engine, "count", len(items))
 	}
+}
+
+// claimJobs atomically claims up to 20 unclaimed jobs for a specific engine.
+func (f *SERPFeeder) claimJobs(ctx context.Context, engine string) []SERPBufferItem {
+	rows, err := f.db.QueryContext(ctx, `
+		UPDATE serp_jobs SET status = 'processing', locked_at = NOW(), picked_at = NOW()
+		WHERE id IN (
+			SELECT id FROM serp_jobs
+			WHERE status = 'new'
+			  AND engine = $1
+			  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+			ORDER BY priority DESC, created_at
+			LIMIT 20
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, search_url, parent_job_id, page_num, COALESCE(engine, 'google')
+	`, engine)
+	if err != nil {
+		slog.Warn("serp-feeder: query failed", "engine", engine, "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var items []SERPBufferItem
+	for rows.Next() {
+		var item SERPBufferItem
+		if err := rows.Scan(&item.ID, &item.URL, &item.QueryID, &item.PageNum, &item.Engine); err != nil {
+			continue
+		}
+		items = append(items, item)
+	}
+	return items
 }
 
 // reconcileStale resets picked_at for jobs that were picked but never processed.
