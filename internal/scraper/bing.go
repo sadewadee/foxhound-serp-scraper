@@ -3,6 +3,7 @@
 package scraper
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"strings"
@@ -48,10 +49,17 @@ func (b *BingEngine) ParseResults(body []byte) ([]string, error) {
 
 	// Bing organic results: anchor inside h2 inside li.b_algo.
 	// Picking the first a[href] picks tracking/sitelinks; h2 a is the title link.
+	// Bing wraps real URLs in /ck/a?...&u=a1<base64>&ntb=1 — decode to get target.
 	doc.Each("li.b_algo h2 a", func(_ int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
 		if !exists || href == "" {
 			return
+		}
+		// Unwrap Bing tracking redirect.
+		if strings.Contains(href, "bing.com/ck/a") {
+			if real := unwrapBingRedirect(href); real != "" {
+				href = real
+			}
 		}
 		if !strings.HasPrefix(href, "http") {
 			return
@@ -69,6 +77,37 @@ func (b *BingEngine) ParseResults(body []byte) ([]string, error) {
 	})
 
 	return urls, nil
+}
+
+// unwrapBingRedirect decodes the actual URL from a Bing /ck/a? tracking link.
+// Format: ...&u=a1<base64-url-of-target>&ntb=1
+// The "a1" prefix marks the encoding scheme; remainder is base64url of the URL.
+func unwrapBingRedirect(href string) string {
+	u, err := url.Parse(href)
+	if err != nil {
+		return ""
+	}
+	uParam := u.Query().Get("u")
+	if uParam == "" {
+		return ""
+	}
+	if !strings.HasPrefix(uParam, "a1") {
+		return ""
+	}
+	encoded := uParam[2:]
+	// Bing uses URL-safe base64 without padding.
+	if pad := len(encoded) % 4; pad != 0 {
+		encoded += strings.Repeat("=", 4-pad)
+	}
+	decoded, err := base64.URLEncoding.DecodeString(encoded)
+	if err != nil {
+		// Try standard base64.
+		decoded, err = base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return ""
+		}
+	}
+	return string(decoded)
 }
 
 func (b *BingEngine) FetchSteps() []foxhound.JobStep {
