@@ -109,6 +109,39 @@ var PersonalTemplates = []string{
 	"%s %s \"@protonmail.com\"",
 }
 
+// SiteTemplates — site: operator queries for high-value directories.
+// Bing/DDG honor site: reliably. Used for directory farming where
+// the platform itself has structured business info exposed to SERP.
+var SiteTemplates = []string{
+	// Yoga Alliance — registered yoga teachers directory
+	"site:yogaalliance.org %s %s",
+	// ClassPass — global fitness class marketplace
+	"site:classpass.com %s %s",
+	// Mindbody — studio booking platform (owner + studio info)
+	"site:mindbodyonline.com %s %s",
+	// Instagram — bio often exposes email
+	"site:instagram.com %s %s email",
+	"site:instagram.com %s %s contact",
+	"site:instagram.com %s %s \"@gmail.com\"",
+	// Facebook pages — About section has contact info
+	"site:facebook.com %s %s contact",
+	"site:facebook.com %s %s email",
+	// LinkedIn public profiles — name + company → domain guess chain
+	"site:linkedin.com/in %s %s",
+	// Yelp business listings
+	"site:yelp.com/biz %s %s",
+	// Eventbrite — wellness event organizers
+	"site:eventbrite.com %s %s",
+	// Punchpass / Momence / WellnessLiving — smaller studio platforms
+	"site:punchpass.com %s %s",
+	"site:momence.com %s %s",
+	"site:wellnessliving.com %s %s",
+	// Directory / review sites
+	"site:yogatrail.com %s %s",
+	"site:bookyogaretreats.com %s %s",
+	"site:bookyogateachertraining.com %s %s",
+}
+
 // Cities organized by country — includes neighborhoods for major metros.
 var Cities = map[string][]string{
 	// Indonesia
@@ -503,17 +536,26 @@ func GenerateKeywords(niches, cities []string, templates []string) []string {
 }
 
 // GenerateAllKeywords generates keywords for ALL cities in ALL countries.
-// Combines business templates + personal templates for maximum coverage.
+// Combines business + personal + site-operator templates for maximum coverage.
 func GenerateAllKeywords() []string {
 	var allCities []string
 	for _, c := range Cities {
 		allCities = append(allCities, c...)
 	}
-	// Business queries (yoga studio bali, etc).
+	// Business queries (yoga studio bali contact, etc).
 	business := GenerateKeywords(Niches, allCities, WellnessTemplates)
 	// Personal queries (yoga instructor bali @gmail.com, etc).
 	personal := GenerateKeywords(PersonalNiches, allCities, PersonalTemplates)
-	return dedupStrings(append(business, personal...))
+	// Site-operator queries (site:yogaalliance.org yoga instructor bali, etc).
+	// Use business niches only for site queries — personal niches too noisy
+	// on directory sites like ClassPass/Mindbody.
+	siteBiz := GenerateKeywords(Niches, allCities, SiteTemplates)
+	sitePersonal := GenerateKeywords(PersonalNiches, allCities, SiteTemplates)
+
+	all := append(business, personal...)
+	all = append(all, siteBiz...)
+	all = append(all, sitePersonal...)
+	return dedupStrings(all)
 }
 
 // GenerateKeywordsForCountry generates keywords for a specific country.
@@ -524,7 +566,13 @@ func GenerateKeywordsForCountry(country string) []string {
 	}
 	business := GenerateKeywords(Niches, cities, WellnessTemplates)
 	personal := GenerateKeywords(PersonalNiches, cities, PersonalTemplates)
-	return dedupStrings(append(business, personal...))
+	siteBiz := GenerateKeywords(Niches, cities, SiteTemplates)
+	sitePersonal := GenerateKeywords(PersonalNiches, cities, SiteTemplates)
+
+	all := append(business, personal...)
+	all = append(all, siteBiz...)
+	all = append(all, sitePersonal...)
+	return dedupStrings(all)
 }
 
 // dedupStrings removes duplicate strings (case-insensitive).
