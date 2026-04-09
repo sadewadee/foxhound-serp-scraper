@@ -528,7 +528,21 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		c.emailsFound.Add(int64(len(emails)))
 		c.phonesFound.Add(int64(len(phones)))
 
-		slog.Debug("enrich: page done", "url", pageURL, "emails", len(emails), "phones", len(phones), "worker", workerID)
+		// Only log pages that actually yielded contacts — skip empty ones
+		// to avoid log spam for the ~70% of pages that return nothing.
+		if len(emails) > 0 || len(phones) > 0 {
+			firstEmail := ""
+			if len(emails) > 0 {
+				firstEmail = emails[0]
+			}
+			slog.Info("enrich: page done",
+				"url", pageURL,
+				"emails", len(emails),
+				"phones", len(phones),
+				"first_email", firstEmail,
+				"business", cd.BusinessName,
+				"worker", workerID)
+		}
 	}
 }
 
