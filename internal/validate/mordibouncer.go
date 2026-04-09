@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -138,14 +137,104 @@ type emailRow struct {
 	email string
 }
 
+// bulkSubmitRequest is the body for POST /v1/bulk.
+type bulkSubmitRequest struct {
+	Input []string `json:"input"`
+}
+
+// bulkSubmitResponse is the response from POST /v1/bulk.
+type bulkSubmitResponse struct {
+	JobID int64 `json:"job_id"`
+}
+
+// bulkProgressResponse is the response from GET /v1/bulk/{job_id}.
+type bulkProgressResponse struct {
+	JobID          int64  `json:"job_id"`
+	TotalRecords   int    `json:"total_records"`
+	TotalProcessed int    `json:"total_processed"`
+	JobStatus      string `json:"job_status"` // "Running", "Completed"
+}
+
+// SubmitBulk submits a batch of emails for async validation.
+func (c *MordibouncerClient) SubmitBulk(ctx context.Context, emails []string) (int64, error) {
+	body, err := json.Marshal(bulkSubmitRequest{Input: emails})
+	if err != nil {
+		return 0, fmt.Errorf("mordibouncer: marshal: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", c.apiURL+"/v1/bulk", bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("mordibouncer: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-mordibouncer-secret", c.secret)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("mordibouncer: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("mordibouncer: HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result bulkSubmitResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("mordibouncer: decode: %w", err)
+	}
+	return result.JobID, nil
+}
+
+// PollBulk checks if a bulk job is done.
+func (c *MordibouncerClient) PollBulk(ctx context.Context, jobID int64) (*bulkProgressResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/bulk/%d", c.apiURL, jobID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-mordibouncer-secret", c.secret)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result bulkProgressResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// FetchBulkResults gets the full results for a completed bulk job.
+func (c *MordibouncerClient) FetchBulkResults(ctx context.Context, jobID int64) ([]CheckResult, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/bulk/%d/results", c.apiURL, jobID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-mordibouncer-secret", c.secret)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var results []CheckResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 // BackfillValidation scans existing emails with pending validation status
-// and validates them via Mordibouncer using N concurrent workers.
-// Runs as a background goroutine in the manager container.
+// and validates them via Mordibouncer bulk API.
+// Flow: fetch 500 pending → submit bulk → poll until done → fetch results → write DB.
 func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerClient) {
-	const numWorkers = 20
 	const batchSize = 500
 
-	slog.Info("backfill: starting email validation", "workers", numWorkers)
+	slog.Info("backfill: starting email validation (bulk mode)")
 
 	// Small delay to let other services start first.
 	select {
@@ -155,76 +244,6 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 	}
 
 	var validated, removed atomic.Int64
-
-	// Channel for distributing emails to workers.
-	jobs := make(chan emailRow, numWorkers*2)
-
-	// Start worker pool.
-	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for e := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				validateOne(ctx, db, client, e, &validated, &removed)
-			}
-		}(i)
-	}
-
-	// Feeder: fetch batches from DB and feed workers.
-	go func() {
-		defer close(jobs)
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-
-			rows, err := db.QueryContext(ctx, `
-				SELECT id, email
-				FROM emails
-				WHERE validation_status = 'pending'
-				ORDER BY created_at ASC
-				LIMIT $1
-			`, batchSize)
-			if err != nil {
-				slog.Warn("backfill: query failed", "error", err)
-				time.Sleep(30 * time.Second)
-				continue
-			}
-
-			var batch []emailRow
-			for rows.Next() {
-				var e emailRow
-				if err := rows.Scan(&e.id, &e.email); err == nil {
-					batch = append(batch, e)
-				}
-			}
-			rows.Close()
-
-			if len(batch) == 0 {
-				slog.Info("backfill: caught up, sleeping 60s",
-					"total_validated", validated.Load(),
-					"total_removed", removed.Load())
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(60 * time.Second):
-				}
-				continue
-			}
-
-			for _, e := range batch {
-				select {
-				case <-ctx.Done():
-					return
-				case jobs <- e:
-				}
-			}
-		}
-	}()
 
 	// Progress logger.
 	go func() {
@@ -242,51 +261,142 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 		}
 	}()
 
-	wg.Wait()
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+
+		// 1. Fetch batch of pending emails.
+		rows, err := db.QueryContext(ctx, `
+			SELECT id, email
+			FROM emails
+			WHERE validation_status = 'pending'
+			ORDER BY created_at ASC
+			LIMIT $1
+		`, batchSize)
+		if err != nil {
+			slog.Warn("backfill: query failed", "error", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+
+		var batch []emailRow
+		for rows.Next() {
+			var e emailRow
+			if err := rows.Scan(&e.id, &e.email); err == nil {
+				batch = append(batch, e)
+			}
+		}
+		rows.Close()
+
+		if len(batch) == 0 {
+			slog.Info("backfill: caught up, sleeping 60s",
+				"validated", validated.Load(), "removed", removed.Load())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(60 * time.Second):
+			}
+			continue
+		}
+
+		// Build email list and id lookup.
+		emails := make([]string, len(batch))
+		idByEmail := make(map[string]int64, len(batch))
+		for i, e := range batch {
+			emails[i] = e.email
+			idByEmail[e.email] = e.id
+		}
+
+		// 2. Submit bulk job.
+		jobID, submitErr := client.SubmitBulk(ctx, emails)
+		if submitErr != nil {
+			slog.Warn("backfill: bulk submit failed, marking batch unknown", "error", submitErr)
+			for _, e := range batch {
+				db.ExecContext(ctx, `UPDATE emails SET validation_status = 'unknown', validated_at = NOW() WHERE id = $1`, e.id)
+				validated.Add(1)
+			}
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		slog.Info("backfill: bulk job submitted", "job_id", jobID, "count", len(batch))
+
+		// 3. Poll until completed (max 5 min).
+		deadline := time.Now().Add(5 * time.Minute)
+		completed := false
+		for time.Now().Before(deadline) {
+			if ctx.Err() != nil {
+				return
+			}
+			progress, pollErr := client.PollBulk(ctx, jobID)
+			if pollErr != nil {
+				slog.Warn("backfill: poll failed", "job_id", jobID, "error", pollErr)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			if progress.JobStatus == "Completed" {
+				completed = true
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+
+		if !completed {
+			slog.Warn("backfill: bulk job timed out, marking batch unknown", "job_id", jobID)
+			for _, e := range batch {
+				db.ExecContext(ctx, `UPDATE emails SET validation_status = 'unknown', validated_at = NOW() WHERE id = $1`, e.id)
+				validated.Add(1)
+			}
+			continue
+		}
+
+		// 4. Fetch results.
+		results, fetchErr := client.FetchBulkResults(ctx, jobID)
+		if fetchErr != nil {
+			slog.Warn("backfill: fetch results failed", "job_id", jobID, "error", fetchErr)
+			for _, e := range batch {
+				db.ExecContext(ctx, `UPDATE emails SET validation_status = 'unknown', validated_at = NOW() WHERE id = $1`, e.id)
+				validated.Add(1)
+			}
+			continue
+		}
+
+		// 5. Write results to DB.
+		for _, r := range results {
+			eid, ok := idByEmail[r.Email]
+			if !ok {
+				continue
+			}
+			if r.IsGoodEmail() {
+				db.ExecContext(ctx, `
+					UPDATE emails SET
+						validation_status = 'valid',
+						mx_valid = $1, deliverable = $2, disposable = $3,
+						role_account = $4, free_email = $5, catch_all = $6,
+						validated_at = NOW()
+					WHERE id = $7
+				`, r.MX.AcceptsMail, r.SMTP.IsDeliverable, r.Misc.IsDisposable,
+					r.Misc.IsRoleAccount, r.Misc.IsFreeProvider, r.SMTP.IsCatchAll, eid)
+			} else {
+				db.ExecContext(ctx, `
+					UPDATE emails SET
+						validation_status = 'invalid',
+						reason = $1,
+						validated_at = NOW()
+					WHERE id = $2
+				`, r.IsReachable, eid)
+				removed.Add(1)
+			}
+			validated.Add(1)
+		}
+
+		slog.Info("backfill: bulk job done", "job_id", jobID, "results", len(results))
+	}
+
 	slog.Info("backfill: finished",
 		"validated", validated.Load(),
 		"removed", removed.Load())
-}
-
-// validateOne validates a single email and writes the result to DB.
-func validateOne(ctx context.Context, db *sql.DB, client *MordibouncerClient, e emailRow, validated, removed *atomic.Int64) {
-	emailCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	result, checkErr := client.Check(emailCtx, e.email)
-	if checkErr != nil {
-		db.ExecContext(ctx, `UPDATE emails SET validation_status = 'unknown', validated_at = NOW() WHERE id = $1`, e.id)
-		validated.Add(1)
-		return
-	}
-
-	if result.IsGoodEmail() {
-		mxValid := result.MX.AcceptsMail
-		deliverable := result.SMTP.IsDeliverable
-		disposable := result.Misc.IsDisposable
-		roleAccount := result.Misc.IsRoleAccount
-		freeEmail := result.Misc.IsFreeProvider
-		catchAll := result.SMTP.IsCatchAll
-		db.ExecContext(ctx, `
-			UPDATE emails SET
-				validation_status = 'valid',
-				mx_valid = $1, deliverable = $2, disposable = $3,
-				role_account = $4, free_email = $5, catch_all = $6,
-				validated_at = NOW()
-			WHERE id = $7
-		`, mxValid, deliverable, disposable, roleAccount, freeEmail, catchAll, e.id)
-	} else {
-		db.ExecContext(ctx, `
-			UPDATE emails SET
-				validation_status = 'invalid',
-				reason = $1,
-				validated_at = NOW()
-			WHERE id = $2
-		`, result.IsReachable, e.id)
-		removed.Add(1)
-	}
-
-	validated.Add(1)
 }
 
 // IsGoodEmail returns true if the email is safe or risky-but-deliverable.
