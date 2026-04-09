@@ -221,11 +221,13 @@ func (c *MordibouncerClient) FetchBulkResults(ctx context.Context, jobID int64) 
 	}
 	defer resp.Body.Close()
 
-	var results []CheckResult
-	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+	var wrapper struct {
+		Results []CheckResult `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
 		return nil, err
 	}
-	return results, nil
+	return wrapper.Results, nil
 }
 
 // BackfillValidation scans existing emails with pending validation status
