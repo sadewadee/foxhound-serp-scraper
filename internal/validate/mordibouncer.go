@@ -207,27 +207,39 @@ func (c *MordibouncerClient) PollBulk(ctx context.Context, jobID int64) (*bulkPr
 	return &result, nil
 }
 
-// FetchBulkResults gets the full results for a completed bulk job.
+// FetchBulkResults gets the full results for a completed bulk job using pagination.
 func (c *MordibouncerClient) FetchBulkResults(ctx context.Context, jobID int64) ([]CheckResult, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/bulk/%d/results", c.apiURL, jobID), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("x-mordibouncer-secret", c.secret)
+	const pageSize = 200
+	var all []CheckResult
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	for offset := 0; ; offset += pageSize {
+		req, err := http.NewRequestWithContext(ctx, "GET",
+			fmt.Sprintf("%s/v1/bulk/%d/results?limit=%d&offset=%d", c.apiURL, jobID, pageSize, offset), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("x-mordibouncer-secret", c.secret)
 
-	var wrapper struct {
-		Results []CheckResult `json:"results"`
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		var wrapper struct {
+			Results []CheckResult `json:"results"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+
+		all = append(all, wrapper.Results...)
+		if len(wrapper.Results) < pageSize {
+			break
+		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, err
-	}
-	return wrapper.Results, nil
+	return all, nil
 }
 
 // BackfillValidation scans existing emails with pending validation status
@@ -365,7 +377,9 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 		}
 
 		// 5. Write results to DB.
+		seen := make(map[string]bool, len(results))
 		for _, r := range results {
+			seen[r.Email] = true
 			eid, ok := idByEmail[r.Email]
 			if !ok {
 				continue
@@ -393,7 +407,17 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 			validated.Add(1)
 		}
 
-		slog.Info("backfill: bulk job done", "job_id", jobID, "results", len(results))
+		// 6. Mark emails not returned by API as unknown.
+		missing := 0
+		for _, e := range batch {
+			if !seen[e.email] {
+				db.ExecContext(ctx, `UPDATE emails SET validation_status = 'unknown', validated_at = NOW() WHERE id = $1`, e.id)
+				validated.Add(1)
+				missing++
+			}
+		}
+
+		slog.Info("backfill: bulk job done", "job_id", jobID, "results", len(results), "missing", missing)
 	}
 
 	slog.Info("backfill: finished",
