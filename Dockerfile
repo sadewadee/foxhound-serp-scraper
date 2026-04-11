@@ -119,5 +119,5 @@ EXPOSE 8080 9090
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -fsS http://localhost:8080/api/health || exit 1
 
-ENTRYPOINT ["sh", "-c", "Xvfb :99 -screen 0 2560x1600x24 -nolisten tcp & exec serp-scraper \"$@\"", "--"]
+ENTRYPOINT ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 && Xvfb :99 -screen 0 2560x1600x24 -nolisten tcp & exec serp-scraper \"$@\"", "--"]
 CMD ["run"]
