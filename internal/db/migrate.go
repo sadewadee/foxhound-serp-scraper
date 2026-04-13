@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 )
 
 const schema = `
@@ -185,6 +186,24 @@ func runMigrations(db *sql.DB) error {
 	// Index for reconciler: retire exhausted failed jobs to 'dead' and resurrect viable ones.
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_failed_retry ON serp_jobs(updated_at) WHERE status = 'failed'`); err != nil {
 		return fmt.Errorf("db: create idx_serp_failed_retry: %w", err)
+	}
+
+	// V2 API performance indexes.
+	// pg_trgm extension for ILIKE search index.
+	db.Exec(`CREATE EXTENSION IF NOT EXISTS pg_trgm`)
+	for _, stmt := range []string{
+		// emails.created_at: used by stats last_hour/last_24h queries (noted in gotchas.md 2026-04-06).
+		`CREATE INDEX IF NOT EXISTS idx_emails_created_at ON emails(created_at)`,
+		// business_listings.business_name: used by V2 search filter (ILIKE).
+		// pg_trgm GIN index supports ILIKE efficiently.
+		`CREATE INDEX IF NOT EXISTS idx_bl_name_trgm ON business_listings USING gin(business_name gin_trgm_ops)`,
+		// business_listings.phone: used by V2 stats with_phone count.
+		`CREATE INDEX IF NOT EXISTS idx_bl_phone ON business_listings(phone) WHERE phone IS NOT NULL AND phone != ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			// pg_trgm might not be available on some setups; log and continue.
+			slog.Warn("db: optional index creation", "error", err)
+		}
 	}
 
 	// Populate emails.domain and emails.local_part for rows that have NULLs.

@@ -70,6 +70,35 @@ func (s *Server) registerRoutes() {
 
 	// Health.
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
+
+	// V2 API.
+	s.registerV2Routes()
+}
+
+func (s *Server) registerV2Routes() {
+	// Auth (public).
+	s.mux.HandleFunc("POST /api/v2/auth/login", s.handleV2Login)
+	s.mux.HandleFunc("POST /api/v2/auth/refresh", s.handleV2Refresh)
+	s.mux.HandleFunc("GET /api/v2/health", s.handleV2Health)
+
+	// Results.
+	s.mux.HandleFunc("GET /api/v2/results", RequireRole(RoleViewer, s.handleV2ListResults))
+	s.mux.HandleFunc("GET /api/v2/results/stats", RequireRole(RoleViewer, s.handleV2ResultsStats))
+	s.mux.HandleFunc("GET /api/v2/results/count", RequireRole(RoleViewer, s.handleV2ResultsCount))
+	s.mux.HandleFunc("GET /api/v2/results/categories", RequireRole(RoleViewer, s.handleV2Categories))
+	s.mux.HandleFunc("GET /api/v2/results/domains", RequireRole(RoleViewer, s.handleV2Domains))
+	s.mux.HandleFunc("GET /api/v2/results/download", RequireRole(RoleViewer, s.handleV2Download))
+	s.mux.HandleFunc("DELETE /api/v2/results", RequireRole(RoleAdmin, s.handleV2DeleteResults))
+
+	// Dashboard.
+	s.mux.HandleFunc("GET /api/v2/stats", RequireRole(RoleViewer, s.handleV2DashboardStats))
+
+	// Queries.
+	s.mux.HandleFunc("GET /api/v2/queries", RequireRole(RoleViewer, s.handleV2ListQueries))
+	s.mux.HandleFunc("POST /api/v2/queries", RequireRole(RoleAdmin, s.handleV2CreateQueries))
+	s.mux.HandleFunc("DELETE /api/v2/queries", RequireRole(RoleAdmin, s.handleV2DeleteQueries))
+	s.mux.HandleFunc("POST /api/v2/queries/generate", RequireRole(RoleAdmin, s.handleV2GenerateQueries))
+	s.mux.HandleFunc("POST /api/v2/queries/retry", RequireRole(RoleAdmin, s.handleV2RetryQueries))
 }
 
 // Start begins serving the API.

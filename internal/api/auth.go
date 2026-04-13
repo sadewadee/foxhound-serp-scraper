@@ -146,8 +146,9 @@ func (a *Auth) AuthenticateByKey(apiKey string) (*User, error) {
 // Supports: Bearer token, x-api-key header.
 func (a *Auth) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health check.
-		if r.URL.Path == "/api/health" {
+		// Skip auth for health check and login.
+		if r.URL.Path == "/api/health" || r.URL.Path == "/api/v2/health" ||
+			r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/v2/auth/login" {
 			next.ServeHTTP(w, r)
 			return
 		}
