@@ -212,7 +212,8 @@ func (s *Server) handleV2ResultsStats(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'"); err != nil {
+	// 15s timeout for stats — emails table (828K+) with 6 FILTER passes needs more than 5s.
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'"); err != nil {
 		slog.Error("v2: set timeout error", "error", err)
 		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to set timeout")
 		return

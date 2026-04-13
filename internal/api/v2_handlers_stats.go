@@ -41,7 +41,8 @@ func (s *Server) handleV2DashboardStats(w http.ResponseWriter, r *http.Request) 
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'"); err != nil {
+	// 15s — serp_jobs (5.7M rows) and emails (828K+) need more headroom.
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'"); err != nil {
 		slog.Error("v2: set timeout error", "error", err)
 		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to set timeout")
 		return
