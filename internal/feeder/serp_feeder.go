@@ -26,21 +26,24 @@ type SERPBufferItem struct {
 
 // SERPFeeder polls serp_jobs from DB and fills the serp:buffer Redis LIST.
 type SERPFeeder struct {
-	db    *sql.DB
-	redis *redis.Client
+	db      *sql.DB
+	redis   *redis.Client
+	engines []string
 }
 
-// NewSERPFeeder creates a new SERP feeder.
-func NewSERPFeeder(db *sql.DB, redisClient *redis.Client) *SERPFeeder {
-	return &SERPFeeder{db: db, redis: redisClient}
+// NewSERPFeeder creates a new SERP feeder. engines is the list of engine names
+// to round-robin claim from serp_jobs — must match SERP_ENGINES config so we
+// don't pick up jobs for disabled engines (e.g. legacy Google rows).
+func NewSERPFeeder(db *sql.DB, redisClient *redis.Client, engines []string) *SERPFeeder {
+	if len(engines) == 0 {
+		engines = []string{"google", "bing", "duckduckgo"}
+	}
+	return &SERPFeeder{db: db, redis: redisClient, engines: engines}
 }
-
-// engines to round-robin across.
-var feedEngines = []string{"google", "bing", "duckduckgo"}
 
 // Run starts the SERP feeder loop. Blocks until ctx is cancelled.
 func (f *SERPFeeder) Run(ctx context.Context) {
-	slog.Info("serp-feeder: starting")
+	slog.Info("serp-feeder: starting", "engines", f.engines)
 
 	// Start stale-pick reconciler in background.
 	go f.reconcileStale(ctx)
@@ -67,13 +70,13 @@ func (f *SERPFeeder) Run(ctx context.Context) {
 		}
 
 		// Round-robin: pick from one engine at a time.
-		engine := feedEngines[engineIdx%len(feedEngines)]
+		engine := f.engines[engineIdx%len(f.engines)]
 		engineIdx++
 
 		items := f.claimJobs(ctx, engine)
 		if len(items) == 0 {
-			// If all 3 engines return 0 in a row, sleep briefly.
-			if engineIdx%len(feedEngines) == 0 {
+			// If all engines return 0 in a row, sleep briefly.
+			if engineIdx%len(f.engines) == 0 {
 				sleepCtx(ctx, 2*time.Second)
 			}
 			continue

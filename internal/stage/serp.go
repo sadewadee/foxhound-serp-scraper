@@ -141,7 +141,11 @@ func (s *SERPStage) Run(ctx context.Context) error {
 	go s.queryFeeder(ctx)
 
 	// Start the DB-to-Redis buffer feeder.
-	serpFeeder := feeder.NewSERPFeeder(s.db, s.redis)
+	engineNames := make([]string, len(s.engines))
+	for i, e := range s.engines {
+		engineNames[i] = e.Name()
+	}
+	serpFeeder := feeder.NewSERPFeeder(s.db, s.redis, engineNames)
 	go serpFeeder.Run(ctx)
 
 	var wg sync.WaitGroup
@@ -351,6 +355,23 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		eng := scraper.GetEngine(job.Engine)
 		if eng == nil {
 			slog.Warn("serp: unknown engine, skipping", "engine", job.Engine, "job", job.ID)
+			continue
+		}
+
+		// Guard: refuse jobs whose engine is not in the configured set. Legacy
+		// rows (e.g. Google jobs from before SERP_ENGINES was narrowed) still
+		// live in serp_jobs and would otherwise burn browser time on reCAPTCHA.
+		engineEnabled := false
+		for _, e := range s.engines {
+			if e.Name() == job.Engine {
+				engineEnabled = true
+				break
+			}
+		}
+		if !engineEnabled {
+			slog.Warn("serp: engine disabled, marking dead", "engine", job.Engine, "job", job.ID)
+			s.db.Exec(`UPDATE serp_jobs SET status='dead', error_msg='engine disabled in SERP_ENGINES', locked_by=NULL, updated_at=NOW() WHERE id=$1`, job.ID)
+			s.redis.Del(ctx, "serp:lock:"+job.ID)
 			continue
 		}
 
