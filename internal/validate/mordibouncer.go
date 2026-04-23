@@ -384,24 +384,27 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 			if !ok {
 				continue
 			}
+			score := r.Score()
 			if r.IsGoodEmail() {
 				db.ExecContext(ctx, `
 					UPDATE emails SET
 						validation_status = 'valid',
-						mx_valid = $1, deliverable = $2, disposable = $3,
-						role_account = $4, free_email = $5, catch_all = $6,
+						score = $1, is_acceptable = TRUE,
+						mx_valid = $2, deliverable = $3, disposable = $4,
+						role_account = $5, free_email = $6, catch_all = $7,
 						validated_at = NOW()
-					WHERE id = $7
-				`, r.MX.AcceptsMail, r.SMTP.IsDeliverable, r.Misc.IsDisposable,
+					WHERE id = $8
+				`, score, r.MX.AcceptsMail, r.SMTP.IsDeliverable, r.Misc.IsDisposable,
 					r.Misc.IsRoleAccount, r.Misc.IsFreeProvider, r.SMTP.IsCatchAll, eid)
 			} else {
 				db.ExecContext(ctx, `
 					UPDATE emails SET
 						validation_status = 'invalid',
-						reason = $1,
+						score = $1, is_acceptable = FALSE,
+						reason = $2,
 						validated_at = NOW()
-					WHERE id = $2
-				`, r.IsReachable, eid)
+					WHERE id = $3
+				`, score, r.IsReachable, eid)
 				removed.Add(1)
 			}
 			validated.Add(1)
@@ -423,6 +426,32 @@ func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerCli
 	slog.Info("backfill: finished",
 		"validated", validated.Load(),
 		"removed", removed.Load())
+}
+
+// Score computes a deliverability score in [0.0, 1.0] from validation flags.
+// Hard disqualifiers (invalid/honeypot/disabled/bad-syntax) force 0.
+func (r *CheckResult) Score() float32 {
+	if r.IsReachable == "invalid" || !r.Syntax.IsValidSyntax ||
+		r.Misc.IsHoneypot || r.SMTP.IsDisabled {
+		return 0.0
+	}
+	var s float32 = 0.05 // valid syntax baseline
+	if r.MX.AcceptsMail {
+		s += 0.25
+	}
+	if r.SMTP.IsDeliverable {
+		s += 0.35
+	}
+	if !r.Misc.IsDisposable {
+		s += 0.15
+	}
+	if !r.Misc.IsRoleAccount {
+		s += 0.10
+	}
+	if !r.SMTP.IsCatchAll {
+		s += 0.10
+	}
+	return s
 }
 
 // IsGoodEmail returns true if the email is safe or risky-but-deliverable.
