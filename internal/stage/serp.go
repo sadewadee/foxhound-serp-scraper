@@ -125,17 +125,34 @@ func (s *SERPStage) Run(ctx context.Context) error {
 
 	slog.Info("serp: starting", "concurrency", concurrency)
 
-	// Warm-up: visit Google homepage to establish cookies before real traffic.
-	// This builds initial trust with Google's session system.
-	slog.Info("serp: warming up browser — visiting google.com")
-	browser.Fetch(ctx, &foxhound.Job{
-		ID: "warmup", URL: "https://www.google.com/", Method: "GET",
-		FetchMode: foxhound.FetchBrowser,
-	})
-	time.Sleep(3 * time.Second)
-	slog.Info("serp: warm-up done")
-
+	// Touch health file first so Docker never sees us as unhealthy while
+	// warm-up is in flight — otherwise a stuck fetch loops container restarts.
 	go touchHealthFile(ctx, "/tmp/worker-healthy")
+
+	googleEnabled := false
+	for _, eng := range s.engines {
+		if eng.Name() == "google" {
+			googleEnabled = true
+			break
+		}
+	}
+	if googleEnabled {
+		slog.Info("serp: warming up browser — visiting google.com")
+		warmupCtx, warmupCancel := context.WithTimeout(ctx, 30*time.Second)
+		_, err := browser.Fetch(warmupCtx, &foxhound.Job{
+			ID: "warmup", URL: "https://www.google.com/", Method: "GET",
+			FetchMode: foxhound.FetchBrowser,
+		})
+		warmupCancel()
+		if err != nil {
+			slog.Warn("serp: warm-up failed, continuing anyway", "error", err)
+		} else {
+			time.Sleep(3 * time.Second)
+			slog.Info("serp: warm-up done")
+		}
+	} else {
+		slog.Info("serp: skipping warm-up (google not in engines)")
+	}
 	go s.heartbeat(ctx)
 	go s.reconciler(ctx)
 	go s.queryFeeder(ctx)

@@ -111,13 +111,17 @@ VOLUME ["/dev/shm", "/data"]
 USER scraper
 WORKDIR /home/scraper
 
-ENV DISPLAY=:99 \
-    PLAYWRIGHT_BROWSERS_PATH=/home/scraper/.cache/ms-playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/scraper/.cache/ms-playwright
 
 EXPOSE 8080 9090
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -fsS http://localhost:8080/api/health || exit 1
 
-ENTRYPOINT ["sh", "-c", "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 && Xvfb :99 -screen 0 2560x1600x24 -nolisten tcp & exec serp-scraper \"$@\"", "--"]
+# Foxhound's DisplayManager (headless=virtual) spawns Xvfb as a Go-managed
+# child, monitors it, and restarts on crash — so we must NOT pre-set DISPLAY
+# and must NOT start Xvfb in the entrypoint. Doing so would make foxhound
+# skip its own manager, and a crashed external Xvfb would leave the browser
+# wedged with no recovery.
+ENTRYPOINT ["serp-scraper"]
 CMD ["run"]
