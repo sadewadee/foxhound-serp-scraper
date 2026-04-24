@@ -134,16 +134,16 @@ services:
       PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
       PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
       # ── Browser lifecycle tuning (optional) ──
-      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-20}"
       BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
-      SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-200}"
+      SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-20}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
       # ── SERP engines + timing ──
-      SERP_ENGINES: "${SERP_ENGINES:-bing,duckduckgo}"
+      SERP_ENGINES: "${SERP_ENGINES:-bing}"
       SERP_DELAY_MS: "${SERP_DELAY_MS:-3000}"
       GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-1}"
-      BING_MAX_PAGES: "${BING_MAX_PAGES:-7}"
+      BING_MAX_PAGES: "${BING_MAX_PAGES:-5}"
       DDG_MAX_PAGES: "${DDG_MAX_PAGES:-5}"
       # ── Beta features DISABLED for SERP — circuit breaker skips proxy too aggressively ──
       BETA_FEATURES: "0"
