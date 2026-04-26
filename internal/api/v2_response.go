@@ -64,10 +64,12 @@ func writeV2Single(w http.ResponseWriter, data any) {
 	json.NewEncoder(w).Encode(SingleResponse{Data: data})
 }
 
-// v2RequestContext returns a context with a 10-second timeout for API requests.
-// Prevents slow DB queries from holding connections and making consumers wait forever.
+// v2RequestContext returns a context with an 18-second timeout for API requests.
+// Must stay STRICTLY GREATER than any per-handler `SET LOCAL statement_timeout`
+// (currently max 15s in dashboard stats, 12s in filtered results) so PG-side
+// timeout fires first and returns a clean cancel error instead of context-cancel.
 func v2RequestContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), 10*time.Second)
+	return context.WithTimeout(r.Context(), 18*time.Second)
 }
 
 // v2DownloadContext returns a context with a 5-minute timeout for download/export requests.

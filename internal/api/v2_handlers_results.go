@@ -1,17 +1,75 @@
 package api
 
 import (
+	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	pq "github.com/lib/pq"
 )
+
+// resultsCountTTL is the Redis cache window for filtered COUNT(*) results.
+// Polling clients re-hit the same filter combo within this window for free.
+const resultsCountTTL = 60 * time.Second
+
+// cachedFilteredCount returns COUNT(*) for the given WHERE+args, served from
+// Redis when fresh. On query timeout/error, returns (-1, err) so the caller can
+// still serve the page with a "many" sentinel instead of HTTP 500.
+//
+// Cache key shape: "v2:count:<sha1(where|args)>" — args serialized via fmt to
+// keep numbers/strings/timestamps stable across calls.
+func (s *Server) cachedFilteredCount(ctx context.Context, where string, args []any) (int, error) {
+	key := buildCountCacheKey(where, args)
+
+	if s.redis != nil {
+		if v, err := s.redis.Get(ctx, key).Result(); err == nil {
+			if n, perr := strconv.Atoi(v); perr == nil {
+				return n, nil
+			}
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return -1, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '12000'"); err != nil {
+		return -1, err
+	}
+
+	var total int
+	q := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
+	if err := tx.QueryRowContext(ctx, q, args...).Scan(&total); err != nil {
+		return -1, err
+	}
+	tx.Commit()
+
+	if s.redis != nil {
+		// Best-effort SETEX; cache miss isn't worth failing the request over.
+		_ = s.redis.Set(ctx, key, strconv.Itoa(total), resultsCountTTL).Err()
+	}
+	return total, nil
+}
+
+func buildCountCacheKey(where string, args []any) string {
+	h := sha1.New()
+	h.Write([]byte(where))
+	for _, a := range args {
+		fmt.Fprintf(h, "|%v", a)
+	}
+	return "v2:count:" + hex.EncodeToString(h.Sum(nil))
+}
 
 // buildResultsFilter builds a WHERE clause + args from query parameters.
 // Returns (whereClause, args, nextArgIdx).
@@ -68,23 +126,12 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 
 	where, args, argIdx := buildResultsFilter(q)
 
-	// Count total (with statement timeout for large tables).
-	var total int
-	tx, err := s.db.BeginTx(ctx, nil)
+	// Count total via Redis-cached helper. On timeout/error the helper returns -1
+	// so we serve the page with a sentinel instead of 500.
+	total, err := s.cachedFilteredCount(ctx, where, args)
 	if err != nil {
-		slog.Error("v2: count tx error", "error", err)
-		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to count results")
-		return
+		slog.Warn("v2: count failed (returning -1 sentinel)", "error", err)
 	}
-	tx.Exec("SET LOCAL statement_timeout = '5000'")
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
-	if err := tx.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
-		tx.Rollback()
-		slog.Error("v2: count error", "error", err)
-		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to count results")
-		return
-	}
-	tx.Commit()
 
 	// Query 1: Fetch paginated listings (all columns).
 	dataQuery := fmt.Sprintf(`
@@ -274,25 +321,10 @@ func (s *Server) handleV2ResultsCount(w http.ResponseWriter, r *http.Request) {
 
 	where, args, _ := buildResultsFilter(r.URL.Query())
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	total, err := s.cachedFilteredCount(ctx, where, args)
 	if err != nil {
-		slog.Error("v2: count tx error", "error", err)
-		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to count")
-		return
+		slog.Warn("v2: count failed (returning -1 sentinel)", "error", err)
 	}
-	defer tx.Rollback()
-
-	tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
-
-	var total int
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
-	if err := tx.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
-		slog.Error("v2: count error", "error", err)
-		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to count results")
-		return
-	}
-
-	tx.Commit()
 
 	writeV2Single(w, map[string]int{"count": total})
 }
