@@ -112,8 +112,6 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/rogpeppe/go-internal v1.11.0 h1:cWPaGQEPrBb5/AsnsZesgZZ9yb1OQ+GOISoDNXVBh4M=
 github.com/rogpeppe/go-internal v1.11.0/go.mod h1:ddIwULY96R17DhadqLgMfk9H9tvdUzkipdSkR5nkCZA=
-github.com/sadewadee/foxhound v0.0.13 h1:atFOZWhZs2TjhS2Ekto8HSU+bQFakmxUENLIeaUKz3w=
-github.com/sadewadee/foxhound v0.0.13/go.mod h1:ESWjmkJK3Aua62yiXlcKYGnSpSXbZVdFuXcQf5oFMB8=
 github.com/sadewadee/foxhound v0.0.14 h1:WQF0KIp990AZQlhkXLJV/gOYcEukwNqzkfGgLAcFOx4=
 github.com/sadewadee/foxhound v0.0.14/go.mod h1:ESWjmkJK3Aua62yiXlcKYGnSpSXbZVdFuXcQf5oFMB8=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=

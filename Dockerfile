@@ -29,7 +29,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build \
-    -tags playwright \
+    -tags playwright,tls \
     -ldflags="-w -s -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" \
     -o /serp-scraper \
     .

@@ -115,10 +115,11 @@ func NewBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 // acquire a slot, navigate, then release. No context creation overhead after warmup.
 //
 // Architecture:
-//   1 browser process → N pooled tabs (N = poolSize)
-//   Multiple goroutines call Fetch() concurrently
-//   Each gets a pre-warmed tab from the pool
-//   Cookies/state cleared between uses (no session bleed)
+//
+//	1 browser process → N pooled tabs (N = poolSize)
+//	Multiple goroutines call Fetch() concurrently
+//	Each gets a pre-warmed tab from the pool
+//	Cookies/state cleared between uses (no session bleed)
 func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetcher, error) {
 	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
 	bp := behavior.ModerateProfile().Jitter() // moderate for enrich (faster, less stealth needed)
@@ -158,8 +159,11 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 	return browser, nil
 }
 
-// NewStealth creates a TLS-impersonating HTTP fetcher for website scraping.
-// Geo-matches identity to proxy country to avoid detection from IP/identity mismatch.
+// NewStealth creates a stealth HTTP fetcher for website scraping.
+// Real JA3/JA4 + HTTP/2 fingerprint impersonation requires the binary to be
+// built with `-tags tls` (see Dockerfile); without it, foxhound falls back to
+// stealth_default.go which uses Go's standard net/http transport — headers are
+// browser-like but the TLS ClientHello is Go's default and trivially detected.
 func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
 	// Random identity for diversity — rotating proxy exits in different countries.
 	profile := identity.Generate()
