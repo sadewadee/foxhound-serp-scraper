@@ -88,6 +88,11 @@ type MordibouncerConfig struct {
 
 type ProxyConfig struct {
 	URL string `yaml:"url"`
+	// Country is the ISO 3166-1 alpha-2 code (e.g. "US", "ID") of the proxy
+	// exit node. When set, identity profiles are geo-matched so the browser
+	// locale, timezone, and Accept-Language line up with the apparent source IP.
+	// Mismatch (e.g. US Firefox UA exiting via DE IP) is itself a bot signal.
+	Country string `yaml:"country"`
 }
 
 type FetchConfig struct {
@@ -167,7 +172,8 @@ func LoadFromEnv() (*Config, error) {
 			Password: os.Getenv("REDIS_PASSWORD"),
 		},
 		Proxy: ProxyConfig{
-			URL: os.Getenv("PROXY_URL"),
+			URL:     os.Getenv("PROXY_URL"),
+			Country: os.Getenv("PROXY_COUNTRY"),
 		},
 		SERP: SERPConfig{
 			SERPDelayMs:    parseEnvInt("SERP_DELAY_MS", 0),

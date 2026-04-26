@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"time"
 
 	foxhound "github.com/sadewadee/foxhound"
@@ -16,6 +18,43 @@ import (
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
+
+// refererForURL returns a realistic Referer for an enrich/contact-page fetch.
+// Mimics the natural click chain: a user on the site's homepage clicks a link
+// to the contact/about page. Without a Referer header every request looks like
+// a cold cold-start direct navigation, which is itself a bot signal.
+func refererForURL(targetURL string) string {
+	u, err := url.Parse(targetURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	return scheme + "://" + u.Host + "/"
+}
+
+// refererHeader builds an http.Header containing only a Referer entry, or
+// returns nil when the URL is unparseable.
+func refererHeader(targetURL string) http.Header {
+	ref := refererForURL(targetURL)
+	if ref == "" {
+		return nil
+	}
+	return http.Header{"Referer": []string{ref}}
+}
+
+// engineHomepageReferer returns the SERP engine homepage to use as Referer
+// for page-2+ stealth requests. For page-1 the Referer is already realistic
+// from the engine's own navigation; this is mainly for paginated fetches.
+func engineHomepageReferer(serpURL string) http.Header {
+	u, err := url.Parse(serpURL)
+	if err != nil || u.Host == "" {
+		return nil
+	}
+	return http.Header{"Referer": []string{u.Scheme + "://" + u.Host + "/"}}
+}
 
 // NewSERPBrowser creates a Camoufox browser optimized for Google SERP scraping.
 // Uses persistent session, page pooling, and geo-matched identity.
@@ -164,9 +203,16 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 // built with `-tags tls` (see Dockerfile); without it, foxhound falls back to
 // stealth_default.go which uses Go's standard net/http transport — headers are
 // browser-like but the TLS ClientHello is Go's default and trivially detected.
+//
+// Geo-match: when PROXY_COUNTRY is set, the identity profile is constrained
+// to that country so locale, timezone, and Accept-Language match the proxy
+// exit IP. A US Firefox profile exiting via a DE proxy is itself a bot signal.
 func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
-	// Random identity for diversity — rotating proxy exits in different countries.
-	profile := identity.Generate()
+	idOpts := []identity.Option{}
+	if cfg.Proxy.Country != "" {
+		idOpts = append(idOpts, identity.WithCountry(cfg.Proxy.Country))
+	}
+	profile := identity.Generate(idOpts...)
 
 	opts := []fetch.StealthOption{
 		fetch.WithIdentity(profile),
@@ -212,10 +258,12 @@ func FetchSERP(ctx context.Context, browser *fetch.CamoufoxFetcher, serpURL, job
 
 // FetchPage tries stealth first, falls back to browser on failure/block.
 func FetchPage(ctx context.Context, stealth *fetch.StealthFetcher, browser *fetch.CamoufoxFetcher, pageURL, jobID string) (string, error) {
+	referer := refererHeader(pageURL)
 	resp, err := stealth.Fetch(ctx, &foxhound.Job{
-		ID:     jobID,
-		URL:    pageURL,
-		Method: "GET",
+		ID:      jobID,
+		URL:     pageURL,
+		Method:  "GET",
+		Headers: referer,
 	})
 
 	if err != nil || resp == nil || resp.StatusCode >= 400 {
@@ -227,6 +275,7 @@ func FetchPage(ctx context.Context, stealth *fetch.StealthFetcher, browser *fetc
 			URL:       pageURL,
 			Method:    "GET",
 			FetchMode: foxhound.FetchBrowser,
+			Headers:   referer,
 		})
 		if err != nil {
 			return "", fmt.Errorf("fetch failed: %w", err)
@@ -269,9 +318,10 @@ func FetchSERPWithEngine(ctx context.Context, browser *fetch.CamoufoxFetcher, se
 // Used by engines that do not require a full browser (e.g. DuckDuckGo).
 func FetchSERPStealth(ctx context.Context, stealth *fetch.StealthFetcher, serpURL, jobID string) ([]byte, error) {
 	resp, err := stealth.Fetch(ctx, &foxhound.Job{
-		ID:     jobID,
-		URL:    serpURL,
-		Method: "GET",
+		ID:      jobID,
+		URL:     serpURL,
+		Method:  "GET",
+		Headers: engineHomepageReferer(serpURL),
 	})
 	if err != nil {
 		return nil, err
