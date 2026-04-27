@@ -1,9 +1,11 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 const schema = `
@@ -615,7 +617,42 @@ func runMigrations(db *sql.DB) error {
 }
 
 // Migrate creates all tables if they don't exist, then runs incremental migrations.
+// migrationLockKey is the int64 key used with pg_advisory_lock to serialize
+// schema migrations across all containers (manager + serp + enrich + cmd).
+// Without this lock, simultaneous startup of N containers all calling
+// Migrate() race on system catalog tables (pg_proc, pg_trigger, pg_class)
+// when issuing CREATE OR REPLACE FUNCTION / CREATE TRIGGER / CREATE INDEX
+// — PostgreSQL aborts the losers with "tuple concurrently updated" or
+// "deadlock detected", crashing the manager.
+//
+// Value is arbitrary but stable; chosen to be unique to this app's
+// migration namespace. Advisory locks are session-scoped: when the
+// owning conn is closed, the lock is released automatically.
+const migrationLockKey int64 = 4242420427
+
+// Migrate runs all schema migrations under a session-scoped PostgreSQL
+// advisory lock so concurrent container startups serialize cleanly.
+// On lock-acquisition timeout (5 min), returns an error rather than
+// blocking the caller indefinitely.
 func Migrate(db *sql.DB) error {
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer lockCancel()
+
+	// Use a dedicated session for the lock so it stays held across the
+	// pool-based migration statements that follow. Closing this conn
+	// releases the advisory lock automatically.
+	conn, err := db.Conn(lockCtx)
+	if err != nil {
+		return fmt.Errorf("db: acquire migration lock conn: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(lockCtx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("db: acquire migration advisory lock: %w", err)
+	}
+	// Explicit unlock for clarity; conn.Close() also releases.
+	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
+
 	db.Exec(`SET statement_timeout = '300s'`)
 	defer db.Exec(`SET statement_timeout = '60s'`)
 
