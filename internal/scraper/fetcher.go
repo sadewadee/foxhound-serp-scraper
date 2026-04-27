@@ -13,11 +13,21 @@ import (
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/behavior"
 	"github.com/sadewadee/foxhound/fetch"
+	"github.com/sadewadee/foxhound/fetch/presets"
 	"github.com/sadewadee/foxhound/identity"
 	"github.com/sadewadee/foxhound/middleware"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
+
+// stealthJA3Pool is the JA3 fingerprint rotation pool used by all stealth
+// fetchers. Built once at package init from foxhound presets (Firefox +
+// Chrome + Safari) so each stealth recycle picks a different fingerprint —
+// makes Cloudflare's per-fingerprint reputation tracking ineffective.
+//
+// Only meaningful when the binary is built with -tags tls; the default
+// build's WithJA3Pool is a no-op.
+var stealthJA3Pool = presets.JA3Pool(presets.All())
 
 // refererForURL returns a realistic Referer for an enrich/contact-page fetch.
 // Mimics the natural click chain: a user on the site's homepage clicks a link
@@ -217,11 +227,22 @@ func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
 	opts := []fetch.StealthOption{
 		fetch.WithIdentity(profile),
 		fetch.WithTimeout(time.Duration(cfg.Enrich.TimeoutMs) * time.Millisecond),
+		// Rotate TLS fingerprint per recycle; Cloudflare cannot pin reputation
+		// to a single JA3 hash. No-op on builds without -tags tls.
+		fetch.WithJA3Pool(stealthJA3Pool),
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithProxy(cfg.Proxy.URL))
 	}
-	return fetch.NewStealth(opts...)
+	f := fetch.NewStealth(opts...)
+	if !f.IsImpersonating() {
+		// Built without -tags tls — JA3/HTTP2 customisation is silently no-op
+		// and Cloudflare will see Go's default crypto/tls fingerprint. Logged
+		// once per stealth construction; staging/dev OK, production should
+		// see this at most a handful of times before being noticed.
+		slog.Warn("fetcher: stealth not impersonating — build with -tags tls for JA3 rotation")
+	}
+	return f
 }
 
 // FetchSERP fetches a Google SERP page with consent banner handling.
