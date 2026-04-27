@@ -229,6 +229,56 @@ services:
           memory: 512m
 
   # ===========================================
+  # Reenrich - Autonomous re-enrichment worker
+  # ===========================================
+  reenrich:
+    init: true
+    build: .
+    image: foxhound-serp-scraper:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      PROXY_URL: "${PROXY_URL:-}"
+      MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
+      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
+      BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      BETA_FEATURES: "${BETA_FEATURES:-0}"
+      TZ: "${TZ:-Asia/Jakarta}"
+      REENRICH_WORKER_COUNT: "${REENRICH_WORKER_COUNT:-1}"
+      REENRICH_SCORE: "${REENRICH_SCORE:-90}"
+    shm_size: "512mb"
+    command: ["run", "-stage", "reenrich", "-workers", "${REENRICH_WORKER_COUNT:-1}"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - scraper-network
+    deploy:
+      mode: replicated
+      replicas: ${REENRICH_WORKER_COUNT:-1}
+      resources:
+        limits:
+          cpus: "1"
+          memory: 4g
+        reservations:
+          memory: 512m
+
+  # ===========================================
   # Autoheal - Auto-restart unhealthy containers
   # ===========================================
   autoheal:

@@ -100,6 +100,8 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 				pipeErr = orch.RunAll(ctx)
 			case "enrich":
 				pipeErr = orch.RunEnrich(ctx)
+			case "reenrich":
+				pipeErr = orch.RunReenrich(ctx)
 			default:
 				pipeErr = orch.RunStage(ctx, stageName)
 			}

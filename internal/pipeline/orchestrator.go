@@ -20,18 +20,20 @@ type Orchestrator struct {
 	db    *sql.DB
 	dedup *dedup.Store
 
-	serp   *stage.SERPStage
-	enrich *stage.EnrichStage
+	serp     *stage.SERPStage
+	enrich   *stage.EnrichStage
+	reenrich *stage.ReenrichStage
 }
 
 // New creates a pipeline orchestrator.
 func New(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Orchestrator {
 	return &Orchestrator{
-		cfg:    cfg,
-		db:     database,
-		dedup:  dd,
-		serp:   stage.NewSERPStage(cfg, database, dd),
-		enrich: stage.NewEnrichStage(cfg, database, dd),
+		cfg:      cfg,
+		db:       database,
+		dedup:    dd,
+		serp:     stage.NewSERPStage(cfg, database, dd),
+		enrich:   stage.NewEnrichStage(cfg, database, dd),
+		reenrich: stage.NewReenrichStage(cfg, database, dd),
 	}
 }
 
@@ -81,6 +83,14 @@ func (o *Orchestrator) RunEnrich(ctx context.Context) error {
 	return o.enrich.Run(ctx)
 }
 
+// RunReenrich starts the autonomous reenrich worker.
+// Targets business_listings rows with re_enriched_at IS NULL and low completeness score.
+// Manual trigger: UPDATE business_listings SET re_enriched_at = NULL WHERE domain IN (...)
+func (o *Orchestrator) RunReenrich(ctx context.Context) error {
+	slog.Info("pipeline: starting reenrich stage")
+	return o.reenrich.Run(ctx)
+}
+
 // RunStage starts a specific stage.
 func (o *Orchestrator) RunStage(ctx context.Context, stageName string) error {
 	switch stageName {
@@ -88,6 +98,8 @@ func (o *Orchestrator) RunStage(ctx context.Context, stageName string) error {
 		return o.serp.Run(ctx)
 	case "enrich":
 		return o.enrich.Run(ctx)
+	case "reenrich":
+		return o.reenrich.Run(ctx)
 	default:
 		return fmt.Errorf("unknown stage: %s", stageName)
 	}

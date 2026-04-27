@@ -555,6 +555,34 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	// re_enriched_at: tracks which business_listings rows have been processed by
+	// the autonomous reenrich worker. NULL = eligible for re-enrichment.
+	// Manual trigger for specific domains:
+	//   UPDATE business_listings SET re_enriched_at = NULL WHERE domain IN ('example.com', ...)
+	const reenrichColVersion = "2026_04_27_reenrich_col"
+	var reenrichColDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, reenrichColVersion,
+	).Scan(&reenrichColDone); err == nil && !reenrichColDone {
+		stmts := []string{
+			`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS re_enriched_at TIMESTAMPTZ`,
+			`CREATE INDEX IF NOT EXISTS idx_bl_re_enriched_at ON business_listings(re_enriched_at) WHERE re_enriched_at IS NULL`,
+		}
+		migOK := true
+		for _, s := range stmts {
+			if _, err := db.Exec(s); err != nil {
+				slog.Warn("db: reenrich col migration failed", "error", err)
+				migOK = false
+				break
+			}
+		}
+		if migOK {
+			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+				reenrichColVersion, "add re_enriched_at to business_listings for autonomous reenrich worker")
+			slog.Info("db: reenrich col migration applied")
+		}
+	}
+
 	return nil
 }
 
