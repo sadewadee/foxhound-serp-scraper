@@ -22,3 +22,11 @@ results/
 
 # Test
 coverage.out
+
+# Local tooling
+.claude/
+.dev-squad/
+
+# Secrets / proxy lists
+docs/TxtProxy.txt
+*proxy*.txt
