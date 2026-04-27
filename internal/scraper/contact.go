@@ -21,6 +21,9 @@ var (
 	facebookRe  = regexp.MustCompile(`https?://(?:www\.)?facebook\.com/([a-zA-Z0-9._\-]+)/?`)
 	twitterRe   = regexp.MustCompile(`https?://(?:www\.)?(?:twitter\.com|x\.com)/([a-zA-Z0-9._]+)/?`)
 	linkedinRe  = regexp.MustCompile(`https?://(?:www\.)?linkedin\.com/(?:company|in)/([a-zA-Z0-9._\-]+)/?`)
+	tiktokRe    = regexp.MustCompile(`https?://(?:www\.)?tiktok\.com/@([a-zA-Z0-9._]+)/?`)
+	youtubeRe   = regexp.MustCompile(`https?://(?:www\.)?youtube\.com/(?:c/|channel/|user/|@)([a-zA-Z0-9._\-]+)/?`)
+	telegramRe  = regexp.MustCompile(`https?://(?:www\.)?t(?:elegram)?\.me/([a-zA-Z0-9_]+)/?`)
 )
 
 // extraBlockedDomains are placeholder/spam domains to reject (exact match on domain part).
@@ -55,9 +58,17 @@ type ContactData struct {
 	Facebook  string
 	Twitter   string
 	LinkedIn  string
+	TikTok    string
+	YouTube   string
+	Telegram  string
 
 	// Address (from HTML selectors + JSON-LD).
 	Address string
+
+	// Geo (split from JSON-LD addressLocality / addressCountry — easier targeting
+	// than parsing the flat Address string at query time).
+	City    string
+	Country string // ISO 3166-1 alpha-2 when derivable, raw otherwise
 
 	// Contact person name (from JSON-LD author/founder, meta author, vCard).
 	ContactName string
@@ -116,6 +127,15 @@ func ExtractContacts(body []byte) *ContactData {
 	}
 	if m := linkedinRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
 		cd.LinkedIn = "https://linkedin.com/company/" + m[1]
+	}
+	if m := tiktokRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+		cd.TikTok = "https://tiktok.com/@" + m[1]
+	}
+	if m := youtubeRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+		cd.YouTube = "https://youtube.com/@" + m[1]
+	}
+	if m := telegramRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+		cd.Telegram = m[1] // username only, t.me/<username> is the canonical form
 	}
 
 	// ── Structured data: JSON-LD ──
@@ -207,6 +227,18 @@ func extractJSONLD(resp *foxhound.Response, cd *ContactData) {
 			cd.Address = extractLDAddress(ld)
 		}
 
+		// Extract structured city/country from JSON-LD address — keeps targeting
+		// queries simple instead of regex-parsing the flat Address blob later.
+		if cd.City == "" || cd.Country == "" {
+			city, country := extractLDCityCountry(ld)
+			if cd.City == "" {
+				cd.City = city
+			}
+			if cd.Country == "" {
+				cd.Country = country
+			}
+		}
+
 		// Extract location (geo coordinates or locality).
 		if cd.Location == "" {
 			cd.Location = extractLDLocation(ld)
@@ -282,6 +314,32 @@ func extractLDAddress(ld map[string]any) string {
 		return ""
 	}
 	return strings.Join(parts, ", ")
+}
+
+// extractLDCityCountry returns (city, country) from a JSON-LD address node.
+// Country is normalized to uppercase when it looks like an ISO 3166-1 alpha-2
+// or alpha-3 code; full names are passed through unchanged.
+func extractLDCityCountry(ld map[string]any) (string, string) {
+	addr, ok := ld["address"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	city, _ := addr["addressLocality"].(string)
+	city = strings.TrimSpace(city)
+
+	var country string
+	switch v := addr["addressCountry"].(type) {
+	case string:
+		country = strings.TrimSpace(v)
+	case map[string]any:
+		if name, ok := v["name"].(string); ok {
+			country = strings.TrimSpace(name)
+		}
+	}
+	if l := len(country); l == 2 || l == 3 {
+		country = strings.ToUpper(country)
+	}
+	return city, country
 }
 
 // extractLDLocation extracts location info (geo or locality) from JSON-LD.

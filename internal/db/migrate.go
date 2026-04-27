@@ -224,6 +224,38 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	// Schema fix 2026-04-27: extraction layer captured fields that the trigger
+	// hardcoded to NULL (description, location) or never had a column for
+	// (country, city, contact_name, opening_hours, rating, multi-phone).
+	// Add missing columns + raw_* counterparts; the trigger update later in
+	// this file forwards them. opening_hours/rating remain optional — they
+	// stay null when extraction misses them.
+	for _, stmt := range []string{
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS city TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS contact_name TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS phones TEXT[] DEFAULT '{}'`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS tiktok TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS youtube TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS telegram TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_country TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_city TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_contact_name TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_description TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_location TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_opening_hours TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_rating TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_tiktok TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_youtube TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_telegram TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_bl_country ON business_listings(country) WHERE country IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_bl_city ON business_listings(city) WHERE city IS NOT NULL`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
+		}
+	}
+
 	// --- Triggers ---
 
 	// Trigger 1: serp_results INSERT -> create enrichment_job.
@@ -259,19 +291,39 @@ func runMigrations(db *sql.DB) error {
 		  e TEXT;
 		BEGIN
 		  IF NEW.status = 'completed' AND (OLD.status IS NULL OR OLD.status != 'completed') THEN
-		    -- 1. Upsert business_listings
+		    -- 1. Upsert business_listings.
+		    --    Forward every raw_* the extractor populates. Previously
+		    --    description and location were hardcoded NULL here, and
+		    --    country/city/contact_name/opening_hours/rating/multi-phone
+		    --    had no path at all — extracted then dropped on the floor.
 		    INSERT INTO business_listings (domain, url, business_name, category, description,
-		        address, location, phone, website, page_title, social_links, source_query_id)
-		    VALUES (NEW.domain, NEW.url, NEW.raw_business_name, NEW.raw_category, NULL,
-		        NEW.raw_address, NULL, NEW.raw_phones[1], NEW.url, NEW.raw_page_title,
-		        NEW.raw_social, NEW.parent_query_id)
+		        address, location, country, city, contact_name,
+		        phone, phones, website, page_title, social_links,
+		        opening_hours, rating, tiktok, youtube, telegram, source_query_id)
+		    VALUES (NEW.domain, NEW.url, NEW.raw_business_name, NEW.raw_category, NEW.raw_description,
+		        NEW.raw_address, NEW.raw_location, NEW.raw_country, NEW.raw_city, NEW.raw_contact_name,
+		        NEW.raw_phones[1], COALESCE(NEW.raw_phones, '{}'), NEW.url, NEW.raw_page_title, NEW.raw_social,
+		        NEW.raw_opening_hours, NEW.raw_rating, NEW.raw_tiktok, NEW.raw_youtube, NEW.raw_telegram,
+		        NEW.parent_query_id)
 		    ON CONFLICT (domain) DO UPDATE SET
 		        business_name = COALESCE(EXCLUDED.business_name, business_listings.business_name),
-		        category = COALESCE(EXCLUDED.category, business_listings.category),
-		        phone = COALESCE(EXCLUDED.phone, business_listings.phone),
-		        page_title = COALESCE(EXCLUDED.page_title, business_listings.page_title),
-		        social_links = COALESCE(business_listings.social_links, '{}') || COALESCE(EXCLUDED.social_links, '{}'),
-		        updated_at = NOW()
+		        category      = COALESCE(EXCLUDED.category, business_listings.category),
+		        description   = COALESCE(EXCLUDED.description, business_listings.description),
+		        address       = COALESCE(EXCLUDED.address, business_listings.address),
+		        location      = COALESCE(EXCLUDED.location, business_listings.location),
+		        country       = COALESCE(EXCLUDED.country, business_listings.country),
+		        city          = COALESCE(EXCLUDED.city, business_listings.city),
+		        contact_name  = COALESCE(EXCLUDED.contact_name, business_listings.contact_name),
+		        phone         = COALESCE(EXCLUDED.phone, business_listings.phone),
+		        phones        = CASE WHEN array_length(EXCLUDED.phones, 1) > 0 THEN EXCLUDED.phones ELSE business_listings.phones END,
+		        page_title    = COALESCE(EXCLUDED.page_title, business_listings.page_title),
+		        social_links  = COALESCE(business_listings.social_links, '{}') || COALESCE(EXCLUDED.social_links, '{}'),
+		        opening_hours = COALESCE(EXCLUDED.opening_hours, business_listings.opening_hours),
+		        rating        = COALESCE(EXCLUDED.rating, business_listings.rating),
+		        tiktok        = COALESCE(EXCLUDED.tiktok, business_listings.tiktok),
+		        youtube       = COALESCE(EXCLUDED.youtube, business_listings.youtube),
+		        telegram      = COALESCE(EXCLUDED.telegram, business_listings.telegram),
+		        updated_at    = NOW()
 		    RETURNING id INTO biz_id;
 
 		    -- 2. Upsert emails + junction
@@ -317,6 +369,53 @@ func runMigrations(db *sql.DB) error {
 		  FOR EACH ROW EXECUTE FUNCTION trg_normalize_enrichment();
 	`); err != nil {
 		return fmt.Errorf("db: create trg_enrichment_normalize trigger: %w", err)
+	}
+
+	// Phase 2 backfill 2026-04-27: recover what we can from already-completed
+	// enrichment_jobs.raw_* without re-fetching anything. Idempotent — only
+	// touches rows where the target column is still NULL/empty so re-runs are
+	// safe and cheap.
+	for _, stmt := range []string{
+		// Promote raw_phones array → business_listings.phones (was: only [1] kept).
+		`UPDATE business_listings bl
+		 SET phones = ej.raw_phones
+		 FROM enrichment_jobs ej
+		 WHERE ej.domain = bl.domain
+		   AND ej.status = 'completed'
+		   AND COALESCE(array_length(ej.raw_phones, 1), 0) > 0
+		   AND COALESCE(array_length(bl.phones, 1), 0) = 0`,
+
+		// Heuristic country recovery from raw_address tail. Looks for ISO-3166
+		// alpha-2 codes or common country names at the end of the address blob.
+		// Conservative — only fills NULL, never overwrites existing country.
+		`UPDATE business_listings bl
+		 SET country = sub.code
+		 FROM (
+		     SELECT ej.domain, UPPER(TRIM(BOTH '., ' FROM (regexp_match(ej.raw_address, '([A-Z]{2}|[Uu]nited [Ss]tates|[Uu]nited [Kk]ingdom|[Ii]ndonesia|[Aa]ustralia|[Cc]anada|[Gg]ermany|[Ff]rance|[Ss]ingapore|[Mm]alaysia|[Tt]hailand|[Jj]apan)\s*$'))[1])) AS code
+		     FROM enrichment_jobs ej
+		     WHERE ej.status = 'completed' AND ej.raw_address IS NOT NULL
+		 ) sub
+		 WHERE sub.domain = bl.domain
+		   AND sub.code IS NOT NULL
+		   AND (bl.country IS NULL OR bl.country = '')`,
+
+		// City recovery — middle segment of "Street, City, Country" pattern.
+		// Best-effort regex; many addresses won't fit but partial recovery is
+		// better than none. Skips if city already populated.
+		`UPDATE business_listings bl
+		 SET city = TRIM(BOTH ' ,' FROM (regexp_split_to_array(ej.raw_address, ','))[array_length(regexp_split_to_array(ej.raw_address, ','), 1) - 1])
+		 FROM enrichment_jobs ej
+		 WHERE ej.domain = bl.domain
+		   AND ej.status = 'completed'
+		   AND ej.raw_address IS NOT NULL
+		   AND array_length(regexp_split_to_array(ej.raw_address, ','), 1) >= 3
+		   AND (bl.city IS NULL OR bl.city = '')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			// Backfill is recovery, not correctness — log and continue rather
+			// than blocking startup over best-effort heuristics.
+			slog.Warn("db: phase 2 backfill skipped", "error", err)
+		}
 	}
 
 	return nil

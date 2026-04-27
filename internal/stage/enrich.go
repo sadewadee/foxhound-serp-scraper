@@ -513,16 +513,28 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		socialJSON, _ := json.Marshal(socialLinks)
 
 		// DB direct write — trigger handles normalization + contact pages.
+		// Pass through every raw_* the trigger expects; previously
+		// description/location/country/city/contact_name/opening_hours/rating
+		// were extracted then dropped here (silent data loss).
 		c.db.Exec(`UPDATE enrichment_jobs SET
 			status = 'completed',
 			raw_emails = $1, raw_phones = $2, raw_social = $3,
 			raw_business_name = $4, raw_category = $5, raw_address = $6,
 			raw_page_title = $7,
+			raw_description = $8, raw_location = $9, raw_country = $10,
+			raw_city = $11, raw_contact_name = $12,
+			raw_opening_hours = $13, raw_rating = $14,
+			raw_tiktok = $15, raw_youtube = $16, raw_telegram = $17,
 			locked_by = NULL, completed_at = NOW(), updated_at = NOW()
-		WHERE url_hash = $8`,
+		WHERE url_hash = $18`,
 			pq.Array(emails), pq.Array(phones), socialJSON,
 			cd.BusinessName, cd.BusinessCategory, cd.Address,
-			cd.PageTitle, urlHash)
+			cd.PageTitle,
+			nullIfEmpty(cd.Description), nullIfEmpty(cd.Location), nullIfEmpty(cd.Country),
+			nullIfEmpty(cd.City), nullIfEmpty(cd.ContactName),
+			nullIfEmpty(cd.OpeningHours), nullIfEmpty(cd.Rating),
+			nullIfEmpty(cd.TikTok), nullIfEmpty(cd.YouTube), nullIfEmpty(cd.Telegram),
+			urlHash)
 
 		redisClient.Del(ctx, "enrich:lock:"+urlHash)
 		c.emailsFound.Add(int64(len(emails)))
@@ -566,7 +578,26 @@ func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 	if cd.WhatsApp != "" {
 		links["whatsapp"] = cd.WhatsApp
 	}
+	if cd.TikTok != "" {
+		links["tiktok"] = cd.TikTok
+	}
+	if cd.YouTube != "" {
+		links["youtube"] = cd.YouTube
+	}
+	if cd.Telegram != "" {
+		links["telegram"] = cd.Telegram
+	}
 	return links
+}
+
+// nullIfEmpty returns sql.NullString so empty strings round-trip as SQL NULL.
+// Avoids overwriting a pre-existing column value with ” on subsequent
+// enrichments where the extractor failed to capture this field.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func fetchStealthOnly(ctx context.Context, stealth *fetch.StealthFetcher, pageURL, jobID string) (string, error) {
