@@ -132,7 +132,11 @@ func ExtractContacts(body []byte) *ContactData {
 		cd.TikTok = "https://tiktok.com/@" + m[1]
 	}
 	if m := youtubeRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
-		cd.YouTube = "https://youtube.com/@" + m[1]
+		// Preserve original path form: /channel/UCxxx and /user/xxx are not
+		// valid /@handle URLs. Prepending @ to a UCid produced unreachable
+		// URLs in production data. Reconstruct the matched URL instead.
+		full := whichYouTubePath(m[0], m[1])
+		cd.YouTube = full
 	}
 	if m := telegramRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
 		cd.Telegram = m[1] // username only, t.me/<username> is the canonical form
@@ -316,9 +320,127 @@ func extractLDAddress(ld map[string]any) string {
 	return strings.Join(parts, ", ")
 }
 
+// iso3166Alpha2 is the canonical set of ISO 3166-1 alpha-2 country codes.
+// Used to validate "country" extractions — without this, US/AU/CA/BR state
+// codes (CA, NY, TX, NSW, ON, SP) would land in the country column and
+// pollute global targeting queries.
+var iso3166Alpha2 = map[string]bool{
+	"AD": true, "AE": true, "AF": true, "AG": true, "AI": true, "AL": true, "AM": true, "AO": true,
+	"AQ": true, "AR": true, "AS": true, "AT": true, "AU": true, "AW": true, "AX": true, "AZ": true,
+	"BA": true, "BB": true, "BD": true, "BE": true, "BF": true, "BG": true, "BH": true, "BI": true,
+	"BJ": true, "BL": true, "BM": true, "BN": true, "BO": true, "BQ": true, "BR": true, "BS": true,
+	"BT": true, "BV": true, "BW": true, "BY": true, "BZ": true, "CA": true, "CC": true, "CD": true,
+	"CF": true, "CG": true, "CH": true, "CI": true, "CK": true, "CL": true, "CM": true, "CN": true,
+	"CO": true, "CR": true, "CU": true, "CV": true, "CW": true, "CX": true, "CY": true, "CZ": true,
+	"DE": true, "DJ": true, "DK": true, "DM": true, "DO": true, "DZ": true, "EC": true, "EE": true,
+	"EG": true, "EH": true, "ER": true, "ES": true, "ET": true, "FI": true, "FJ": true, "FK": true,
+	"FM": true, "FO": true, "FR": true, "GA": true, "GB": true, "GD": true, "GE": true, "GF": true,
+	"GG": true, "GH": true, "GI": true, "GL": true, "GM": true, "GN": true, "GP": true, "GQ": true,
+	"GR": true, "GS": true, "GT": true, "GU": true, "GW": true, "GY": true, "HK": true, "HM": true,
+	"HN": true, "HR": true, "HT": true, "HU": true, "ID": true, "IE": true, "IL": true, "IM": true,
+	"IN": true, "IO": true, "IQ": true, "IR": true, "IS": true, "IT": true, "JE": true, "JM": true,
+	"JO": true, "JP": true, "KE": true, "KG": true, "KH": true, "KI": true, "KM": true, "KN": true,
+	"KP": true, "KR": true, "KW": true, "KY": true, "KZ": true, "LA": true, "LB": true, "LC": true,
+	"LI": true, "LK": true, "LR": true, "LS": true, "LT": true, "LU": true, "LV": true, "LY": true,
+	"MA": true, "MC": true, "MD": true, "ME": true, "MF": true, "MG": true, "MH": true, "MK": true,
+	"ML": true, "MM": true, "MN": true, "MO": true, "MP": true, "MQ": true, "MR": true, "MS": true,
+	"MT": true, "MU": true, "MV": true, "MW": true, "MX": true, "MY": true, "MZ": true, "NA": true,
+	"NC": true, "NE": true, "NF": true, "NG": true, "NI": true, "NL": true, "NO": true, "NP": true,
+	"NR": true, "NU": true, "NZ": true, "OM": true, "PA": true, "PE": true, "PF": true, "PG": true,
+	"PH": true, "PK": true, "PL": true, "PM": true, "PN": true, "PR": true, "PS": true, "PT": true,
+	"PW": true, "PY": true, "QA": true, "RE": true, "RO": true, "RS": true, "RU": true, "RW": true,
+	"SA": true, "SB": true, "SC": true, "SD": true, "SE": true, "SG": true, "SH": true, "SI": true,
+	"SJ": true, "SK": true, "SL": true, "SM": true, "SN": true, "SO": true, "SR": true, "SS": true,
+	"ST": true, "SV": true, "SX": true, "SY": true, "SZ": true, "TC": true, "TD": true, "TF": true,
+	"TG": true, "TH": true, "TJ": true, "TK": true, "TL": true, "TM": true, "TN": true, "TO": true,
+	"TR": true, "TT": true, "TV": true, "TW": true, "TZ": true, "UA": true, "UG": true, "UM": true,
+	"US": true, "UY": true, "UZ": true, "VA": true, "VC": true, "VE": true, "VG": true, "VI": true,
+	"VN": true, "VU": true, "WF": true, "WS": true, "YE": true, "YT": true, "ZA": true, "ZM": true,
+	"ZW": true,
+}
+
+// countryNameToISO maps full country names (including common variants) to
+// their ISO 3166-1 alpha-2 code. Extend as new sources surface.
+var countryNameToISO = map[string]string{
+	"united states": "US", "united states of america": "US", "usa": "US", "u.s.a.": "US", "u.s.": "US", "america": "US",
+	"united kingdom": "GB", "uk": "GB", "great britain": "GB", "england": "GB", "scotland": "GB", "wales": "GB",
+	"indonesia": "ID", "republic of indonesia": "ID",
+	"australia": "AU", "canada": "CA", "germany": "DE", "deutschland": "DE",
+	"france": "FR", "spain": "ES", "españa": "ES", "italy": "IT", "italia": "IT",
+	"netherlands": "NL", "nederland": "NL", "holland": "NL",
+	"singapore": "SG", "malaysia": "MY", "thailand": "TH",
+	"japan": "JP", "korea": "KR", "south korea": "KR", "republic of korea": "KR",
+	"china": "CN", "people's republic of china": "CN", "vietnam": "VN", "viet nam": "VN",
+	"philippines": "PH", "india": "IN",
+	"brazil": "BR", "brasil": "BR", "mexico": "MX", "méxico": "MX",
+	"new zealand": "NZ", "switzerland": "CH",
+	"belgium": "BE", "sweden": "SE", "norway": "NO", "denmark": "DK", "finland": "FI",
+	"poland": "PL", "turkey": "TR", "türkiye": "TR",
+	"united arab emirates": "AE", "uae": "AE",
+	"saudi arabia": "SA", "south africa": "ZA",
+}
+
+// normalizeCountry converts a raw country string into ISO 3166-1 alpha-2
+// when possible. Returns "" for unrecognized inputs (better empty than wrong).
+// Rejects 2-letter inputs that look like US/AU/CA/BR state codes commonly
+// confused with country codes ("CA"=California vs Canada, "NY", "WA",
+// "NSW", "ON", "SP" — all have caused real false positives in scraped data).
+func normalizeCountry(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return ""
+	}
+	// Full name lookup first (more reliable than 2-letter heuristics).
+	if iso, ok := countryNameToISO[s]; ok {
+		return iso
+	}
+	upper := strings.ToUpper(s)
+	switch len(upper) {
+	case 2:
+		// Reject state codes that are also valid ISO codes (CA=Canada vs
+		// California, NC=North Carolina vs New Caledonia, etc.). These are
+		// almost always state context in scraped addresses; the false-
+		// positive cost is much higher than missing a few real Canada/NC
+		// entries (those will arrive via full-name path or JSON-LD).
+		stateBlocklist := map[string]bool{
+			"CA": true, "NY": true, "TX": true, "WA": true, "OR": true,
+			"FL": true, "IL": true, "MA": true, "PA": true, "AZ": true,
+			"CO": true, "NV": true, "NJ": true, "GA": true, "NC": true,
+			"VA": true, "MI": true, "OH": true, "IN": true, "MN": true,
+			"WI": true, "MO": true, "MD": true, "TN": true, "SC": true,
+			"AL": true, "KY": true, "LA": true, "OK": true, "CT": true,
+			"UT": true, "NM": true, "NH": true, "VT": true, "ME": true,
+			"RI": true, "DE": true, "HI": true, "AK": true, "ID": true,
+			"MT": true, "ND": true, "SD": true, "NE": true, "KS": true,
+			"WV": true, "AR": true, "MS": true, "IA": true,
+		}
+		if stateBlocklist[upper] {
+			return ""
+		}
+		if iso3166Alpha2[upper] {
+			return upper
+		}
+	case 3:
+		// alpha-3 → alpha-2 mapping is incomplete here; pass through if
+		// recognized as ISO-3 family. Most scrapers will provide alpha-2
+		// or full names anyway.
+		if upper == "USA" {
+			return "US"
+		}
+		if upper == "GBR" {
+			return "GB"
+		}
+		if upper == "IDN" {
+			return "ID"
+		}
+	}
+	return ""
+}
+
 // extractLDCityCountry returns (city, country) from a JSON-LD address node.
-// Country is normalized to uppercase when it looks like an ISO 3166-1 alpha-2
-// or alpha-3 code; full names are passed through unchanged.
+// Country is normalized to ISO 3166-1 alpha-2 via normalizeCountry — values
+// that don't resolve to a real country code are dropped to keep the column
+// queryable instead of polluted with state codes / partial names.
 func extractLDCityCountry(ld map[string]any) (string, string) {
 	addr, ok := ld["address"].(map[string]any)
 	if !ok {
@@ -327,19 +449,30 @@ func extractLDCityCountry(ld map[string]any) (string, string) {
 	city, _ := addr["addressLocality"].(string)
 	city = strings.TrimSpace(city)
 
-	var country string
+	var rawCountry string
 	switch v := addr["addressCountry"].(type) {
 	case string:
-		country = strings.TrimSpace(v)
+		rawCountry = v
 	case map[string]any:
 		if name, ok := v["name"].(string); ok {
-			country = strings.TrimSpace(name)
+			rawCountry = name
 		}
 	}
-	if l := len(country); l == 2 || l == 3 {
-		country = strings.ToUpper(country)
+	return city, normalizeCountry(rawCountry)
+}
+
+// whichYouTubePath reconstructs a canonical YouTube URL from the matched
+// regex form. Channel/user paths preserve their structure; @-handles and
+// /c/ vanity URLs collapse to the canonical /@handle form.
+func whichYouTubePath(matched, handle string) string {
+	switch {
+	case strings.Contains(matched, "/channel/"):
+		return "https://youtube.com/channel/" + handle
+	case strings.Contains(matched, "/user/"):
+		return "https://youtube.com/user/" + handle
+	default:
+		return "https://youtube.com/@" + handle
 	}
-	return city, country
 }
 
 // extractLDLocation extracts location info (geo or locality) from JSON-LD.

@@ -315,7 +315,12 @@ func runMigrations(db *sql.DB) error {
 		        city          = COALESCE(EXCLUDED.city, business_listings.city),
 		        contact_name  = COALESCE(EXCLUDED.contact_name, business_listings.contact_name),
 		        phone         = COALESCE(EXCLUDED.phone, business_listings.phone),
-		        phones        = CASE WHEN array_length(EXCLUDED.phones, 1) > 0 THEN EXCLUDED.phones ELSE business_listings.phones END,
+		        -- Phones array: union + dedup. Re-enrichment that captured 1
+		        -- phone must NEVER drop the 3 phones found in the prior visit
+		        -- (memory feedback_never_drop_data.md / 344K email incident).
+		        phones        = ARRAY(SELECT DISTINCT UNNEST(
+		                          COALESCE(business_listings.phones, '{}') ||
+		                          COALESCE(EXCLUDED.phones, '{}'))),
 		        page_title    = COALESCE(EXCLUDED.page_title, business_listings.page_title),
 		        social_links  = COALESCE(business_listings.social_links, '{}') || COALESCE(EXCLUDED.social_links, '{}'),
 		        opening_hours = COALESCE(EXCLUDED.opening_hours, business_listings.opening_hours),
@@ -323,8 +328,12 @@ func runMigrations(db *sql.DB) error {
 		        tiktok        = COALESCE(EXCLUDED.tiktok, business_listings.tiktok),
 		        youtube       = COALESCE(EXCLUDED.youtube, business_listings.youtube),
 		        telegram      = COALESCE(EXCLUDED.telegram, business_listings.telegram),
-		        updated_at    = NOW()
-		    RETURNING id INTO biz_id;
+		        updated_at    = NOW();
+		    -- 2-step biz_id resolution. RETURNING id INTO biz_id was unreliable
+		    -- on the DO UPDATE path when all incoming values were NULL — the
+		    -- email junction inserts below would silently skip. Separate SELECT
+		    -- guarantees biz_id is populated.
+		    SELECT id INTO biz_id FROM business_listings WHERE domain = NEW.domain;
 
 		    -- 2. Upsert emails + junction
 		    IF array_length(NEW.raw_emails, 1) > 0 THEN
@@ -362,59 +371,133 @@ func runMigrations(db *sql.DB) error {
 	`); err != nil {
 		return fmt.Errorf("db: create trg_normalize_enrichment function: %w", err)
 	}
+	// CREATE TRIGGER ... WHEN (...) filters at trigger-system level so the
+	// function call is skipped entirely for non-completing UPDATEs (heartbeat,
+	// locked_by, attempt_count). At peak throughput enrichment_jobs sees
+	// thousands of UPDATEs/h that have no normalization work to do; this WHEN
+	// clause cuts that overhead to zero.
 	if _, err := db.Exec(`
 		DROP TRIGGER IF EXISTS trg_enrichment_normalize ON enrichment_jobs;
 		CREATE TRIGGER trg_enrichment_normalize
 		  AFTER UPDATE ON enrichment_jobs
-		  FOR EACH ROW EXECUTE FUNCTION trg_normalize_enrichment();
+		  FOR EACH ROW
+		  WHEN (NEW.status = 'completed' AND OLD.status IS DISTINCT FROM 'completed')
+		  EXECUTE FUNCTION trg_normalize_enrichment();
 	`); err != nil {
 		return fmt.Errorf("db: create trg_enrichment_normalize trigger: %w", err)
 	}
 
+	// schema_migrations: lightweight version tracking so one-shot migrations
+	// (e.g. Phase 2 backfill) only run once even when the binary restarts.
+	// Pre-existing schema is treated as version 0; new versioned migrations
+	// register themselves below.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version    TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ DEFAULT NOW(),
+			notes      TEXT
+		)
+	`); err != nil {
+		return fmt.Errorf("db: schema_migrations table: %w", err)
+	}
+
 	// Phase 2 backfill 2026-04-27: recover what we can from already-completed
-	// enrichment_jobs.raw_* without re-fetching anything. Idempotent — only
-	// touches rows where the target column is still NULL/empty so re-runs are
-	// safe and cheap.
-	for _, stmt := range []string{
-		// Promote raw_phones array → business_listings.phones (was: only [1] kept).
-		`UPDATE business_listings bl
-		 SET phones = ej.raw_phones
-		 FROM enrichment_jobs ej
-		 WHERE ej.domain = bl.domain
-		   AND ej.status = 'completed'
-		   AND COALESCE(array_length(ej.raw_phones, 1), 0) > 0
-		   AND COALESCE(array_length(bl.phones, 1), 0) = 0`,
+	// enrichment_jobs.raw_* without re-fetching anything. Tracked in
+	// schema_migrations so it only runs once (re-running would re-scan the
+	// entire enrichment_jobs table for no benefit).
+	const phase2Version = "2026_04_27_phase2_backfill"
+	var phase2Done bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, phase2Version,
+	).Scan(&phase2Done); err != nil {
+		return fmt.Errorf("db: phase 2 version check: %w", err)
+	}
+	if !phase2Done {
+		// State codes that are NOT countries — must be excluded from the
+		// 2-letter regex country branch. US state codes like "CA" "NY" "TX"
+		// would otherwise be mis-stored as country (Canada, NY-non-existent,
+		// Turks-and-Caicos). Same for AU/CA/BR/DE state codes. Lower-case
+		// for case-insensitive comparison.
+		stateCodeBlocklist := `'al','ak','az','ar','ca','co','ct','de','fl','ga','hi','id','il','in','ia','ks','ky','la','me','md','ma','mi','mn','ms','mo','mt','ne','nv','nh','nj','nm','ny','nc','nd','oh','ok','or','pa','ri','sc','sd','tn','tx','ut','vt','va','wa','wv','wi','wy',` + // US states
+			`'nsw','vic','qld','wa','sa','tas','act','nt',` + // Australia (already lowercased)
+			`'on','qc','bc','mb','nb','nl','ns','pe','sk','yt','nu',` + // Canada provinces
+			`'sp','rj','mg','ba','rs','pr','sc','pe','ce','pa','go'` // Brazil
 
-		// Heuristic country recovery from raw_address tail. Looks for ISO-3166
-		// alpha-2 codes or common country names at the end of the address blob.
-		// Conservative — only fills NULL, never overwrites existing country.
-		`UPDATE business_listings bl
-		 SET country = sub.code
-		 FROM (
-		     SELECT ej.domain, UPPER(TRIM(BOTH '., ' FROM (regexp_match(ej.raw_address, '([A-Z]{2}|[Uu]nited [Ss]tates|[Uu]nited [Kk]ingdom|[Ii]ndonesia|[Aa]ustralia|[Cc]anada|[Gg]ermany|[Ff]rance|[Ss]ingapore|[Mm]alaysia|[Tt]hailand|[Jj]apan)\s*$'))[1])) AS code
-		     FROM enrichment_jobs ej
-		     WHERE ej.status = 'completed' AND ej.raw_address IS NOT NULL
-		 ) sub
-		 WHERE sub.domain = bl.domain
-		   AND sub.code IS NOT NULL
-		   AND (bl.country IS NULL OR bl.country = '')`,
+		backfillStmts := []struct {
+			name string
+			sql  string
+		}{
+			{
+				"promote_raw_phones",
+				`UPDATE business_listings bl
+				 SET phones = ej.raw_phones
+				 FROM enrichment_jobs ej
+				 WHERE ej.domain = bl.domain
+				   AND ej.status = 'completed'
+				   AND COALESCE(array_length(ej.raw_phones, 1), 0) > 0
+				   AND COALESCE(array_length(bl.phones, 1), 0) = 0`,
+			},
+			{
+				// Country: case-insensitive, accepts ISO-2 OR known country
+				// names. State codes excluded via NOT IN. CTE prevents
+				// regexp_split_to_array from running twice (2x perf at scale).
+				"recover_country",
+				`WITH parsed AS (
+				   SELECT ej.domain,
+				          (regexp_match(ej.raw_address, '(?i)([A-Z]{2,3}|United States|United Kingdom|Indonesia|Australia|Canada|Germany|France|Singapore|Malaysia|Thailand|Japan|Brazil|Mexico|Spain|Italy|Netherlands|Belgium|Sweden|Norway|Denmark|Finland|Poland|Turkey|India|China|Korea|Vietnam|Philippines|New Zealand)\s*$'))[1] AS code
+				   FROM enrichment_jobs ej
+				   WHERE ej.status = 'completed' AND ej.raw_address IS NOT NULL
+				 )
+				 UPDATE business_listings bl
+				 SET country = UPPER(parsed.code)
+				 FROM parsed
+				 WHERE parsed.domain = bl.domain
+				   AND parsed.code IS NOT NULL
+				   AND LOWER(parsed.code) NOT IN (` + stateCodeBlocklist + `)
+				   AND (bl.country IS NULL OR bl.country = '')`,
+			},
+			{
+				"recover_city",
+				`WITH parts AS (
+				   SELECT ej.domain, regexp_split_to_array(ej.raw_address, ',') AS segs
+				   FROM enrichment_jobs ej
+				   WHERE ej.status = 'completed' AND ej.raw_address IS NOT NULL
+				 )
+				 UPDATE business_listings bl
+				 SET city = TRIM(BOTH ' ,' FROM parts.segs[array_length(parts.segs, 1) - 1])
+				 FROM parts
+				 WHERE parts.domain = bl.domain
+				   AND array_length(parts.segs, 1) >= 3
+				   AND (bl.city IS NULL OR bl.city = '')`,
+			},
+			{
+				// Drop tiktok/youtube/telegram keys from social_links JSONB
+				// after promoting them to flat columns — single source of
+				// truth (per architect Finding 5).
+				"normalize_social_links",
+				`UPDATE business_listings
+				 SET social_links = social_links - 'tiktok' - 'youtube' - 'telegram'
+				 WHERE social_links ?| array['tiktok','youtube','telegram']`,
+			},
+		}
 
-		// City recovery — middle segment of "Street, City, Country" pattern.
-		// Best-effort regex; many addresses won't fit but partial recovery is
-		// better than none. Skips if city already populated.
-		`UPDATE business_listings bl
-		 SET city = TRIM(BOTH ' ,' FROM (regexp_split_to_array(ej.raw_address, ','))[array_length(regexp_split_to_array(ej.raw_address, ','), 1) - 1])
-		 FROM enrichment_jobs ej
-		 WHERE ej.domain = bl.domain
-		   AND ej.status = 'completed'
-		   AND ej.raw_address IS NOT NULL
-		   AND array_length(regexp_split_to_array(ej.raw_address, ','), 1) >= 3
-		   AND (bl.city IS NULL OR bl.city = '')`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			// Backfill is recovery, not correctness — log and continue rather
-			// than blocking startup over best-effort heuristics.
-			slog.Warn("db: phase 2 backfill skipped", "error", err)
+		for _, b := range backfillStmts {
+			res, err := db.Exec(b.sql)
+			if err != nil {
+				slog.Warn("db: phase 2 backfill failed", "step", b.name, "error", err)
+				continue
+			}
+			n, _ := res.RowsAffected()
+			slog.Info("db: phase 2 backfill", "step", b.name, "rows_updated", n)
+		}
+
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2)
+			 ON CONFLICT (version) DO NOTHING`,
+			phase2Version,
+			"backfill country/city/phones from raw_address; normalize social_links JSONB",
+		); err != nil {
+			slog.Warn("db: phase 2 version record failed", "error", err)
 		}
 	}
 

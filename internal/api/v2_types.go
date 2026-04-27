@@ -15,11 +15,17 @@ type V2BusinessListing struct {
 	Description     string          `json:"description"`
 	Address         string          `json:"address"`
 	Location        string          `json:"location"`
+	City            string          `json:"city"`
+	Country         string          `json:"country"`
+	ContactName     string          `json:"contact_name"`
 	Phone           string          `json:"phone"`
 	Phones          []string        `json:"phones"`
 	Website         string          `json:"website"`
 	PageTitle       string          `json:"page_title"`
 	SocialLinks     json.RawMessage `json:"social_links"`
+	TikTok          string          `json:"tiktok"`
+	YouTube         string          `json:"youtube"`
+	Telegram        string          `json:"telegram"`
 	OpeningHours    string          `json:"opening_hours"`
 	Rating          string          `json:"rating"`
 	SourceQueryID   *int64          `json:"source_query_id"`

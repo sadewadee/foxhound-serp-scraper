@@ -513,10 +513,11 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		socialJSON, _ := json.Marshal(socialLinks)
 
 		// DB direct write — trigger handles normalization + contact pages.
-		// Pass through every raw_* the trigger expects; previously
-		// description/location/country/city/contact_name/opening_hours/rating
-		// were extracted then dropped here (silent data loss).
-		c.db.Exec(`UPDATE enrichment_jobs SET
+		// All textual fields go through nullIfEmpty so an empty extraction
+		// from a re-enrichment cannot clobber a prior valid value via the
+		// trigger's COALESCE merge (COALESCE treats '' as truthy; only NULL
+		// falls through to the existing column).
+		_, updErr := c.db.Exec(`UPDATE enrichment_jobs SET
 			status = 'completed',
 			raw_emails = $1, raw_phones = $2, raw_social = $3,
 			raw_business_name = $4, raw_category = $5, raw_address = $6,
@@ -528,13 +529,23 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			locked_by = NULL, completed_at = NOW(), updated_at = NOW()
 		WHERE url_hash = $18`,
 			pq.Array(emails), pq.Array(phones), socialJSON,
-			cd.BusinessName, cd.BusinessCategory, cd.Address,
-			cd.PageTitle,
+			nullIfEmpty(cd.BusinessName), nullIfEmpty(cd.BusinessCategory), nullIfEmpty(cd.Address),
+			nullIfEmpty(cd.PageTitle),
 			nullIfEmpty(cd.Description), nullIfEmpty(cd.Location), nullIfEmpty(cd.Country),
 			nullIfEmpty(cd.City), nullIfEmpty(cd.ContactName),
 			nullIfEmpty(cd.OpeningHours), nullIfEmpty(cd.Rating),
 			nullIfEmpty(cd.TikTok), nullIfEmpty(cd.YouTube), nullIfEmpty(cd.Telegram),
 			urlHash)
+		if updErr != nil {
+			// Don't leave the job in 'processing' — reconciler would re-fetch
+			// in 5 min thinking it stalled, wasting bandwidth. Mark failed so
+			// the resurrection logic governs retries with attempt_count cap.
+			slog.Error("enrich: completion UPDATE failed, marking job failed",
+				"url_hash", urlHash, "url", pageURL, "error", updErr)
+			c.db.Exec(`UPDATE enrichment_jobs SET status = 'failed',
+				error_msg = $1, locked_by = NULL, updated_at = NOW()
+			WHERE url_hash = $2`, "completion-update-failed: "+updErr.Error(), urlHash)
+		}
 
 		redisClient.Del(ctx, "enrich:lock:"+urlHash)
 		c.emailsFound.Add(int64(len(emails)))
@@ -558,6 +569,12 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 	}
 }
 
+// buildSocialLinks builds the JSONB social_links blob. Platforms with
+// dedicated TEXT columns on business_listings (tiktok, youtube, telegram)
+// are NOT duplicated into the JSONB to keep a single source of truth —
+// architect review found that dual storage diverges across re-enrichments.
+// Old socials (fb/ig/tw/li/wa) stay in JSONB for backward-compatibility
+// with existing consumers and to avoid a wider schema change.
 func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 	links := map[string]string{}
 	if cd == nil {
@@ -577,15 +594,6 @@ func buildSocialLinks(cd *internalScraper.ContactData) map[string]string {
 	}
 	if cd.WhatsApp != "" {
 		links["whatsapp"] = cd.WhatsApp
-	}
-	if cd.TikTok != "" {
-		links["tiktok"] = cd.TikTok
-	}
-	if cd.YouTube != "" {
-		links["youtube"] = cd.YouTube
-	}
-	if cd.Telegram != "" {
-		links["telegram"] = cd.Telegram
 	}
 	return links
 }

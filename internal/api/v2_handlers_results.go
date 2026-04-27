@@ -146,8 +146,10 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.description,''), COALESCE(bl.website,''),
 		       bl.domain, bl.url, COALESCE(bl.social_links,'{}'),
 		       COALESCE(bl.address,''), COALESCE(bl.location,''),
+		       COALESCE(bl.city,''), COALESCE(bl.country,''), COALESCE(bl.contact_name,''),
 		       COALESCE(bl.opening_hours,''), COALESCE(bl.rating,''),
-		       COALESCE(bl.page_title,''), COALESCE(bl.phone,''),
+		       COALESCE(bl.page_title,''), COALESCE(bl.phone,''), COALESCE(bl.phones,'{}'),
+		       COALESCE(bl.tiktok,''), COALESCE(bl.youtube,''), COALESCE(bl.telegram,''),
 		       bl.source_query_id, bl.created_at, bl.updated_at
 		FROM business_listings bl %s
 		ORDER BY bl.id DESC
@@ -169,10 +171,14 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		var l V2BusinessListing
 		var socialLinksJSON []byte
 		var phone string
+		var phones pq.StringArray
 		err := rows.Scan(&l.ID, &l.BusinessName, &l.Category, &l.Description, &l.Website,
 			&l.Domain, &l.URL, &socialLinksJSON,
-			&l.Address, &l.Location, &l.OpeningHours, &l.Rating,
-			&l.PageTitle, &phone, &l.SourceQueryID, &l.CreatedAt, &l.UpdatedAt)
+			&l.Address, &l.Location, &l.City, &l.Country, &l.ContactName,
+			&l.OpeningHours, &l.Rating,
+			&l.PageTitle, &phone, &phones,
+			&l.TikTok, &l.YouTube, &l.Telegram,
+			&l.SourceQueryID, &l.CreatedAt, &l.UpdatedAt)
 		if err != nil {
 			slog.Error("v2: scan error", "error", err)
 			continue
@@ -180,10 +186,16 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		l.SocialLinks = json.RawMessage(socialLinksJSON)
 		l.Emails = []string{}
 		l.EmailsWithInfo = []V2EmailInfo{}
-		l.Phones = []string{}
-		if phone != "" {
+		// Prefer multi-phone array; fall back to single phone for old rows
+		// where the array column is empty (legacy data pre-2026-04-27).
+		if len(phones) > 0 {
+			l.Phones = []string(phones)
+		} else if phone != "" {
 			l.Phones = []string{phone}
+		} else {
+			l.Phones = []string{}
 		}
+		l.Phone = phone
 		listings = append(listings, l)
 		listingIDs = append(listingIDs, l.ID)
 	}
@@ -473,8 +485,10 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 			       COALESCE(bl.description,''), COALESCE(bl.website,''),
 			       bl.domain, bl.url, COALESCE(bl.social_links,'{}'),
 			       COALESCE(bl.address,''), COALESCE(bl.location,''),
+			       COALESCE(bl.city,''), COALESCE(bl.country,''), COALESCE(bl.contact_name,''),
 			       COALESCE(bl.opening_hours,''), COALESCE(bl.rating,''),
-			       COALESCE(bl.page_title,''), COALESCE(bl.phone,''),
+			       COALESCE(bl.page_title,''), COALESCE(bl.phone,''), COALESCE(bl.phones,'{}'),
+			       COALESCE(bl.tiktok,''), COALESCE(bl.youtube,''), COALESCE(bl.telegram,''),
 			       bl.source_query_id, bl.created_at, bl.updated_at
 			FROM business_listings bl %s
 			ORDER BY bl.id ASC
@@ -493,20 +507,28 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 			var l V2BusinessListing
 			var socialLinksJSON []byte
 			var phone string
+			var phones pq.StringArray
 			if err := rows.Scan(&l.ID, &l.BusinessName, &l.Category, &l.Description, &l.Website,
 				&l.Domain, &l.URL, &socialLinksJSON,
-				&l.Address, &l.Location, &l.OpeningHours, &l.Rating,
-				&l.PageTitle, &phone, &l.SourceQueryID, &l.CreatedAt, &l.UpdatedAt); err != nil {
+				&l.Address, &l.Location, &l.City, &l.Country, &l.ContactName,
+				&l.OpeningHours, &l.Rating,
+				&l.PageTitle, &phone, &phones,
+				&l.TikTok, &l.YouTube, &l.Telegram,
+				&l.SourceQueryID, &l.CreatedAt, &l.UpdatedAt); err != nil {
 				slog.Error("v2: download scan error", "error", err)
 				continue
 			}
 			l.SocialLinks = json.RawMessage(socialLinksJSON)
 			l.Emails = []string{}
 			l.EmailsWithInfo = []V2EmailInfo{}
-			l.Phones = []string{}
-			if phone != "" {
+			if len(phones) > 0 {
+				l.Phones = []string(phones)
+			} else if phone != "" {
 				l.Phones = []string{phone}
+			} else {
+				l.Phones = []string{}
 			}
+			l.Phone = phone
 			batch = append(batch, l)
 			batchIDs = append(batchIDs, l.ID)
 		}
