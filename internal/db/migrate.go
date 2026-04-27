@@ -501,6 +501,60 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	// Phase 4 Tier 1 — normalize existing country values that pre-date the
+	// ISO 3166-1 alpha-2 enforcement. Old rows might have "USA", "United
+	// States", "u.s.a.", "indonesia" as raw text. Fold them to canonical
+	// alpha-2 so country filter queries match across all rows.
+	const tier1Version = "2026_04_27_tier1_country_normalize"
+	var tier1Done bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, tier1Version,
+	).Scan(&tier1Done); err == nil && !tier1Done {
+		// Map common variants in a single UPDATE. CASE expression hits each
+		// row at most once. Skip rows already in canonical 2-char form.
+		res, err := db.Exec(`
+			UPDATE business_listings SET country = CASE LOWER(TRIM(country))
+				WHEN 'usa' THEN 'US' WHEN 'u.s.a.' THEN 'US' WHEN 'u.s.' THEN 'US'
+				WHEN 'united states' THEN 'US' WHEN 'united states of america' THEN 'US' WHEN 'america' THEN 'US'
+				WHEN 'uk' THEN 'GB' WHEN 'united kingdom' THEN 'GB' WHEN 'great britain' THEN 'GB'
+				WHEN 'england' THEN 'GB' WHEN 'scotland' THEN 'GB' WHEN 'wales' THEN 'GB'
+				WHEN 'indonesia' THEN 'ID' WHEN 'republic of indonesia' THEN 'ID'
+				WHEN 'australia' THEN 'AU' WHEN 'canada' THEN 'CA'
+				WHEN 'germany' THEN 'DE' WHEN 'deutschland' THEN 'DE'
+				WHEN 'france' THEN 'FR' WHEN 'spain' THEN 'ES' WHEN 'españa' THEN 'ES'
+				WHEN 'italy' THEN 'IT' WHEN 'italia' THEN 'IT'
+				WHEN 'netherlands' THEN 'NL' WHEN 'nederland' THEN 'NL' WHEN 'holland' THEN 'NL'
+				WHEN 'singapore' THEN 'SG' WHEN 'malaysia' THEN 'MY' WHEN 'thailand' THEN 'TH'
+				WHEN 'japan' THEN 'JP' WHEN 'korea' THEN 'KR' WHEN 'south korea' THEN 'KR'
+				WHEN 'china' THEN 'CN' WHEN 'vietnam' THEN 'VN' WHEN 'viet nam' THEN 'VN'
+				WHEN 'philippines' THEN 'PH' WHEN 'india' THEN 'IN'
+				WHEN 'brazil' THEN 'BR' WHEN 'brasil' THEN 'BR'
+				WHEN 'mexico' THEN 'MX' WHEN 'méxico' THEN 'MX'
+				WHEN 'new zealand' THEN 'NZ' WHEN 'switzerland' THEN 'CH'
+				WHEN 'belgium' THEN 'BE' WHEN 'sweden' THEN 'SE'
+				WHEN 'norway' THEN 'NO' WHEN 'denmark' THEN 'DK' WHEN 'finland' THEN 'FI'
+				WHEN 'poland' THEN 'PL' WHEN 'turkey' THEN 'TR' WHEN 'türkiye' THEN 'TR'
+				WHEN 'united arab emirates' THEN 'AE' WHEN 'uae' THEN 'AE'
+				WHEN 'saudi arabia' THEN 'SA' WHEN 'south africa' THEN 'ZA'
+				ELSE country
+			END
+			WHERE country IS NOT NULL
+			  AND length(country) > 2
+		`)
+		if err != nil {
+			slog.Warn("db: tier 1 country normalize failed", "error", err)
+		} else {
+			n, _ := res.RowsAffected()
+			slog.Info("db: tier 1 country normalize", "rows_updated", n)
+			db.Exec(
+				`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2)
+				 ON CONFLICT (version) DO NOTHING`,
+				tier1Version,
+				"normalize existing country values to ISO 3166-1 alpha-2",
+			)
+		}
+	}
+
 	return nil
 }
 
