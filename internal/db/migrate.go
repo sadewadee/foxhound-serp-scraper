@@ -583,6 +583,34 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	// re_enrich_locked_at: claim sentinel for multi-worker coordination.
+	// Set to NOW() when a worker claims a row via FOR UPDATE SKIP LOCKED.
+	// Cleared on completion (success or release). Stale claims (>15 min)
+	// are auto-recovered by the eligibility query — no janitor needed.
+	const reenrichLockVersion = "2026_04_27_reenrich_lock"
+	var reenrichLockDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, reenrichLockVersion,
+	).Scan(&reenrichLockDone); err == nil && !reenrichLockDone {
+		stmts := []string{
+			`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS re_enrich_locked_at TIMESTAMPTZ`,
+			`CREATE INDEX IF NOT EXISTS idx_bl_re_enrich_locked_at ON business_listings(re_enrich_locked_at) WHERE re_enriched_at IS NULL`,
+		}
+		migOK := true
+		for _, s := range stmts {
+			if _, err := db.Exec(s); err != nil {
+				slog.Warn("db: reenrich lock migration failed", "error", err)
+				migOK = false
+				break
+			}
+		}
+		if migOK {
+			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+				reenrichLockVersion, "add re_enrich_locked_at for multi-worker FOR UPDATE SKIP LOCKED claim")
+			slog.Info("db: reenrich lock migration applied")
+		}
+	}
+
 	return nil
 }
 

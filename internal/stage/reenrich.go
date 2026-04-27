@@ -148,19 +148,26 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 	}
 }
 
-// fetchEligibleBatch returns up to limit business_listings rows where
-// re_enriched_at IS NULL and the inline completeness score < threshold.
+// fetchEligibleBatch atomically claims up to limit business_listings rows.
 //
-// Scoring is computed inline in SQL so we avoid pulling columns not needed and
-// let PG filter before transferring data. The score mirrors the rubric:
-//   - 40 pts: has a valid email (is_acceptable=true OR score>=0.7 in emails table)
+// Multi-worker correctness: uses CTE with FOR UPDATE OF bl SKIP LOCKED to
+// prevent two workers from picking the same row. Claim is recorded by
+// setting re_enrich_locked_at = NOW() in the same statement, so the row
+// stops appearing in subsequent eligibility queries even after the lock
+// is released by COMMIT.
+//
+// Stale-claim recovery: rows with re_enrich_locked_at older than 15 min
+// are considered abandoned (worker crashed mid-processing) and become
+// eligible again — no separate janitor needed.
+//
+// Score (must be < threshold to be eligible):
+//   - 40 pts: has a valid email (is_acceptable=true OR score>=0.7)
 //   - 20 pts: phone or phones array non-empty
 //   - 15 pts: business_name AND category both non-empty
 //   - 15 pts: address non-empty OR (city AND country non-empty)
 //   - 10 pts: at least one social link present
 //     Total = 100
 //
-// ORDER BY RANDOM() ensures even distribution across concurrent workers.
 // Statement timeout 5s prevents holding a connection on the 500K-row table
 // (per gotchas.md 2026-04-06: collectSnapshot COUNT(*) pattern).
 func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold int, limit int) ([]reenrichRow, error) {
@@ -168,39 +175,46 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 	defer cancel()
 
 	const q = `
-		SELECT id, domain, COALESCE(website, 'https://' || domain) AS url
-		FROM business_listings bl
-		WHERE re_enriched_at IS NULL
-		  AND (
-			CASE WHEN EXISTS(
-				SELECT 1 FROM business_emails be
-				JOIN emails e ON e.id = be.email_id
-				WHERE be.business_id = bl.id
-				  AND (e.is_acceptable = true OR e.score >= 0.7)
-			) THEN 40 ELSE 0 END
-			+
-			CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
-				OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0)
-			THEN 20 ELSE 0 END
-			+
-			CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
-				AND (bl.category IS NOT NULL AND bl.category != '')
-			THEN 15 ELSE 0 END
-			+
-			CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
-				OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != ''))
-			THEN 15 ELSE 0 END
-			+
-			CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb
-			THEN 10 ELSE 0 END
-		  ) < $1
-		ORDER BY RANDOM()
-		LIMIT $2
+		WITH eligible AS (
+			SELECT bl.id
+			FROM business_listings bl
+			WHERE re_enriched_at IS NULL
+			  AND (re_enrich_locked_at IS NULL
+			       OR re_enrich_locked_at < NOW() - INTERVAL '15 minutes')
+			  AND (
+				CASE WHEN EXISTS(
+					SELECT 1 FROM business_emails be
+					JOIN emails e ON e.id = be.email_id
+					WHERE be.business_id = bl.id
+					  AND (e.is_acceptable = true OR e.score >= 0.7)
+				) THEN 40 ELSE 0 END
+				+
+				CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
+					OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0)
+				THEN 20 ELSE 0 END
+				+
+				CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
+					AND (bl.category IS NOT NULL AND bl.category != '')
+				THEN 15 ELSE 0 END
+				+
+				CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
+					OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != ''))
+				THEN 15 ELSE 0 END
+				+
+				CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb
+				THEN 10 ELSE 0 END
+			  ) < $1
+			ORDER BY RANDOM()
+			LIMIT $2
+			FOR UPDATE OF bl SKIP LOCKED
+		)
+		UPDATE business_listings bl
+		SET re_enrich_locked_at = NOW()
+		FROM eligible
+		WHERE bl.id = eligible.id
+		RETURNING bl.id, bl.domain, COALESCE(bl.website, 'https://' || bl.domain)
 	`
 
-	// Use SET LOCAL statement_timeout so this single query can't hold a
-	// connection indefinitely on a large table. The transaction wraps only
-	// the SELECT; we commit immediately after.
 	tx, err := r.db.BeginTx(queryCtx, nil)
 	if err != nil {
 		return nil, err
@@ -226,10 +240,14 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 		}
 		result = append(result, row)
 	}
+	if err := dbRows.Err(); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		slog.Warn("reenrich: eligibility tx commit failed", "error", err)
+		return nil, err
 	}
-	return result, dbRows.Err()
+	return result, nil
 }
 
 func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFetcher, row reenrichRow, workerID int) {
@@ -242,9 +260,11 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 
 	body, err := fetchStealthOnly(fetchCtx, stealth, row.URL, fmt.Sprintf("reenrich-%d", row.ID))
 	if err != nil {
-		// HTTP / network error: skip, leave re_enriched_at NULL so the next
-		// loop iteration will retry. HTTP errors do NOT trigger permanent dead.
-		slog.Debug("reenrich: fetch error, skipping", "domain", row.Domain, "error", err, "worker", workerID)
+		// HTTP / network error: release the claim immediately so another
+		// worker can retry without waiting for the 15-min stale-claim window.
+		// re_enriched_at stays NULL → row remains eligible.
+		r.releaseLock(ctx, row.ID)
+		slog.Debug("reenrich: fetch error, releasing lock", "domain", row.Domain, "error", err, "worker", workerID)
 		return
 	}
 
@@ -306,20 +326,23 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 		nullIfEmpty(cd.TikTok), nullIfEmpty(cd.YouTube), nullIfEmpty(cd.Telegram),
 	)
 	if insertErr != nil {
-		// Don't mark re_enriched_at — will retry on next loop iteration.
+		// DB-side failure (transient). Release the claim so another worker
+		// can retry without waiting for the 15-min stale-claim window.
+		r.releaseLock(ctx, row.ID)
 		slog.Error("reenrich: enrichment_jobs upsert failed",
 			"domain", row.Domain, "error", insertErr, "worker", workerID)
 		return
 	}
 
-	// Mark as processed. Extraction failure (zero fields extracted) is also
-	// marked done — per user: "permanent dead, no retries on empty extract".
+	// Mark as processed and clear the claim atomically. Extraction failure
+	// (zero fields extracted) is also marked done — per user: "permanent
+	// dead, no retries on empty extract".
 	_, markErr := r.db.ExecContext(ctx,
-		`UPDATE business_listings SET re_enriched_at = NOW() WHERE id = $1`, row.ID)
+		`UPDATE business_listings SET re_enriched_at = NOW(), re_enrich_locked_at = NULL WHERE id = $1`, row.ID)
 	if markErr != nil {
 		slog.Error("reenrich: failed to mark re_enriched_at",
 			"id", row.ID, "domain", row.Domain, "error", markErr)
-		// Row remains eligible (re_enriched_at still NULL), retry next loop.
+		// Lock will auto-expire after 15 min; data is already upserted via trigger.
 		return
 	}
 
@@ -331,6 +354,18 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 			"emails", len(emails),
 			"phones", len(phones),
 			"worker", workerID)
+	}
+}
+
+// releaseLock clears re_enrich_locked_at so another worker can immediately
+// re-attempt the row. Used after fetch/insert errors that don't warrant
+// marking the row done. Errors here are non-fatal — the 15-min stale-claim
+// window in fetchEligibleBatch will recover the row anyway.
+func (r *ReenrichStage) releaseLock(ctx context.Context, id int64) {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE business_listings SET re_enrich_locked_at = NULL WHERE id = $1`, id)
+	if err != nil {
+		slog.Debug("reenrich: release lock failed (will auto-expire)", "id", id, "error", err)
 	}
 }
 
