@@ -11,28 +11,19 @@ import (
 )
 
 type Config struct {
-	Postgres     PostgresConfig     `yaml:"postgres"`
-	Redis        RedisConfig        `yaml:"redis"`
-	SERP         SERPConfig         `yaml:"serp"`
-	Website      WebsiteConfig      `yaml:"website"`
-	Enrich       EnrichConfig       `yaml:"enrich"`
-	Proxy        ProxyConfig        `yaml:"proxy"`
-	Fetch        FetchConfig        `yaml:"fetch"`
-	Monitor      MonitorConfig      `yaml:"monitor"`
-	Mordibouncer MordibouncerConfig `yaml:"mordibouncer"`
-	API          APIConfig          `yaml:"api"`
-	Telegram     TelegramConfig     `yaml:"telegram"`
-	Reenrich     ReenrichConfig     `yaml:"reenrich"`
-}
-
-// ReenrichConfig governs the autonomous re-enrich scheduler. All fields read
-// from env vars in LoadFromEnv; the scheduler runs only in stage=none (manager).
-type ReenrichConfig struct {
-	Enabled          bool `yaml:"enabled"`
-	IntervalMin      int  `yaml:"interval_min"`       // ticker interval; default 360 (6h)
-	DailyLimit       int  `yaml:"daily_limit"`        // 0 = unlimited
-	OffPeakStartHour int  `yaml:"offpeak_start_hour"` // 0-23; equal start/end = always on
-	OffPeakEndHour   int  `yaml:"offpeak_end_hour"`
+	Postgres            PostgresConfig     `yaml:"postgres"`
+	Redis               RedisConfig        `yaml:"redis"`
+	SERP                SERPConfig         `yaml:"serp"`
+	Website             WebsiteConfig      `yaml:"website"`
+	Enrich              EnrichConfig       `yaml:"enrich"`
+	Proxy               ProxyConfig        `yaml:"proxy"`
+	Fetch               FetchConfig        `yaml:"fetch"`
+	Monitor             MonitorConfig      `yaml:"monitor"`
+	Mordibouncer        MordibouncerConfig `yaml:"mordibouncer"`
+	API                 APIConfig          `yaml:"api"`
+	Telegram            TelegramConfig     `yaml:"telegram"`
+	ReenrichWorkerCount int                `yaml:"reenrich_worker_count"` // number of reenrich workers (default 1)
+	ReenrichScore       int                `yaml:"reenrich_score"`        // completeness score threshold (default 90)
 }
 
 type APIConfig struct {
@@ -229,13 +220,8 @@ func LoadFromEnv() (*Config, error) {
 			Enabled: true,
 			Port:    9090,
 		},
-		Reenrich: ReenrichConfig{
-			Enabled:          os.Getenv("REENRICH_ENABLED") == "1",
-			IntervalMin:      parseEnvInt("REENRICH_INTERVAL_MIN", 360),
-			DailyLimit:       parseEnvInt("REENRICH_DAILY_LIMIT", 0),
-			OffPeakStartHour: parseEnvInt("REENRICH_OFFPEAK_START_HOUR", 0),
-			OffPeakEndHour:   parseEnvInt("REENRICH_OFFPEAK_END_HOUR", 0),
-		},
+		ReenrichWorkerCount: parseEnvInt("REENRICH_WORKER_COUNT", 1),
+		ReenrichScore:       parseEnvInt("REENRICH_SCORE", 90),
 	}
 	setDefaults(cfg)
 	return cfg, nil

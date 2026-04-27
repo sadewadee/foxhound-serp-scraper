@@ -11,8 +11,6 @@ import (
 	"os/signal"
 	"syscall"
 
-	"time"
-
 	"github.com/sadewadee/serp-scraper/internal/api"
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/db"
@@ -20,7 +18,6 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/monitor"
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
 	"github.com/sadewadee/serp-scraper/internal/reconciler"
-	"github.com/sadewadee/serp-scraper/internal/reenrich"
 	"github.com/sadewadee/serp-scraper/internal/telegram"
 	"github.com/sadewadee/serp-scraper/internal/validate"
 )
@@ -91,16 +88,6 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		projReconciler := reconciler.New(database, dd.Client())
 		go projReconciler.Run(ctx)
 
-		// Start re-enrich scheduler — autonomous selective re-fetch for rows
-		// with missing data. Off by default (REENRICH_ENABLED=1 to enable).
-		// Manager-only so multiple worker replicas don't fight over enqueueing.
-		go reenrich.RunScheduler(ctx, database, reenrich.SchedulerConfig{
-			Enabled:          cfg.Reenrich.Enabled,
-			Interval:         time.Duration(cfg.Reenrich.IntervalMin) * time.Minute,
-			DailyLimit:       cfg.Reenrich.DailyLimit,
-			OffPeakStartHour: cfg.Reenrich.OffPeakStartHour,
-			OffPeakEndHour:   cfg.Reenrich.OffPeakEndHour,
-		})
 	}
 
 	// Start pipeline stages in background (skip for "none" — API only mode).
