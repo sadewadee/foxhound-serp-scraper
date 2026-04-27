@@ -53,7 +53,11 @@ func (s *Server) cachedFilteredCount(ctx context.Context, where string, args []a
 	if err := tx.QueryRowContext(ctx, q, args...).Scan(&total); err != nil {
 		return -1, err
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		// Commit failure means the COUNT result may be from a tx that did not
+		// fully reconcile — never cache it and signal the caller to skip.
+		return -1, err
+	}
 
 	if s.redis != nil {
 		// Best-effort SETEX; cache miss isn't worth failing the request over.
@@ -62,11 +66,14 @@ func (s *Server) cachedFilteredCount(ctx context.Context, where string, args []a
 	return total, nil
 }
 
+// buildCountCacheKey hashes WHERE + args into a stable Redis key. Args are
+// formatted with %q so adjacent string values cannot transpose into the same
+// byte stream (e.g. ["a","bc"] and ["ab","c"] used to collide under %v).
 func buildCountCacheKey(where string, args []any) string {
 	h := sha1.New()
 	h.Write([]byte(where))
 	for _, a := range args {
-		fmt.Fprintf(h, "|%v", a)
+		fmt.Fprintf(h, "|%q|", a)
 	}
 	return "v2:count:" + hex.EncodeToString(h.Sum(nil))
 }
@@ -314,7 +321,10 @@ func (s *Server) handleV2ResultsStats(w http.ResponseWriter, r *http.Request) {
 	writeV2Single(w, stats)
 }
 
-// handleV2ResultsCount returns a lightweight count with filters.
+// handleV2ResultsCount returns a lightweight count with filters. When the
+// underlying COUNT(*) times out, returns count=0 + count_known=false instead
+// of HTTP 500 so polling clients stop retrying a query that will never
+// succeed in the time budget.
 func (s *Server) handleV2ResultsCount(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := v2RequestContext(r)
 	defer cancel()
@@ -322,11 +332,18 @@ func (s *Server) handleV2ResultsCount(w http.ResponseWriter, r *http.Request) {
 	where, args, _ := buildResultsFilter(r.URL.Query())
 
 	total, err := s.cachedFilteredCount(ctx, where, args)
+	known := err == nil && total >= 0
 	if err != nil {
-		slog.Warn("v2: count failed (returning -1 sentinel)", "error", err)
+		slog.Warn("v2: count failed (returning unknown sentinel)", "error", err)
+	}
+	if !known {
+		total = 0
 	}
 
-	writeV2Single(w, map[string]int{"count": total})
+	writeV2Single(w, map[string]any{
+		"count":       total,
+		"count_known": known,
+	})
 }
 
 // handleV2Categories returns categories with business and email counts.

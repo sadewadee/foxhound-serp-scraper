@@ -15,11 +15,17 @@ type PaginatedResponse struct {
 }
 
 // PaginationMeta holds pagination details.
+//
+// TotalKnown is false when the count query timed out / failed and Total is
+// therefore unreliable (typically reported as 0). Consumers SHOULD branch on
+// TotalKnown before computing pagination — when false, render data with a
+// "Showing N items, total unknown" UI instead of "Page 1 of 0".
 type PaginationMeta struct {
-	Page       int `json:"page"`
-	PerPage    int `json:"per_page"`
-	Total      int `json:"total"`
-	TotalPages int `json:"total_pages"`
+	Page       int  `json:"page"`
+	PerPage    int  `json:"per_page"`
+	Total      int  `json:"total"`
+	TotalPages int  `json:"total_pages"`
+	TotalKnown bool `json:"total_known"`
 }
 
 // SingleResponse wraps single-object endpoints.
@@ -38,10 +44,17 @@ type ErrorDetail struct {
 	Message string `json:"message"`
 }
 
-// writeV2Paginated writes a paginated JSON response.
+// writeV2Paginated writes a paginated JSON response. When total < 0 the count
+// is treated as unknown (TotalKnown=false, Total=0, TotalPages=0) so consumers
+// see spec-compliant non-negative values plus an explicit signal that
+// pagination math is unreliable.
 func writeV2Paginated(w http.ResponseWriter, data any, total, page, perPage int) {
+	known := total >= 0
+	if !known {
+		total = 0
+	}
 	totalPages := 0
-	if perPage > 0 {
+	if known && perPage > 0 {
 		totalPages = int(math.Ceil(float64(total) / float64(perPage)))
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -53,6 +66,7 @@ func writeV2Paginated(w http.ResponseWriter, data any, total, page, perPage int)
 			PerPage:    perPage,
 			Total:      total,
 			TotalPages: totalPages,
+			TotalKnown: known,
 		},
 	})
 }
