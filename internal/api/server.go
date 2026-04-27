@@ -99,6 +99,10 @@ func (s *Server) registerV2Routes() {
 	s.mux.HandleFunc("DELETE /api/v2/queries", RequireRole(RoleAdmin, s.handleV2DeleteQueries))
 	s.mux.HandleFunc("POST /api/v2/queries/generate", RequireRole(RoleAdmin, s.handleV2GenerateQueries))
 	s.mux.HandleFunc("POST /api/v2/queries/retry", RequireRole(RoleAdmin, s.handleV2RetryQueries))
+
+	// Re-enrichment (admin-triggered selective re-fetch for missing-data rows).
+	s.mux.HandleFunc("POST /api/v2/enrichments/reenrich", RequireRole(RoleAdmin, s.handleV2Reenrich))
+	s.mux.HandleFunc("GET /api/v2/enrichments/reenrich/stats", RequireRole(RoleViewer, s.handleV2ReenrichStats))
 }
 
 // Start begins serving the API.

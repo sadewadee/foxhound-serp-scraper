@@ -22,6 +22,17 @@ type Config struct {
 	Mordibouncer MordibouncerConfig `yaml:"mordibouncer"`
 	API          APIConfig          `yaml:"api"`
 	Telegram     TelegramConfig     `yaml:"telegram"`
+	Reenrich     ReenrichConfig     `yaml:"reenrich"`
+}
+
+// ReenrichConfig governs the autonomous re-enrich scheduler. All fields read
+// from env vars in LoadFromEnv; the scheduler runs only in stage=none (manager).
+type ReenrichConfig struct {
+	Enabled          bool `yaml:"enabled"`
+	IntervalMin      int  `yaml:"interval_min"`       // ticker interval; default 360 (6h)
+	DailyLimit       int  `yaml:"daily_limit"`        // 0 = unlimited
+	OffPeakStartHour int  `yaml:"offpeak_start_hour"` // 0-23; equal start/end = always on
+	OffPeakEndHour   int  `yaml:"offpeak_end_hour"`
 }
 
 type APIConfig struct {
@@ -217,6 +228,13 @@ func LoadFromEnv() (*Config, error) {
 		Monitor: MonitorConfig{
 			Enabled: true,
 			Port:    9090,
+		},
+		Reenrich: ReenrichConfig{
+			Enabled:          os.Getenv("REENRICH_ENABLED") == "1",
+			IntervalMin:      parseEnvInt("REENRICH_INTERVAL_MIN", 360),
+			DailyLimit:       parseEnvInt("REENRICH_DAILY_LIMIT", 0),
+			OffPeakStartHour: parseEnvInt("REENRICH_OFFPEAK_START_HOUR", 0),
+			OffPeakEndHour:   parseEnvInt("REENRICH_OFFPEAK_END_HOUR", 0),
 		},
 	}
 	setDefaults(cfg)
