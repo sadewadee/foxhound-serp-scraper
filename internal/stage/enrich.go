@@ -99,6 +99,19 @@ var blockedDomains = map[string]bool{
 	"stackexchange.com": true, "math.stackexchange.com": true,
 	"answers.microsoft.com": true, "answers.yahoo.com": true,
 	"detail.chiebukuro.yahoo.co.jp": true, "chiebukuro.yahoo.co.jp": true,
+	// Forum hosts that don't match prefix patterns (creative naming) but
+	// appeared in prod top 60 — exact-match entries catch them.
+	"www.tenforums.com":       true, // Windows 10 forum
+	"www.fxp.co.il":           true, // Israeli forum
+	"www.52pojie.cn":          true, // Chinese tech forum
+	"www.juraforum.de":        true, // German legal forum
+	"www.motor-talk.de":       true, // German auto forum
+	"www.radioforen.de":       true, // German radio forum
+	"www.datev-community.de":  true, // German business community
+	"telekomhilft.telekom.de": true, // German telco support
+	"www.60millions-mag.com":  true, // French consumer
+	"web2.cylex.de":           true, // German business directory
+	"www.bankier.pl":          true, // Polish banking forum
 
 	// News/media
 	"www.cnbc.com": true, "www.bloomberg.com": true, "www.reuters.com": true,
@@ -150,7 +163,11 @@ var blockedDomains = map[string]bool{
 // Three matching layers, in order of precedence:
 //  1. Exact host match against blockedDomains (fast O(1) map lookup)
 //  2. Suffix match for gov/edu/mil TLDs (English + non-English country codes)
-//  3. Substring patterns for forum/community/Q&A/support hosts
+//  3. Subdomain prefix/infix patterns for forum/community/Q&A/support hosts
+//
+// Layer 3 uses STRICT subdomain matching (HasPrefix or ".pat." infix), not
+// substring contains — substring contains incorrectly flagged hosts like
+// www.apparelsupport.com (matched "support." in path) as forums/support.
 func isSkipDomain(domain string) bool {
 	if blockedDomains[domain] {
 		return true
@@ -171,17 +188,27 @@ func isSkipDomain(domain string) bool {
 			return true
 		}
 	}
-	// Substring patterns capture forum/community subdomains regardless of TLD
-	// (e.g. forum.donanimhaber.com, forums.commentcamarche.net,
-	//  community.spotify.com, support.google.com).
-	substrPatterns := []string{
+	// Subdomain-prefix patterns: matches hosts like forum.example.com,
+	// support.google.com — strict prefix only, NOT substring (avoids
+	// www.apparelsupport.com false-positive on "support.").
+	subdomainPrefixes := []string{
 		"forum.", "forums.", "community.",
-		".forum.", ".community.", ".forums.",
 		"diskuse.", "discussions.",
 		"support.", "help.",
 	}
-	for _, sub := range substrPatterns {
-		if strings.Contains(domain, sub) {
+	for _, p := range subdomainPrefixes {
+		if strings.HasPrefix(domain, p) {
+			return true
+		}
+	}
+	// Subdomain-infix patterns: matches hosts where the pattern appears as
+	// a separate subdomain segment — e.g. abc.forum.example.com. The leading
+	// dot in the pattern guarantees match only at segment boundaries.
+	subdomainInfixes := []string{
+		".forum.", ".forums.", ".community.",
+	}
+	for _, p := range subdomainInfixes {
+		if strings.Contains(domain, p) {
 			return true
 		}
 	}
