@@ -565,11 +565,19 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			continue
 		}
 
-		inserted := 0
+		inserted, skippedBlocked := 0, 0
 		for _, u := range urls {
 			urlHash := dedup.HashURL(u)
 			domain := dedup.ExtractDomain(u)
 			if domain == "" {
+				continue
+			}
+			// Pre-INSERT filter: drop off-niche / non-business hosts so the
+			// trigger never spawns enrichment jobs we'd just skip later.
+			// Without this, isSkipDomain only fires after a worker picks up
+			// the locked job — wasted lifecycle.
+			if isSkipDomain(domain) {
+				skippedBlocked++
 				continue
 			}
 
@@ -584,6 +592,15 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				continue
 			}
 			inserted++
+		}
+		if skippedBlocked > 0 {
+			slog.Info("serp: blocked domains filtered pre-INSERT",
+				"engine", job.Engine,
+				"job_id", job.ID,
+				"skipped_blocked", skippedBlocked,
+				"inserted", inserted,
+				"total_urls", len(urls),
+			)
 		}
 
 		tx.Exec(`UPDATE serp_jobs SET status = 'completed', result_count = $1, locked_by = NULL, updated_at = NOW() WHERE id = $2`,
