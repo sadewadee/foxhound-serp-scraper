@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	mrand "math/rand/v2"
 	"net/http"
 	"net/url"
 	"time"
@@ -20,14 +21,33 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 )
 
-// stealthJA3Pool is the JA3 fingerprint rotation pool used by all stealth
-// fetchers. Built once at package init from foxhound presets (Firefox +
-// Chrome + Safari) so each stealth recycle picks a different fingerprint —
-// makes Cloudflare's per-fingerprint reputation tracking ineffective.
+// stealthBundles is the rotation pool of (browser, JA3, HTTP/2) bundles
+// applied per stealth recycle. Each bundle is internally consistent: the
+// JA3 ClientHello, HTTP/2 SETTINGS frame, and identity User-Agent all
+// derive from the same browser family. Mismatched fingerprints are a
+// stronger bot signal than any single burnt fingerprint — Cloudflare bot
+// scoring cross-correlates UA, JA3, and HTTP/2 at the edge.
 //
-// Only meaningful when the binary is built with -tags tls; the default
-// build's WithJA3Pool is a no-op.
-var stealthJA3Pool = presets.JA3Pool(presets.All())
+// Safari is intentionally excluded: foxhound/identity does not generate
+// Safari profiles, so a Safari JA3 paired with a Firefox/Chrome UA would
+// recreate the very mismatch this rotation defeats.
+var stealthBundles = []presets.Bundle{
+	presets.FirefoxLatest(),
+	presets.ChromeLatest(),
+}
+
+// pickStealthBundle returns a random fingerprint Bundle and the matching
+// identity.Browser to feed into identity.Generate. Keeping these together
+// guarantees the UA, TLS ClientHello, and HTTP/2 settings stay aligned.
+func pickStealthBundle() (presets.Bundle, identity.Browser) {
+	b := stealthBundles[mrand.IntN(len(stealthBundles))]
+	switch b.Browser {
+	case "chrome":
+		return b, identity.BrowserChrome
+	default:
+		return b, identity.BrowserFirefox
+	}
+}
 
 // refererForURL returns a realistic Referer for an enrich/contact-page fetch.
 // Mimics the natural click chain: a user on the site's homepage clicks a link
@@ -217,8 +237,15 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 // Geo-match: when PROXY_COUNTRY is set, the identity profile is constrained
 // to that country so locale, timezone, and Accept-Language match the proxy
 // exit IP. A US Firefox profile exiting via a DE proxy is itself a bot signal.
+//
+// Fingerprint rotation: each call picks a single Bundle (Firefox or Chrome)
+// and applies its JA3, HTTP/2 fingerprint, AND identity browser together so
+// User-Agent, TLS ClientHello, and HTTP/2 SETTINGS frame are all internally
+// consistent — Cloudflare flags any UA↔JA3↔HTTP2 mismatch instantly.
 func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
-	idOpts := []identity.Option{}
+	bundle, idBrowser := pickStealthBundle()
+
+	idOpts := []identity.Option{identity.WithBrowser(idBrowser)}
 	if cfg.Proxy.Country != "" {
 		idOpts = append(idOpts, identity.WithCountry(cfg.Proxy.Country))
 	}
@@ -227,9 +254,12 @@ func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
 	opts := []fetch.StealthOption{
 		fetch.WithIdentity(profile),
 		fetch.WithTimeout(time.Duration(cfg.Enrich.TimeoutMs) * time.Millisecond),
-		// Rotate TLS fingerprint per recycle; Cloudflare cannot pin reputation
-		// to a single JA3 hash. No-op on builds without -tags tls.
-		fetch.WithJA3Pool(stealthJA3Pool),
+		// Apply the matched JA3 + HTTP/2 pair from the bundle so all three
+		// fingerprint layers (UA via WithIdentity, TLS via WithJA3, HTTP/2
+		// via WithHTTP2Fingerprint) come from the same browser family.
+		// Both options are no-ops on builds without -tags tls.
+		fetch.WithJA3(bundle.JA3),
+		fetch.WithHTTP2Fingerprint(bundle.HTTP2),
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithProxy(cfg.Proxy.URL))
