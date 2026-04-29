@@ -26,13 +26,38 @@ import (
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
+// blockedDomains: exact-match host blocklist. Domains here are skipped at
+// SERP-result-INSERT time, so they never spawn enrichment jobs.
+//
+// Categories captured (kept inline for fast lookup + audit trail):
+//   - Directory aggregators (Yelp, TripAdvisor, Indeed, Glassdoor, BBB)
+//   - Social/UGC (LinkedIn, Facebook, Twitter, TikTok, YouTube, Pinterest, Reddit, Quora)
+//   - Marketplaces (Amazon TLD variants, eBay, Etsy, AliExpress, Vinted, Idealo, Mobile.de)
+//   - Q&A platforms (Zhihu, Baidu Zhidao/Jingyan, Stack Overflow/Exchange, Yahoo Chiebukuro)
+//   - News/media (CNBC, Bloomberg, Reuters, BBC, NYT, Guardian, WaPo, WSJ, CNN, Fox)
+//   - Software/corporate help (Adobe, Canva, Dell, MS support, Apple support, GitHub)
+//   - Travel (Booking, Expedia, Agoda, Kayak, Priceline, Airbnb)
+//   - Health/medical (PsychologyToday, Drugs.com, WebMD, Healthline, Mayo Clinic)
+//   - Adult (sample from prod logs)
+//   - Gaming (Poki, JeuxVideo, MLB, Steam community)
+//   - Brand/corporate (Nike, Adidas, UnderArmour, Peloton, Lululemon, REI, IKEA)
+//   - Image/document/CDN (IMDB, Scribd, Shutterstock, Getty)
+//   - Logistics (UPS, FedEx, DHL)
+//   - Academic (PMC NCBI, SAGE, Taylor & Francis)
+//   - Other (RocketReach contacts aggregator, Yellowpages, Whitepages, Walmart)
 var blockedDomains = map[string]bool{
+	// Directory aggregators
 	"www.yelp.com": true, "m.yelp.com": true,
 	"www.tripadvisor.com": true, "www.tripadvisor.co.uk": true, "www.tripadvisor.co.id": true,
 	"www.tripadvisor.de": true, "www.tripadvisor.fr": true, "www.tripadvisor.com.au": true,
 	"www.indeed.com": true, "de.indeed.com": true, "id.indeed.com": true,
 	"www.ziprecruiter.com": true, "www.simplyhired.com": true,
 	"www.glassdoor.com": true, "www.glassdoor.co.uk": true, "www.glassdoor.de": true,
+	"www.bbb.org": true, "maps.google.com": true,
+	"www.yellowpages.com": true, "www.whitepages.com": true,
+	"rocketreach.co": true,
+
+	// Social / UGC
 	"www.linkedin.com": true,
 	"www.facebook.com": true, "m.facebook.com": true,
 	"www.instagram.com": true,
@@ -40,24 +65,123 @@ var blockedDomains = map[string]bool{
 	"www.tiktok.com": true, "www.youtube.com": true,
 	"www.pinterest.com": true, "www.reddit.com": true,
 	"www.quora.com": true, "www.researchgate.net": true,
+
+	// Academic
 	"pmc.ncbi.nlm.nih.gov": true,
 	"journals.sagepub.com": true, "www.tandfonline.com": true,
-	"rocketreach.co": true,
-	"www.amazon.com": true, "www.walmart.com": true,
+
+	// Amazon TLD variants (off-niche e-commerce — variants previously bocor)
+	"www.amazon.com": true, "www.amazon.de": true, "www.amazon.fr": true,
+	"www.amazon.co.uk": true, "www.amazon.ca": true, "www.amazon.com.au": true,
+	"www.amazon.it": true, "www.amazon.es": true, "www.amazon.com.mx": true,
+	"www.amazon.com.br": true, "www.amazon.co.jp": true, "www.amazon.in": true,
+	"www.amazon.nl": true, "www.amazon.com.tr": true, "www.amazon.sg": true,
+	"www.amazon.ae": true,
+
+	// Marketplaces global
+	"www.walmart.com": true,
+	"www.etsy.com":    true,
+	"www.alibaba.com": true, "www.aliexpress.com": true, "www.aliexpress.us": true,
+	"www.taobao.com": true, "www.tmall.com": true,
+	"www.ebay.com": true, "www.ebay.de": true, "www.ebay.co.uk": true,
+	"www.ebay.fr": true, "www.ebay.it": true, "www.ebay.es": true,
+	"www.idealo.de": true, "www.idealo.fr": true, "www.idealo.it": true,
+	"www.kleinanzeigen.de": true, "www.mobile.de": true,
+	"www.vinted.com": true, "www.vinted.fr": true, "www.vinted.de": true,
+	"www.vinted.it": true, "www.vinted.es": true,
+	"www.leboncoin.fr": true, "www.immobilienscout24.de": true,
+
+	// Q&A / forum platforms (huge contamination per prod data)
+	"www.zhihu.com": true, "zhuanlan.zhihu.com": true,
+	"zhidao.baidu.com": true, "jingyan.baidu.com": true,
+	"www.justanswer.com": true, "www.chegg.com": true,
+	"stackoverflow.com": true, "superuser.com": true, "askubuntu.com": true,
+	"stackexchange.com": true, "math.stackexchange.com": true,
+	"answers.microsoft.com": true, "answers.yahoo.com": true,
+	"detail.chiebukuro.yahoo.co.jp": true, "chiebukuro.yahoo.co.jp": true,
+
+	// News/media
+	"www.cnbc.com": true, "www.bloomberg.com": true, "www.reuters.com": true,
+	"www.bbc.com": true, "www.nytimes.com": true, "www.theguardian.com": true,
+	"www.washingtonpost.com": true, "www.wsj.com": true, "edition.cnn.com": true,
+	"www.foxnews.com": true, "join1440.com": true, "tecnobits.com": true,
+
+	// Software / corporate help
+	"www.adobe.com": true, "www.canva.com": true, "www.dell.com": true,
+	"www.microsoft.com": true, "support.microsoft.com": true,
+	"support.google.com": true, "support.apple.com": true, "www.apple.com": true,
+	"github.com": true, "gitlab.com": true, "bitbucket.org": true,
+	"www.chip.de": true, "quillbot.com": true,
+	"apkpure.com": true, "steamcommunity.com": true,
+
+	// Travel
 	"www.booking.com": true, "www.airbnb.com": true,
-	"www.bbb.org": true, "maps.google.com": true,
-	"www.yellowpages.com": true, "www.whitepages.com": true,
+	"www.expedia.com": true, "www.agoda.com": true,
+	"www.kayak.com": true, "www.priceline.com": true,
+
+	// Health/medical
+	"www.psychologytoday.com": true,
+	"www.drugs.com":           true, "www.webmd.com": true, "www.healthline.com": true,
+	"www.mayoclinic.org": true, "medlineplus.gov": true,
+	"insurancetoday.cc": true, "goodins.life": true,
+
+	// Adult
+	"sexfinder.com": true, "www.sexfinder.com": true,
+	"friendfinder.com": true, "www.friendfinder.com": true,
+	"bakecaincontrii.com": true, "cosenza.bakecaincontrii.com": true,
+
+	// Gaming
+	"poki.com": true, "www.poki.com": true,
+	"www.jeuxvideo.com": true, "www.mlb.com": true,
+
+	// Fitness brands corporate (no public business contact)
+	"www.nike.com": true, "www.adidas.com": true, "www.underarmour.com": true,
+	"www.onepeloton.com": true, "www.lululemon.com": true,
+	"www.rei.com": true, "www.dickssportinggoods.com": true,
+
+	// Other
+	"www.ikea.com": true,
+	"www.imdb.com": true, "www.scribd.com": true,
+	"www.shutterstock.com": true, "www.gettyimages.com": true,
+	"www.ups.com": true, "www.fedex.com": true, "www.dhl.com": true,
 }
 
+// isSkipDomain reports whether a domain should be skipped from enrichment.
+// Three matching layers, in order of precedence:
+//  1. Exact host match against blockedDomains (fast O(1) map lookup)
+//  2. Suffix match for gov/edu/mil TLDs (English + non-English country codes)
+//  3. Substring patterns for forum/community/Q&A/support hosts
 func isSkipDomain(domain string) bool {
 	if blockedDomains[domain] {
 		return true
 	}
-	for _, suffix := range []string{
-		".edu", ".gov", ".mil", ".ac.uk", ".gov.uk", ".edu.au", ".gov.au",
+	suffixes := []string{
+		// English-speaking gov/edu
+		".edu", ".gov", ".mil",
+		".ac.uk", ".gov.uk", ".edu.au", ".gov.au",
+		// SE Asia gov/edu
 		".ac.id", ".go.id", ".edu.sg", ".gov.sg", ".ac.jp", ".go.jp",
-	} {
+		// EU + LATAM gov
+		".gouv.fr", ".gov.de", ".gob.mx", ".gob.es",
+		// East Asia gov/edu
+		".ac.cn", ".gov.cn", ".edu.cn", ".ac.kr", ".go.kr",
+	}
+	for _, suffix := range suffixes {
 		if strings.HasSuffix(domain, suffix) {
+			return true
+		}
+	}
+	// Substring patterns capture forum/community subdomains regardless of TLD
+	// (e.g. forum.donanimhaber.com, forums.commentcamarche.net,
+	//  community.spotify.com, support.google.com).
+	substrPatterns := []string{
+		"forum.", "forums.", "community.",
+		".forum.", ".community.", ".forums.",
+		"diskuse.", "discussions.",
+		"support.", "help.",
+	}
+	for _, sub := range substrPatterns {
+		if strings.Contains(domain, sub) {
 			return true
 		}
 	}
