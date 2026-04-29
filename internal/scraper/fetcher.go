@@ -126,7 +126,7 @@ func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFe
 		// slow/stuck page blocks every other goroutine. Pool mode gives true
 		// concurrency with per-slot context isolation.
 		fetch.WithPoolSize(poolSize),
-		fetch.WithPageReuseLimit(150),
+		fetch.WithPageReuseLimit(cfg.Fetch.PageReuseLimit),
 		fetch.WithStorageState("/home/scraper/.sessions/serp-session.json"),
 		// NopeCHA extension stays enabled — v0.0.10 fixes the solve gate.
 		// Extension now actually solves reCAPTCHA/Turnstile when encountered.
@@ -181,7 +181,7 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 		fetch.WithMaxBrowserRequests(cfg.Fetch.EnrichMaxRequests),
 		// Anti-detection:
 		fetch.WithBehaviorProfile(bp),
-		fetch.WithPageReuseLimit(150),
+		fetch.WithPageReuseLimit(cfg.Fetch.PageReuseLimit),
 		fetch.WithStorageState("/tmp/enrich-session.json"),
 	}
 	if poolSize > 0 {
