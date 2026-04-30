@@ -770,7 +770,11 @@ func fetchStealthOnly(ctx context.Context, stealth *fetch.StealthFetcher, pageUR
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return string(resp.Body), nil
+	contentType := ""
+	if resp.Headers != nil {
+		contentType = resp.Headers.Get("Content-Type")
+	}
+	return decodeBodyUTF8(resp.Body, contentType), nil
 }
 
 func isPermanentError(errMsg string) bool {
