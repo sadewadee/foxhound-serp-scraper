@@ -1,5 +1,12 @@
 # docker-compose.yaml — Production deployment
 #
+# Pulls images from the private registry (ghcr.mcpke.dev) — no local build.
+# Override the image tag per-deploy:
+#   IMAGE_TAG=v0.7.0 docker compose up -d   # stable baseline
+#   IMAGE_TAG=v0.7.1 docker compose up -d   # canary (foxhound v0.0.20)
+#
+# Default tag: v0.7.1
+#
 # Scaling:
 #   SERP_WORKER_COUNT=2     → 2 SERP containers
 #   ENRICH_WORKER_COUNT=4   → 4 Enrich containers
@@ -76,8 +83,8 @@ services:
   # ===========================================
   manager:
     init: true
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       db:
@@ -116,8 +123,8 @@ services:
   # ===========================================
   serp:
     init: true
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       db:
@@ -178,8 +185,8 @@ services:
   # ===========================================
   enrich:
     init: true
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       db:
@@ -233,8 +240,8 @@ services:
   # ===========================================
   reenrich:
     init: true
-    build: .
-    image: foxhound-serp-scraper:local
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       db:
