@@ -1,0 +1,324 @@
+# docker-compose.registry.yaml — Production deployment (registry-based)
+#
+# Identical to docker-compose.yaml except images are pulled from the
+# private registry (ghcr.mcpke.dev) instead of built locally. Use this
+# variant when:
+#   - Deploying to a host that should NOT build (no Go toolchain, no
+#     spare disk for build cache, or local images get auto-pruned).
+#   - Promoting a tested tag across multiple hosts with identical bits.
+#
+# Usage:
+#   docker compose -f docker-compose.registry.yaml up -d                   # default :v0.7.1
+#   IMAGE_TAG=v0.7.0 docker compose -f docker-compose.registry.yaml up -d  # stable baseline
+#   IMAGE_TAG=v0.7.1 docker compose -f docker-compose.registry.yaml up -d  # canary (foxhound v0.0.20)
+#
+# Tags currently in registry:
+#   v0.7.0  — base 7e27ec0 + 5 cherry-picks, foxhound v0.0.14
+#   v0.7.1  — base 7e27ec0 + 5 cherry-picks + foxhound v0.0.20 bump
+#
+# `docker-compose.yaml` (build-based) remains the default for local dev.
+#
+# Scaling:
+#   SERP_WORKER_COUNT=2     → 2 SERP containers
+#   ENRICH_WORKER_COUNT=4   → 4 Enrich containers
+#   SERP_CONCURRENCY=4      → 4 browser tabs per SERP container
+#   ENRICH_CONCURRENCY=20   → 20 concurrent fetchers per Enrich container
+
+services:
+
+  # ===========================================
+  # PostgreSQL Database
+  # ===========================================
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    command: >
+      postgres
+      -c max_connections=${PG_MAX_CONNECTIONS:-200}
+      -c shared_buffers=512MB
+      -c effective_cache_size=2GB
+      -c work_mem=8MB
+      -c maintenance_work_mem=256MB
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_wal_size=2GB
+      -c checkpoint_completion_target=0.9
+      -c autovacuum_vacuum_scale_factor=0.05
+      -c autovacuum_analyze_scale_factor=0.02
+      -c statement_timeout=60000
+    shm_size: "1gb"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-serp}
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-serp_scraper}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-serp}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scraper-network
+
+  # ===========================================
+  # Redis - Queue & Deduplication
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass "${REDIS_PASSWORD}"
+      --save 60 1
+      --loglevel warning
+      --maxmemory ${REDIS_MAXMEM:-4gb}
+      --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    ports:
+      - "63790:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scraper-network
+
+  # ===========================================
+  # Manager (API + Telegram bot, no scraping)
+  # ===========================================
+  manager:
+    init: true
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      API_SECRET: "${API_SECRET}"
+      API_KEY: "${API_KEY}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
+      MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
+      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
+      TZ: "${TZ:-Asia/Jakarta}"
+    command: ["run", "-stage", "none"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - scraper-network
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 256m
+
+  # ===========================================
+  # SERP Worker Pool (Google search via Camoufox)
+  # ===========================================
+  serp:
+    init: true
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      PROXY_URL: "${PROXY_URL:-}"
+      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
+      # ── DB pool (minimal — hot path is zero-DB, only persister+reconciler need DB) ──
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
+      # ── Browser lifecycle tuning (optional) ──
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-100}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-20}"
+      BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
+      # ── SERP engines + timing ──
+      SERP_ENGINES: "${SERP_ENGINES:-bing}"
+      SERP_DELAY_MS: "${SERP_DELAY_MS:-3000}"
+      GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-1}"
+      BING_MAX_PAGES: "${BING_MAX_PAGES:-5}"
+      DDG_MAX_PAGES: "${DDG_MAX_PAGES:-5}"
+      # ── Beta features DISABLED for SERP — circuit breaker skips proxy too aggressively ──
+      BETA_FEATURES: "0"
+      # ── Persister (batch flush Redis→DB) ──
+      PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
+      PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
+      TZ: "${TZ:-Asia/Jakarta}"
+    shm_size: "512mb"
+    command: ["run", "-stage", "serp", "-workers", "${SERP_CONCURRENCY:-4}"]
+    volumes:
+      - serp_sessions:/home/scraper/.sessions
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - scraper-network
+    deploy:
+      mode: replicated
+      replicas: ${SERP_WORKER_COUNT:-2}
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4g
+        reservations:
+          memory: 512m
+
+  # ===========================================
+  # Enrich Worker Pool (contact page discovery + extraction)
+  # ===========================================
+  enrich:
+    init: true
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      PROXY_URL: "${PROXY_URL:-}"
+      MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
+      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
+      # ── DB pool (minimal — hot path is zero-DB, only persister+reconciler need DB) ──
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
+      # ── Browser lifecycle tuning (optional) ──
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
+      ENRICH_MAX_REQUESTS: "${ENRICH_MAX_REQUESTS:-300}"
+      BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      # ── Beta features (foxhound v0.0.7) — set to "1" to enable ──
+      BETA_FEATURES: "${BETA_FEATURES:-0}"
+      # ── Persister (batch flush Redis→DB) ──
+      PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
+      PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
+      TZ: "${TZ:-Asia/Jakarta}"
+    shm_size: "512mb"
+    command: ["run", "-stage", "enrich", "-workers", "${ENRICH_CONCURRENCY:-20}"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - scraper-network
+    deploy:
+      mode: replicated
+      replicas: ${ENRICH_WORKER_COUNT:-4}
+      resources:
+        limits:
+          cpus: "1"
+          memory: 4g
+        reservations:
+          memory: 512m
+
+  # ===========================================
+  # Reenrich - Autonomous re-enrichment worker
+  # ===========================================
+  reenrich:
+    init: true
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:${IMAGE_TAG:-v0.7.1}
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: "postgres://${POSTGRES_USER:-serp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-serp_scraper}?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      PROXY_URL: "${PROXY_URL:-}"
+      MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
+      MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
+      PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
+      PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
+      PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
+      BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
+      BETA_FEATURES: "${BETA_FEATURES:-0}"
+      TZ: "${TZ:-Asia/Jakarta}"
+      REENRICH_WORKER_COUNT: "${REENRICH_WORKER_COUNT:-1}"
+      REENRICH_SCORE: "${REENRICH_SCORE:-90}"
+    shm_size: "512mb"
+    command: ["run", "-stage", "reenrich", "-workers", "${REENRICH_WORKER_COUNT:-1}"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - scraper-network
+    deploy:
+      mode: replicated
+      replicas: ${REENRICH_WORKER_COUNT:-1}
+      resources:
+        limits:
+          cpus: "1"
+          memory: 4g
+        reservations:
+          memory: 512m
+
+  # ===========================================
+  # Autoheal - Auto-restart unhealthy containers
+  # ===========================================
+  autoheal:
+    image: willfarrell/autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=120
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - scraper-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  serp_sessions:
+    driver: local
+
+networks:
+  scraper-network:
+    driver: bridge
