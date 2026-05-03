@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -71,6 +72,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", cfgErr)
 		os.Exit(1)
 	}
+
+	// Auto-resolve PROXY_COUNTRY from proxy IP if not set explicitly.
+	// Best-effort: warns and continues on failure (random identity fallback).
+	cfg.ResolveProxyGeo(context.Background())
 
 	// Route to subcommand.
 	command := args[0]

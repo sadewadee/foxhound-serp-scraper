@@ -198,7 +198,7 @@ monitor:
 | `REDIS_ADDR` | Redis address (default: `localhost:6379`) |
 | `REDIS_PASSWORD` | Redis password |
 | `PROXY_URL` | Proxy URL for all fetchers |
-| `PROXY_COUNTRY` | ISO 3166-1 alpha-2 country code matching the proxy's exit IP. Drives browser identity locale, Accept-Language, timezone — must match the proxy country to avoid bot-detection. **Required when `PROXY_URL` is set.** |
+| `PROXY_COUNTRY` | ISO 3166-1 alpha-2 country code matching the proxy's exit IP. Drives browser identity locale, Accept-Language, timezone. **Auto-resolved from the proxy IP at startup** via `ipinfo.io/country`; set this env var only to override the auto-detection (e.g. when ipinfo is blocked or a proxy lies about its location). |
 | `TZ` | Container timezone. Defaults to `UTC` (safe for logs). When `PROXY_URL`+`PROXY_COUNTRY` are set, override `TZ` to a matching IANA zone (e.g. `America/Toronto` for `PROXY_COUNTRY=CA`). |
 | `SERP_BLOCK_ASSETS` | Set to `1` to block fonts/images/ads on SERP browser (bandwidth save). Off by default — A/B test on one container first; Google may correlate missing subresources with bot traffic. |
 

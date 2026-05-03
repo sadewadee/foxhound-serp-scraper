@@ -1,13 +1,18 @@
 package config
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/sadewadee/serp-scraper/internal/geo"
 )
 
 type Config struct {
@@ -364,4 +369,34 @@ func (c *Config) DSN() string {
 	// Strip quotes if present.
 	dsn = strings.Trim(dsn, "\"'")
 	return dsn
+}
+
+// ResolveProxyGeo auto-populates c.Proxy.Country by calling ipinfo.io through
+// the configured proxy. Skipped when c.Proxy.URL is empty (no proxy) or
+// c.Proxy.Country is already set (explicit override wins).
+//
+// Best-effort: failures are logged at WARN level and ignored — identity
+// generation falls back to random country, same as before this method existed.
+// Manual PROXY_COUNTRY override always takes precedence: this is the
+// auto-detect fallback for the common case where operators forget to set it.
+func (c *Config) ResolveProxyGeo(ctx context.Context) {
+	if c.Proxy.URL == "" {
+		return
+	}
+	if c.Proxy.Country != "" {
+		slog.Info("config: PROXY_COUNTRY set explicitly, skipping auto-resolve",
+			"country", c.Proxy.Country)
+		return
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	code, err := geo.ResolveCountryFromProxy(lookupCtx, c.Proxy.URL)
+	if err != nil {
+		slog.Warn("config: auto-resolve PROXY_COUNTRY failed; identity will not be geo-matched",
+			"err", err)
+		return
+	}
+	c.Proxy.Country = code
+	slog.Info("config: auto-resolved PROXY_COUNTRY from proxy IP",
+		"country", code)
 }
