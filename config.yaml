@@ -29,12 +29,14 @@ enrich:
 
 proxy:
   url: "${PROXY_URL}"
+  country: "${PROXY_COUNTRY}"   # ISO 3166-1 alpha-2 matching proxy exit IP (drives identity geo-match)
 
 fetch:
   headless: true
   block_images: true
+  serp_block_assets: ${SERP_BLOCK_ASSETS:-false}   # opt-in: block fonts/images/ads on SERP (A/B test)
   page_reuse_limit: ${PAGE_REUSE_LIMIT:-200}
-  browser_reuse_limit: ${BROWSER_REUSE_LIMIT:-2}
+  browser_reuse_limit: ${BROWSER_REUSE_LIMIT:-10}
   stealth_recycle_after: ${STEALTH_RECYCLE_AFTER:-500}
   serp_max_requests: ${SERP_MAX_REQUESTS:-200}
   enrich_max_requests: ${ENRICH_MAX_REQUESTS:-300}

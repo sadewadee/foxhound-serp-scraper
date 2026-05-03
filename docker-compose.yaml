@@ -94,7 +94,7 @@ services:
       TELEGRAM_ALLOWED_USERS: "${TELEGRAM_ALLOWED_USERS:-}"
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
-      TZ: "${TZ:-Asia/Jakarta}"
+      TZ: "${TZ:-UTC}"
     command: ["run", "-stage", "none"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
@@ -129,14 +129,17 @@ services:
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXY_URL: "${PROXY_URL:-}"
+      PROXY_COUNTRY: "${PROXY_COUNTRY:-}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
       # ── DB pool (minimal — hot path is zero-DB, only persister+reconciler need DB) ──
       PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
       PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
       # ── Browser lifecycle tuning (optional) ──
       PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-100}"
-      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-10}"
       SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-20}"
+      # ── Bandwidth A/B (off by default — see issue #notes) ──
+      SERP_BLOCK_ASSETS: "${SERP_BLOCK_ASSETS:-0}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       RECONCILER_INTERVAL_MS: "${RECONCILER_INTERVAL_MS:-60000}"
       # ── SERP engines + timing ──
@@ -150,7 +153,7 @@ services:
       # ── Persister (batch flush Redis→DB) ──
       PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
       PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
-      TZ: "${TZ:-Asia/Jakarta}"
+      TZ: "${TZ:-UTC}"
     shm_size: "512mb"
     command: ["run", "-stage", "serp", "-workers", "${SERP_CONCURRENCY:-4}"]
     volumes:
@@ -191,6 +194,7 @@ services:
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXY_URL: "${PROXY_URL:-}"
+      PROXY_COUNTRY: "${PROXY_COUNTRY:-}"
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
       # ── DB pool (minimal — hot path is zero-DB, only persister+reconciler need DB) ──
@@ -198,7 +202,7 @@ services:
       PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
       # ── Browser lifecycle tuning (optional) ──
       PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
-      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-10}"
       STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
       ENRICH_MAX_REQUESTS: "${ENRICH_MAX_REQUESTS:-300}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
@@ -207,7 +211,7 @@ services:
       # ── Persister (batch flush Redis→DB) ──
       PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
       PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"
-      TZ: "${TZ:-Asia/Jakarta}"
+      TZ: "${TZ:-UTC}"
     shm_size: "512mb"
     command: ["run", "-stage", "enrich", "-workers", "${ENRICH_CONCURRENCY:-20}"]
     healthcheck:
@@ -246,16 +250,17 @@ services:
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
       PROXY_URL: "${PROXY_URL:-}"
+      PROXY_COUNTRY: "${PROXY_COUNTRY:-}"
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
       MORDIBOUNCER_SECRET: "${MORDIBOUNCER_SECRET:-}"
       PG_MAX_OPEN_CONNS: "${PG_MAX_OPEN_CONNS:-2}"
       PG_MAX_IDLE_CONNS: "${PG_MAX_IDLE_CONNS:-1}"
       PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
-      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-10}"
       STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       BETA_FEATURES: "${BETA_FEATURES:-0}"
-      TZ: "${TZ:-Asia/Jakarta}"
+      TZ: "${TZ:-UTC}"
       REENRICH_WORKER_COUNT: "${REENRICH_WORKER_COUNT:-1}"
       REENRICH_SCORE: "${REENRICH_SCORE:-90}"
     shm_size: "512mb"

@@ -30,7 +30,9 @@ services:
 
       # ── Worker config ──
       PROXY_URL: "${PROXY_URL:-}"
-      TZ: "${TZ:-Asia/Jakarta}"
+      PROXY_COUNTRY: "${PROXY_COUNTRY:-}"
+      SERP_BLOCK_ASSETS: "${SERP_BLOCK_ASSETS:-0}"
+      TZ: "${TZ:-UTC}"
 
       # ── Email validation (optional) ──
       MORDIBOUNCER_API_URL: "${MORDIBOUNCER_API_URL:-https://mailexchange.kremlit.dev}"
@@ -38,7 +40,7 @@ services:
 
       # ── Browser lifecycle tuning (optional) ──
       PAGE_REUSE_LIMIT: "${PAGE_REUSE_LIMIT:-200}"
-      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-2}"
+      BROWSER_REUSE_LIMIT: "${BROWSER_REUSE_LIMIT:-10}"
       STEALTH_RECYCLE_AFTER: "${STEALTH_RECYCLE_AFTER:-500}"
       SERP_MAX_REQUESTS: "${SERP_MAX_REQUESTS:-200}"
       ENRICH_MAX_REQUESTS: "${ENRICH_MAX_REQUESTS:-300}"

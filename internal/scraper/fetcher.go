@@ -57,9 +57,11 @@ func engineHomepageReferer(serpURL string) http.Header {
 }
 
 // NewSERPBrowser creates a Camoufox browser optimized for Google SERP scraping.
-// Uses persistent session, page pooling, and geo-matched identity.
+// Uses page pooling and geo-matched identity. No persistent session — Google
+// consent is pre-baked via cookies; storage state across concurrent workers
+// would be a session-cluster signal.
 func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
-	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+	profile := identity.Generate(buildIdentityOpts(cfg)...)
 	bp := behavior.CarefulProfile().Jitter()
 
 	headless := "virtual"
@@ -75,10 +77,6 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 		fetch.WithBrowserTimeout(browserTimeout),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests / 2),
 		fetch.WithBehaviorProfile(bp),
-		// No WithUserDataDir — persistent context serializes all page operations
-		// through a single Playwright channel, killing concurrency.
-		// Use StorageState for cookie/session persistence across restarts instead.
-		fetch.WithStorageState("/home/scraper/.sessions/serp-session.json"),
 		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	if cfg.Proxy.URL != "" {
@@ -96,9 +94,11 @@ func NewSERPBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 // pre-warmed tab pool sized to match the concurrency level. All tab workers
 // share a single browser process — each goroutine acquires a pool slot, fetches,
 // then releases. MaxBrowserRequests is set to 200 to match the lifecycle limit.
+//
+// Identity is geo-matched to cfg.Proxy.Country when set — random identity with
+// a fixed-country exit IP is itself a bot signal, not protection against it.
 func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetcher, error) {
-	// Random identity (no hardcoded country — diverse profiles avoid clustering).
-	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+	profile := identity.Generate(buildIdentityOpts(cfg)...)
 
 	headless := "virtual"
 	if !cfg.Fetch.Headless {
@@ -113,8 +113,9 @@ func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFe
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
-		// NO BlockImages for SERP — Google detects missing subresource loading.
-		// Real browsers always load images; blocking is a bot signal.
+		// SERP runs without resource blocking by default — Google's "missing
+		// subresource loading" detection is a known signal. SERP_BLOCK_ASSETS=1
+		// gates an opt-in interceptor for A/B-tested bandwidth savings.
 		fetch.WithBrowserTimeout(browserTimeout),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.SERPMaxRequests),
 		// Anti-detection (foxhound v0.0.10):
@@ -127,12 +128,16 @@ func NewSERPBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFe
 		// concurrency with per-slot context isolation.
 		fetch.WithPoolSize(poolSize),
 		fetch.WithPageReuseLimit(cfg.Fetch.PageReuseLimit),
-		fetch.WithStorageState("/home/scraper/.sessions/serp-session.json"),
+		// No WithStorageState: a shared session file across concurrent tabs
+		// (and across docker-volume-mounted replicas) carries identical
+		// cookies on every browser, a session-graph cluster signal.
 		// NopeCHA extension stays enabled — v0.0.10 fixes the solve gate.
-		// Extension now actually solves reCAPTCHA/Turnstile when encountered.
 	}
 	if cfg.Proxy.URL != "" {
 		opts = append(opts, fetch.WithBrowserProxy(cfg.Proxy.URL))
+	}
+	if cfg.Fetch.SERPBlockAssets {
+		opts = append(opts, fetch.WithInterceptConfig(serpInterceptConfig()))
 	}
 
 	browser, err := fetch.NewCamoufox(opts...)
@@ -160,7 +165,7 @@ func NewBrowser(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 //	Each gets a pre-warmed tab from the pool
 //	Cookies/state cleared between uses (no session bleed)
 func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetcher, error) {
-	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+	profile := identity.Generate(buildIdentityOpts(cfg)...)
 	bp := behavior.ModerateProfile().Jitter() // moderate for enrich (faster, less stealth needed)
 
 	headless := "virtual"
@@ -176,7 +181,7 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
-		fetch.WithBlockImages(cfg.Fetch.BlockImages),
+		fetch.WithInterceptConfig(enrichInterceptConfig(cfg)),
 		fetch.WithBrowserTimeout(enrichTimeout),
 		fetch.WithMaxBrowserRequests(cfg.Fetch.EnrichMaxRequests),
 		// Anti-detection:
@@ -208,11 +213,7 @@ func NewBrowserWithPool(cfg *config.Config, poolSize int) (*fetch.CamoufoxFetche
 // to that country so locale, timezone, and Accept-Language match the proxy
 // exit IP. A US Firefox profile exiting via a DE proxy is itself a bot signal.
 func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
-	idOpts := []identity.Option{}
-	if cfg.Proxy.Country != "" {
-		idOpts = append(idOpts, identity.WithCountry(cfg.Proxy.Country))
-	}
-	profile := identity.Generate(idOpts...)
+	profile := identity.Generate(buildIdentityOpts(cfg)...)
 
 	opts := []fetch.StealthOption{
 		fetch.WithIdentity(profile),
@@ -222,6 +223,18 @@ func NewStealth(cfg *config.Config) *fetch.StealthFetcher {
 		opts = append(opts, fetch.WithProxy(cfg.Proxy.URL))
 	}
 	return fetch.NewStealth(opts...)
+}
+
+// buildIdentityOpts returns the canonical identity options for any browser
+// or stealth fetcher: pin to Firefox and apply geo-match when PROXY_COUNTRY
+// is set. Random country with a fixed-country exit IP leaks via locale,
+// timezone, Accept-Language, and WebRTC ICE candidates.
+func buildIdentityOpts(cfg *config.Config) []identity.Option {
+	opts := []identity.Option{identity.WithBrowser(identity.BrowserFirefox)}
+	if cfg.Proxy.Country != "" {
+		opts = append(opts, identity.WithCountry(cfg.Proxy.Country))
+	}
+	return opts
 }
 
 // FetchSERP fetches a Google SERP page with consent banner handling.
@@ -359,7 +372,7 @@ func FetchWithBrowser(ctx context.Context, browser *fetch.CamoufoxFetcher, pageU
 // Used as fallback when proxy is blocked by search engines.
 // Only 1 tab — rate-limited to protect server IP.
 func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
-	profile := identity.Generate(identity.WithBrowser(identity.BrowserFirefox))
+	profile := identity.Generate(buildIdentityOpts(cfg)...)
 	bp := behavior.CarefulProfile().Jitter()
 
 	headless := "virtual"
@@ -370,12 +383,12 @@ func NewSERPBrowserDirect(cfg *config.Config) (*fetch.CamoufoxFetcher, error) {
 	opts := []fetch.CamoufoxOption{
 		fetch.WithBrowserIdentity(profile),
 		fetch.WithHeadless(headless),
-		// NO BlockImages — same as proxy browser, avoid detection.
+		// NO resource blocking — same as proxy browser, avoid detection.
 		fetch.WithBrowserTimeout(60 * time.Second),
 		fetch.WithMaxBrowserRequests(100),
 		fetch.WithBehaviorProfile(bp),
-		// No WithUserDataDir — single persistent context kills concurrency.
-		fetch.WithStorageState("/home/scraper/.sessions/serp-direct-session.json"),
+		// No WithStorageState: single direct browser carrying long-lived state
+		// is itself a fingerprint; consent is pre-baked via cookies below.
 		fetch.WithBrowserCookies(googleConsentCookies()),
 	}
 	// NO proxy — uses server IP directly.
@@ -395,6 +408,78 @@ func googleConsentCookies() []fetch.BrowserCookie {
 		{Name: "SOCS", Value: "CAISHAgBEhJnd3NfMjAyMzA4MDktMF9SQzEaAmVuIAEaBgiA_LGYBA", Domain: ".google.com", Path: "/"},
 		{Name: "CONSENT", Value: "YES+cb.20230809-04-p0.en+FX+410", Domain: ".google.com", Path: "/"},
 	}
+}
+
+// enrichInterceptConfig builds the resource/domain blocklist for the enrich
+// browser. Stylesheets are NOT blocked because some contact pages use
+// CSS-driven layout. Social platform root domains (facebook.com, twitter.com,
+// linkedin.com, etc.) are NOT blocked — we extract their URLs from page HTML;
+// only their tracking SDKs (e.g. connect.facebook.net) are blocked.
+//
+// cfg.Fetch.BlockImages still gates resource-type blocking; the tracking
+// blocklist runs unconditionally (no detection cost).
+func enrichInterceptConfig(cfg *config.Config) *fetch.InterceptConfig {
+	domains := map[string]bool{
+		// Google ads + analytics
+		"google-analytics.com":  true,
+		"googletagmanager.com":  true,
+		"googletagservices.com": true,
+		"googleadservices.com":  true,
+		"googlesyndication.com": true,
+		"doubleclick.net":       true,
+		"2mdn.net":              true,
+		// Facebook SDK (NOT facebook.com — we extract those URLs)
+		"connect.facebook.net": true,
+		// Behavior + session-replay analytics
+		"hotjar.com":    true,
+		"fullstory.com": true,
+		"mouseflow.com": true,
+		"crazyegg.com":  true,
+		// Product analytics
+		"segment.io":        true,
+		"segment.com":       true,
+		"mixpanel.com":      true,
+		"amplitude.com":     true,
+		"heap.com":          true,
+		"heapanalytics.com": true,
+		// Customer chat widgets
+		"intercom.io":     true,
+		"intercomcdn.com": true,
+		"drift.com":       true,
+		"tawk.to":         true,
+	}
+	var resources map[fetch.ResourceType]bool
+	if cfg.Fetch.BlockImages {
+		resources = fetch.ContentOnlyResources()
+	}
+	return fetch.NewInterceptConfig(resources, domains)
+}
+
+// serpInterceptConfig builds the conservative SERP blocklist for opt-in A/B
+// testing (gated by SERP_BLOCK_ASSETS). Blocks 8 resource types; preserves
+// stylesheet, script, websocket — Google's SERP needs JS for pagination.
+// google-analytics.com is intentionally NOT blocked — Google's bot detection
+// may correlate GA absence with bot traffic on first-party properties.
+func serpInterceptConfig() *fetch.InterceptConfig {
+	resources := map[fetch.ResourceType]bool{
+		fetch.ResourceFont:      true,
+		fetch.ResourceImage:     true,
+		fetch.ResourceMedia:     true,
+		fetch.ResourceBeacon:    true,
+		fetch.ResourceObject:    true,
+		fetch.ResourceImageSet:  true,
+		fetch.ResourceTextTrack: true,
+		fetch.ResourceCSPReport: true,
+	}
+	domains := map[string]bool{
+		"googletagmanager.com":  true,
+		"googletagservices.com": true,
+		"googleadservices.com":  true,
+		"googlesyndication.com": true,
+		"doubleclick.net":       true,
+		"2mdn.net":              true,
+	}
+	return fetch.NewInterceptConfig(resources, domains)
 }
 
 // FetchWithBrowserString fetches a page using only the browser, returns string body.
