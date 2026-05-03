@@ -46,6 +46,10 @@ func ResolveCountryFromProxy(ctx context.Context, proxyURL string) (string, erro
 		Proxy:                 http.ProxyURL(pu),
 		ResponseHeaderTimeout: DefaultTimeout,
 	}
+	// One-shot client: release the proxy TCP connection from the idle pool
+	// immediately after the call so it doesn't park on a slow SOCKS5 hop
+	// until OS keepalive fires.
+	defer transport.CloseIdleConnections()
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   DefaultTimeout,

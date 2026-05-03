@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -388,7 +387,8 @@ func (c *Config) ResolveProxyGeo(ctx context.Context) {
 			"country", c.Proxy.Country)
 		return
 	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// Match geo.DefaultTimeout — defence-in-depth, both layers cap at 10s.
+	lookupCtx, cancel := context.WithTimeout(ctx, geo.DefaultTimeout)
 	defer cancel()
 	code, err := geo.ResolveCountryFromProxy(lookupCtx, c.Proxy.URL)
 	if err != nil {
