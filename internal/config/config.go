@@ -98,12 +98,13 @@ type ProxyConfig struct {
 }
 
 type FetchConfig struct {
-	Headless    bool `yaml:"headless"`
-	BlockImages bool `yaml:"block_images"`
+	Headless        bool `yaml:"headless"`
+	BlockImages     bool `yaml:"block_images"`
+	SERPBlockAssets bool `yaml:"serp_block_assets"` // opt-in: block fonts/images/ads on SERP browser (A/B test before rollout)
 
 	// Browser lifecycle tuning — controls memory usage vs restart overhead.
 	PageReuseLimit       int `yaml:"page_reuse_limit"`       // requests before browser page recycle (default 200)
-	BrowserReuseLimit    int `yaml:"browser_reuse_limit"`    // page recycles before full browser restart (default 2)
+	BrowserReuseLimit    int `yaml:"browser_reuse_limit"`    // page recycles before full browser restart (default 10)
 	StealthRecycleAfter  int `yaml:"stealth_recycle_after"`  // requests before stealth fetcher recycle (default 500)
 	SERPMaxRequests      int `yaml:"serp_max_requests"`      // MaxBrowserRequests for SERP browser (default 200)
 	EnrichMaxRequests    int `yaml:"enrich_max_requests"`    // MaxBrowserRequests for enrich browser (default 300)
@@ -187,6 +188,7 @@ func LoadFromEnv() (*Config, error) {
 		Fetch: FetchConfig{
 			Headless:             true,
 			BlockImages:          true,
+			SERPBlockAssets:      os.Getenv("SERP_BLOCK_ASSETS") == "1",
 			PageReuseLimit:       parseEnvInt("PAGE_REUSE_LIMIT", 0),
 			BrowserReuseLimit:    parseEnvInt("BROWSER_REUSE_LIMIT", 0),
 			StealthRecycleAfter:  parseEnvInt("STEALTH_RECYCLE_AFTER", 0),
@@ -294,7 +296,7 @@ func setDefaults(cfg *Config) {
 		cfg.Fetch.PageReuseLimit = 200
 	}
 	if cfg.Fetch.BrowserReuseLimit == 0 {
-		cfg.Fetch.BrowserReuseLimit = 2
+		cfg.Fetch.BrowserReuseLimit = 10
 	}
 	if cfg.Fetch.StealthRecycleAfter == 0 {
 		cfg.Fetch.StealthRecycleAfter = 500

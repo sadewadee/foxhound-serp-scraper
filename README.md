@@ -178,10 +178,12 @@ contact:
 
 proxy:
   url: "${PROXY_URL}"                 # SOCKS5 or HTTP proxy URL
+  country: "${PROXY_COUNTRY}"         # ISO 3166-1 alpha-2 matching proxy exit IP (geo-match identity)
 
 fetch:
   headless: true                      # Run browser in headless mode
-  block_images: true                  # Block images/media for faster loading
+  block_images: true                  # Block images/media on enrich for faster loading
+  serp_block_assets: false            # opt-in: block fonts/images/ads on SERP (A/B test)
 
 monitor:
   enabled: true                       # Enable Prometheus metrics endpoint
@@ -196,6 +198,9 @@ monitor:
 | `REDIS_ADDR` | Redis address (default: `localhost:6379`) |
 | `REDIS_PASSWORD` | Redis password |
 | `PROXY_URL` | Proxy URL for all fetchers |
+| `PROXY_COUNTRY` | ISO 3166-1 alpha-2 country code matching the proxy's exit IP. Drives browser identity locale, Accept-Language, timezone — must match the proxy country to avoid bot-detection. **Required when `PROXY_URL` is set.** |
+| `TZ` | Container timezone. Defaults to `UTC` (safe for logs). When `PROXY_URL`+`PROXY_COUNTRY` are set, override `TZ` to a matching IANA zone (e.g. `America/Toronto` for `PROXY_COUNTRY=CA`). |
+| `SERP_BLOCK_ASSETS` | Set to `1` to block fonts/images/ads on SERP browser (bandwidth save). Off by default — A/B test on one container first; Google may correlate missing subresources with bot traffic. |
 
 ## Distributed Workers
 
