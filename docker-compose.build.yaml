@@ -1,0 +1,8 @@
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.7.1-fix
+    command: ["echo", "image build complete: ghcr.mcpke.dev/foxhound-serp-scraper:v0.7.1-fix"]
+    restart: "no"
