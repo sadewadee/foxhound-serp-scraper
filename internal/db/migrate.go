@@ -376,15 +376,45 @@ func runMigrations(db *sql.DB) error {
 	// locked_by, attempt_count). At peak throughput enrichment_jobs sees
 	// thousands of UPDATEs/h that have no normalization work to do; this WHEN
 	// clause cuts that overhead to zero.
+	//
+	// Reenrich propagation fix (v0.7.3): widened WHEN to also fire when the
+	// raw_address / raw_country / raw_city fields change on a row that's
+	// already 'completed'. The reenrich worker upserts with status='completed'
+	// onto rows whose OLD.status is already 'completed' — without this the
+	// trigger silently no-op'd every reenrich writeback and address/country
+	// coverage never improved. Heartbeat UPDATEs (locked_by, attempt_count,
+	// updated_at) don't touch raw_*, so the WHEN gate still filters them out.
 	if _, err := db.Exec(`
 		DROP TRIGGER IF EXISTS trg_enrichment_normalize ON enrichment_jobs;
 		CREATE TRIGGER trg_enrichment_normalize
 		  AFTER UPDATE ON enrichment_jobs
 		  FOR EACH ROW
-		  WHEN (NEW.status = 'completed' AND OLD.status IS DISTINCT FROM 'completed')
+		  WHEN (NEW.status = 'completed' AND (
+		    OLD.status IS DISTINCT FROM 'completed'
+		    OR NEW.raw_address IS DISTINCT FROM OLD.raw_address
+		    OR NEW.raw_country IS DISTINCT FROM OLD.raw_country
+		    OR NEW.raw_city    IS DISTINCT FROM OLD.raw_city
+		  ))
 		  EXECUTE FUNCTION trg_normalize_enrichment();
 	`); err != nil {
 		return fmt.Errorf("db: create trg_enrichment_normalize trigger: %w", err)
+	}
+
+	// Reenrich propagation fix (v0.7.3): cover the INSERT path too. When
+	// reenrich's url_hash differs from the first-enrich URL (e.g. root vs
+	// /contact-us), the ON CONFLICT branch falls through to INSERT — and
+	// the AFTER UPDATE trigger never fires. Mirror it as AFTER INSERT so
+	// new completed rows propagate to business_listings on either path.
+	// Reuses the same function body — no logic duplication.
+	if _, err := db.Exec(`
+		DROP TRIGGER IF EXISTS trg_enrichment_normalize_insert ON enrichment_jobs;
+		CREATE TRIGGER trg_enrichment_normalize_insert
+		  AFTER INSERT ON enrichment_jobs
+		  FOR EACH ROW
+		  WHEN (NEW.status = 'completed')
+		  EXECUTE FUNCTION trg_normalize_enrichment();
+	`); err != nil {
+		return fmt.Errorf("db: create trg_enrichment_normalize_insert trigger: %w", err)
 	}
 
 	// schema_migrations: lightweight version tracking so one-shot migrations
@@ -609,6 +639,118 @@ func runMigrations(db *sql.DB) error {
 				reenrichLockVersion, "add re_enrich_locked_at for multi-worker FOR UPDATE SKIP LOCKED claim")
 			slog.Info("db: reenrich lock migration applied")
 		}
+	}
+
+	// re_enrich_attempts: counter for Bug C — without this, reenrich stamps
+	// re_enriched_at = NOW() unconditionally on every successful upsert
+	// (even when the extractor returned zero new fields), permanently
+	// locking the row out of future retries. With the counter, reenrich
+	// only stamps when attempts >= 3 OR fields were extracted; transient
+	// extraction misses (bot-detect page, JS-heavy SPA, slow render) get
+	// up to 3 attempts before the row is marked permanently dead.
+	const reenrichAttemptsVersion = "2026_05_09_reenrich_attempts"
+	var reenrichAttemptsDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, reenrichAttemptsVersion,
+	).Scan(&reenrichAttemptsDone); err == nil && !reenrichAttemptsDone {
+		stmts := []string{
+			`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS re_enrich_attempts INT NOT NULL DEFAULT 0`,
+		}
+		migOK := true
+		for _, s := range stmts {
+			if _, err := db.Exec(s); err != nil {
+				slog.Warn("db: reenrich attempts migration failed", "error", err)
+				migOK = false
+				break
+			}
+		}
+		if migOK {
+			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+				reenrichAttemptsVersion, "add re_enrich_attempts counter to allow capped retry on empty extract")
+			slog.Info("db: reenrich attempts migration applied")
+		}
+	}
+
+	// Reenrich propagation backfill (v0.7.3): repair already-stamped rows
+	// where reenrich's writeback was silently no-op'd by the trigger WHEN
+	// gate. Touches rows where re_enriched_at IS NOT NULL but address /
+	// country are still NULL while enrichment_jobs has the raw data.
+	//
+	// Estimated 500K-2M rows on a 10M dataset — batched 10K rows per
+	// statement with pg_sleep(0.05) between batches to avoid lock pile-up
+	// (per dev-squad/postgres-patterns mass-update guidance). Wrapped in
+	// schema_migrations so it only runs once across restarts.
+	//
+	// Fill-NULL-only semantics — never overwrites existing values
+	// (feedback_never_drop_data: NEVER replace good data with worse data).
+	const reenrichBackfillVersion = "2026_05_09_reenrich_propagation_backfill"
+	var reenrichBackfillDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, reenrichBackfillVersion,
+	).Scan(&reenrichBackfillDone); err == nil && !reenrichBackfillDone {
+		slog.Info("db: starting reenrich propagation backfill (this may take 3-5 minutes)")
+
+		const batchSQL = `
+			WITH eligible AS (
+				SELECT bl.id
+				FROM business_listings bl
+				JOIN enrichment_jobs ej ON ej.domain = bl.domain AND ej.status = 'completed'
+				WHERE bl.re_enriched_at IS NOT NULL
+				  AND (
+				    ((bl.address IS NULL OR bl.address = '') AND ej.raw_address IS NOT NULL AND ej.raw_address != '')
+				    OR ((bl.country IS NULL OR bl.country = '') AND ej.raw_country IS NOT NULL AND ej.raw_country != '')
+				    OR ((bl.city    IS NULL OR bl.city    = '') AND ej.raw_city    IS NOT NULL AND ej.raw_city    != '')
+				    OR ((bl.business_name IS NULL OR bl.business_name = '') AND ej.raw_business_name IS NOT NULL AND ej.raw_business_name != '')
+				    OR ((bl.category IS NULL OR bl.category = '') AND ej.raw_category IS NOT NULL AND ej.raw_category != '')
+				  )
+				LIMIT 10000
+				FOR UPDATE OF bl SKIP LOCKED
+			)
+			UPDATE business_listings bl
+			SET address       = COALESCE(NULLIF(bl.address, ''),       ej.raw_address),
+			    country       = COALESCE(NULLIF(bl.country, ''),       ej.raw_country),
+			    city          = COALESCE(NULLIF(bl.city, ''),          ej.raw_city),
+			    business_name = COALESCE(NULLIF(bl.business_name, ''), ej.raw_business_name),
+			    category      = COALESCE(NULLIF(bl.category, ''),      ej.raw_category),
+			    description   = COALESCE(NULLIF(bl.description, ''),   ej.raw_description),
+			    location      = COALESCE(NULLIF(bl.location, ''),      ej.raw_location),
+			    page_title    = COALESCE(NULLIF(bl.page_title, ''),    ej.raw_page_title),
+			    contact_name  = COALESCE(NULLIF(bl.contact_name, ''),  ej.raw_contact_name),
+			    opening_hours = COALESCE(NULLIF(bl.opening_hours, ''), ej.raw_opening_hours),
+			    rating        = COALESCE(NULLIF(bl.rating, ''),        ej.raw_rating),
+			    tiktok        = COALESCE(NULLIF(bl.tiktok, ''),        ej.raw_tiktok),
+			    youtube       = COALESCE(NULLIF(bl.youtube, ''),       ej.raw_youtube),
+			    telegram      = COALESCE(NULLIF(bl.telegram, ''),      ej.raw_telegram),
+			    updated_at    = NOW()
+			FROM eligible, enrichment_jobs ej
+			WHERE bl.id = eligible.id
+			  AND ej.domain = bl.domain
+			  AND ej.status = 'completed'
+		`
+
+		var totalRows int64
+		batches := 0
+		// Hard cap at 500 batches (5M rows). Beyond that, something is wrong
+		// and the operator should investigate — better to bail than spin forever.
+		for batches < 500 {
+			res, err := db.Exec(batchSQL)
+			if err != nil {
+				slog.Warn("db: reenrich backfill batch failed", "batch", batches, "error", err)
+				break
+			}
+			n, _ := res.RowsAffected()
+			totalRows += n
+			batches++
+			if n == 0 {
+				break
+			}
+			// Throttle between batches to avoid lock pile-up on a hot table.
+			db.Exec(`SELECT pg_sleep(0.05)`)
+		}
+
+		slog.Info("db: reenrich propagation backfill done", "rows", totalRows, "batches", batches)
+		db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			reenrichBackfillVersion, fmt.Sprintf("backfill %d rows where reenrich writeback was trigger-gated", totalRows))
 	}
 
 	return nil

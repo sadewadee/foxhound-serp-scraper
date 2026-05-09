@@ -276,12 +276,18 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 	socialJSON, _ := json.Marshal(socialLinks)
 
 	// Write results by upserting an enrichment_jobs row with status='completed'.
-	// The DB trigger (trg_enrich_complete_upsert) handles the upsert into
-	// business_listings — we do NOT duplicate that logic here.
+	// The DB trigger (trg_enrichment_normalize / _insert) handles the propagation
+	// into business_listings — we do NOT duplicate that logic here.
+	//
+	// Bug D fix (v0.7.3): include `source = 'reenrich'`. The trigger function's
+	// contact-page enqueue branch is gated on `NEW.source = 'serp_result'`, so
+	// our 'reenrich' tag is correctly excluded — but having a non-NULL source
+	// makes audit / debugging trivial and prevents future trigger logic from
+	// mistakenly treating these rows as serp_result origin.
 	urlHash := dedup.HashURL(row.URL)
 	_, insertErr := r.db.ExecContext(ctx, `
 		INSERT INTO enrichment_jobs (
-			url, url_hash, domain, status,
+			url, url_hash, domain, source, status,
 			raw_emails, raw_phones, raw_social,
 			raw_business_name, raw_category, raw_address,
 			raw_page_title, raw_description, raw_location, raw_country,
@@ -289,7 +295,7 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 			raw_tiktok, raw_youtube, raw_telegram,
 			completed_at, updated_at
 		) VALUES (
-			$1, $2, $3, 'completed',
+			$1, $2, $3, 'reenrich', 'completed',
 			$4, $5, $6,
 			$7, $8, $9,
 			$10, $11, $12, $13,
@@ -334,13 +340,47 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 		return
 	}
 
-	// Mark as processed and clear the claim atomically. Extraction failure
-	// (zero fields extracted) is also marked done — per user: "permanent
-	// dead, no retries on empty extract".
-	_, markErr := r.db.ExecContext(ctx,
-		`UPDATE business_listings SET re_enriched_at = NOW(), re_enrich_locked_at = NULL WHERE id = $1`, row.ID)
+	// Bug C fix (v0.7.3): only stamp re_enriched_at when extraction actually
+	// produced something OR we've burned all 3 retry attempts. Previously,
+	// every successful upsert (including zero-field extracts from bot-detect
+	// pages, JS-heavy SPAs, or transient render failures) marked the row as
+	// permanently re-enriched, so a single bad fetch killed the row's chance
+	// at recovery forever. With the attempts counter, transient extraction
+	// misses get up to 3 shots before being marked dead.
+	const maxAttempts = 3
+	extracted := len(emails) > 0 || len(phones) > 0 ||
+		cd.Address != "" || cd.Country != "" || cd.City != "" ||
+		cd.BusinessName != "" || cd.BusinessCategory != "" ||
+		cd.ContactName != "" || cd.OpeningHours != "" || cd.Rating != "" ||
+		cd.PageTitle != "" || cd.Description != "" || cd.Location != "" ||
+		cd.TikTok != "" || cd.YouTube != "" || cd.Telegram != "" ||
+		len(socialLinks) > 0
+
+	var markErr error
+	if extracted {
+		// Success path: stamp re_enriched_at, clear lock + attempts.
+		_, markErr = r.db.ExecContext(ctx,
+			`UPDATE business_listings
+			 SET re_enriched_at = NOW(),
+			     re_enrich_locked_at = NULL,
+			     re_enrich_attempts = re_enrich_attempts + 1
+			 WHERE id = $1`, row.ID)
+	} else {
+		// Empty extract: bump attempts, release lock. Only stamp dead after
+		// maxAttempts. Race-safe: the comparison is in SQL so two workers
+		// can't both decide "this is the final attempt" off stale state.
+		_, markErr = r.db.ExecContext(ctx,
+			`UPDATE business_listings
+			 SET re_enrich_attempts = re_enrich_attempts + 1,
+			     re_enrich_locked_at = NULL,
+			     re_enriched_at = CASE
+			       WHEN re_enrich_attempts + 1 >= $2 THEN NOW()
+			       ELSE re_enriched_at
+			     END
+			 WHERE id = $1`, row.ID, maxAttempts)
+	}
 	if markErr != nil {
-		slog.Error("reenrich: failed to mark re_enriched_at",
+		slog.Error("reenrich: failed to update re_enrich_attempts/at",
 			"id", row.ID, "domain", row.Domain, "error", markErr)
 		// Lock will auto-expire after 15 min; data is already upserted via trigger.
 		return
@@ -354,6 +394,9 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 			"emails", len(emails),
 			"phones", len(phones),
 			"worker", workerID)
+	} else if !extracted {
+		slog.Debug("reenrich: empty extract, will retry",
+			"domain", row.Domain, "worker", workerID)
 	}
 }
 
