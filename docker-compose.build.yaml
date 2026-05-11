@@ -3,6 +3,24 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.7.1-fix
-    command: ["echo", "image build complete: ghcr.mcpke.dev/foxhound-serp-scraper:v0.7.1-fix"]
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:v0.7.1-fix
+    command: ["echo", "build complete: ghcr.io/sadewadee/foxhound-serp-scraper:v0.7.1-fix"]
+    restart: "no"
+
+  pusher:
+    image: docker:24-cli
+    depends_on:
+      builder:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      GHCR_USER: sadewadee
+      GHCR_PAT: ${GHCR_PAT}
+    command: >
+      sh -c "
+      echo \"$$GHCR_PAT\" | docker login ghcr.io -u \"$$GHCR_USER\" --password-stdin &&
+      docker push ghcr.io/sadewadee/foxhound-serp-scraper:v0.7.1-fix &&
+      echo 'PUSH COMPLETE: ghcr.io/sadewadee/foxhound-serp-scraper:v0.7.1-fix'
+      "
     restart: "no"
