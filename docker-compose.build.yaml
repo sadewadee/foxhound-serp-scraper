@@ -4,7 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ghcr.io/sadewadee/foxhound-serp-scraper:v0.7.1-fix
-    command: ["echo", "build complete: ghcr.io/sadewadee/foxhound-serp-scraper:v0.7.1-fix"]
+    entrypoint: [""]
+    command: ["true"]
     restart: "no"
 
   pusher:
