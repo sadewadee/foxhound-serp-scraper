@@ -651,6 +651,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 
 		// Extract contacts.
 		cd := internalScraper.ExtractContacts([]byte(body))
+		internalScraper.ApplyTLDCountryFallback(cd, pageURL)
 		emails := internalScraper.FilterEmails(cd.Emails)
 		phones := internalScraper.FilterPhones(cd.Phones)
 
