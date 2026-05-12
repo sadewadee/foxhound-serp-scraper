@@ -1,0 +1,60 @@
+# Build-only compose for kurama. Runs docker build then pushes to ghcr.io.
+#
+# Usage (on kurama, from /home/sadewa/serp-scraper-canary or equivalent):
+#   git fetch origin && git checkout canary/v0.8.0-country-extraction
+#   export GHCR_PAT=<your-personal-access-token-with-write:packages>
+#   docker compose -f docker-compose.build.yaml up --abort-on-container-exit
+#
+# Tags produced:
+#   ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction
+#   ghcr.io/sadewadee/foxhound-serp-scraper:canary-latest
+#
+# After successful push, redeploy the canary stack via Dokploy pointing at
+# either tag. The :canary-latest moving tag is convenient for redeploys
+# while iterating; the version-specific tag is the rollback anchor.
+
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction
+    # Override Dockerfile ENTRYPOINT so the container exits 0 once the
+    # image is built (we're not running the binary here, just producing
+    # the image layer set).
+    entrypoint: [""]
+    command: ["true"]
+    restart: "no"
+
+  retagger:
+    image: docker:24-cli
+    depends_on:
+      builder:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      sh -c "
+      docker tag ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction
+                 ghcr.io/sadewadee/foxhound-serp-scraper:canary-latest
+      "
+    restart: "no"
+
+  pusher:
+    image: docker:24-cli
+    depends_on:
+      retagger:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      GHCR_USER: sadewadee
+      GHCR_PAT: ${GHCR_PAT}
+    command: >
+      sh -c "
+      echo \"$$GHCR_PAT\" | docker login ghcr.io -u \"$$GHCR_USER\" --password-stdin &&
+      docker push ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction &&
+      docker push ghcr.io/sadewadee/foxhound-serp-scraper:canary-latest &&
+      echo 'PUSH COMPLETE: canary-v0.8.0-country-extraction + canary-latest'
+      "
+    restart: "no"
