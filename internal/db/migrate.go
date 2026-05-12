@@ -846,6 +846,22 @@ func runMigrations(db *sql.DB) error {
 		// STEP A — BACKUP: capture all non-plausible country values before
 		// any mutation. Backup table is append-safe; IF NOT EXISTS prevents
 		// failure on re-run if backup already exists from a prior attempt.
+		//
+		// Integrity gate: count live garbage rows BEFORE creating the backup,
+		// then verify backup row count matches. If backup is empty or the count
+		// diverges by more than 10%, abort STEPS B and C to prevent data loss
+		// on a silent CREATE failure (e.g. table already existed with old data).
+		var liveGarbageCount int
+		if err := db.QueryRow(`
+			SELECT COUNT(*) FROM business_listings
+			WHERE country IS NOT NULL
+			  AND country != ''
+			  AND country NOT IN (` + plausibleAlpha2 + `)`).Scan(&liveGarbageCount); err != nil {
+			slog.Warn("db: country garbage purge pre-backup count failed — aborting", "error", err)
+			return nil
+		}
+		slog.Info("db: country garbage purge pre-backup count", "live_garbage_rows", liveGarbageCount)
+
 		_, err := db.Exec(`
 			CREATE TABLE IF NOT EXISTS business_listings_country_backup_20260512 AS
 			SELECT id, country, updated_at
@@ -859,7 +875,31 @@ func runMigrations(db *sql.DB) error {
 		}
 		var backupCount int
 		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings_country_backup_20260512`).Scan(&backupCount)
-		slog.Info("db: country garbage purge backup created", "backup_rows", backupCount)
+		slog.Info("db: country garbage purge backup created", "backup_rows", backupCount, "expected_rows", liveGarbageCount)
+
+		// Integrity gate: abort if backup is empty (total failure) or count
+		// diverges more than 10% from live count (partial failure / stale table).
+		// A 10% tolerance covers rows legitimately converted between the pre-count
+		// query and the CREATE TABLE AS SELECT (concurrent pipeline activity).
+		if backupCount == 0 && liveGarbageCount > 0 {
+			slog.Warn("db: country garbage purge backup integrity FAILED — backup is empty, aborting purge",
+				"live_garbage_rows", liveGarbageCount)
+			return nil
+		}
+		if liveGarbageCount > 0 {
+			divergePct := float64(liveGarbageCount-backupCount) / float64(liveGarbageCount) * 100
+			if divergePct < 0 {
+				divergePct = -divergePct
+			}
+			if divergePct > 10 {
+				slog.Warn("db: country garbage purge backup integrity FAILED — count diverges, aborting purge",
+					"live_garbage_rows", liveGarbageCount,
+					"backup_rows", backupCount,
+					"diverge_pct", divergePct)
+				return nil
+			}
+		}
+		slog.Info("db: country garbage purge backup integrity verified — proceeding with STEPS B and C")
 
 		// STEP B — CONVERT: salvage all recognizable country names and common
 		// aliases not in the ISO alpha-2 set. Covers:
