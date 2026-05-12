@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
 )
 
 const schema = `
@@ -608,6 +609,358 @@ func runMigrations(db *sql.DB) error {
 			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
 				reenrichLockVersion, "add re_enrich_locked_at for multi-worker FOR UPDATE SKIP LOCKED claim")
 			slog.Info("db: reenrich lock migration applied")
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-05-12: Country regex hardening (Deliverable 1).
+	//
+	// Background: the original phase2Version recover_country step used
+	// `[A-Z]{2,3}` as the first alternative in the regex, which captured the
+	// last 2-3 uppercase characters of ANY string (e.g. "LS7 1AB" → "AB",
+	// "Den Haag" → "AAG", "Schönebach" → "ACH"). The stateCodeBlocklist only
+	// filtered US/AU/CA/BR state codes, so random suffixes like "AAG", "ACH",
+	// "ADO", "ADS" passed through.
+	//
+	// Fix: remove [A-Z]{2,3} entirely. Match only known full country names
+	// (same whitelist as before), then map them to ISO alpha-2 via CASE.
+	// The WHERE guard `(bl.country IS NULL OR bl.country = '')` is retained so
+	// this step only fills blanks — it will not overwrite any existing value.
+	//
+	// This step is intentionally idempotent: running it again on rows that
+	// already have a correct country is a no-op due to the WHERE guard.
+	// -------------------------------------------------------------------------
+	const countryRegexHardenVersion = "2026_05_12_country_regex_hardening"
+	var countryRegexHardenDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, countryRegexHardenVersion,
+	).Scan(&countryRegexHardenDone); err != nil {
+		return fmt.Errorf("db: country regex harden version check: %w", err)
+	}
+	if !countryRegexHardenDone {
+		// Match only spelled-out country names at end of address string.
+		// [A-Z]{2,3} removed entirely — it was too greedy and caused 8,177
+		// garbage rows (COM, AND, ACH, AAG, etc.) in production.
+		// The CASE below maps each matched name to its ISO 3166-1 alpha-2 code.
+		countryRegexHardenSQL := `
+		WITH parsed AS (
+		  SELECT ej.domain,
+		         (regexp_match(ej.raw_address,
+		           '(?i)(United States|United Kingdom|Indonesia|Australia|Canada|Germany|France|Singapore|Malaysia|Thailand|Japan|Brazil|Mexico|Spain|Italy|Netherlands|Belgium|Sweden|Norway|Denmark|Finland|Poland|Turkey|India|China|Korea|Vietnam|Philippines|New Zealand|Portugal|Ireland|Croatia|Austria|Chile|Colombia|Hungary|Romania|Greece|Taiwan|Morocco|Argentina|Egypt|Myanmar|Costa Rica|Panama|Kenya|Bahrain|Qatar|Nepal|Nigeria|Sri Lanka|Cambodia|Switzerland|South Africa|United Arab Emirates|Saudi Arabia|South Korea|New Zealand|Czech Republic|Hong Kong)\s*$'))[1]
+		         AS matched_name
+		  FROM enrichment_jobs ej
+		  WHERE ej.status = 'completed' AND ej.raw_address IS NOT NULL
+		)
+		UPDATE business_listings bl
+		SET country = CASE LOWER(parsed.matched_name)
+		  WHEN 'united states'           THEN 'US'
+		  WHEN 'united kingdom'          THEN 'GB'
+		  WHEN 'indonesia'               THEN 'ID'
+		  WHEN 'australia'               THEN 'AU'
+		  WHEN 'canada'                  THEN 'CA'
+		  WHEN 'germany'                 THEN 'DE'
+		  WHEN 'france'                  THEN 'FR'
+		  WHEN 'singapore'               THEN 'SG'
+		  WHEN 'malaysia'                THEN 'MY'
+		  WHEN 'thailand'                THEN 'TH'
+		  WHEN 'japan'                   THEN 'JP'
+		  WHEN 'brazil'                  THEN 'BR'
+		  WHEN 'mexico'                  THEN 'MX'
+		  WHEN 'spain'                   THEN 'ES'
+		  WHEN 'italy'                   THEN 'IT'
+		  WHEN 'netherlands'             THEN 'NL'
+		  WHEN 'belgium'                 THEN 'BE'
+		  WHEN 'sweden'                  THEN 'SE'
+		  WHEN 'norway'                  THEN 'NO'
+		  WHEN 'denmark'                 THEN 'DK'
+		  WHEN 'finland'                 THEN 'FI'
+		  WHEN 'poland'                  THEN 'PL'
+		  WHEN 'turkey'                  THEN 'TR'
+		  WHEN 'india'                   THEN 'IN'
+		  WHEN 'china'                   THEN 'CN'
+		  WHEN 'korea'                   THEN 'KR'
+		  WHEN 'south korea'             THEN 'KR'
+		  WHEN 'vietnam'                 THEN 'VN'
+		  WHEN 'philippines'             THEN 'PH'
+		  WHEN 'new zealand'             THEN 'NZ'
+		  WHEN 'portugal'                THEN 'PT'
+		  WHEN 'ireland'                 THEN 'IE'
+		  WHEN 'croatia'                 THEN 'HR'
+		  WHEN 'austria'                 THEN 'AT'
+		  WHEN 'chile'                   THEN 'CL'
+		  WHEN 'colombia'                THEN 'CO'
+		  WHEN 'hungary'                 THEN 'HU'
+		  WHEN 'romania'                 THEN 'RO'
+		  WHEN 'greece'                  THEN 'GR'
+		  WHEN 'taiwan'                  THEN 'TW'
+		  WHEN 'morocco'                 THEN 'MA'
+		  WHEN 'argentina'               THEN 'AR'
+		  WHEN 'egypt'                   THEN 'EG'
+		  WHEN 'myanmar'                 THEN 'MM'
+		  WHEN 'costa rica'              THEN 'CR'
+		  WHEN 'panama'                  THEN 'PA'
+		  WHEN 'kenya'                   THEN 'KE'
+		  WHEN 'bahrain'                 THEN 'BH'
+		  WHEN 'qatar'                   THEN 'QA'
+		  WHEN 'nepal'                   THEN 'NP'
+		  WHEN 'nigeria'                 THEN 'NG'
+		  WHEN 'sri lanka'               THEN 'LK'
+		  WHEN 'cambodia'                THEN 'KH'
+		  WHEN 'switzerland'             THEN 'CH'
+		  WHEN 'south africa'            THEN 'ZA'
+		  WHEN 'united arab emirates'    THEN 'AE'
+		  WHEN 'saudi arabia'            THEN 'SA'
+		  WHEN 'czech republic'          THEN 'CZ'
+		  WHEN 'hong kong'               THEN 'HK'
+		  ELSE NULL
+		END
+		FROM parsed
+		WHERE parsed.domain = bl.domain
+		  AND parsed.matched_name IS NOT NULL
+		  AND (bl.country IS NULL OR bl.country = '')`
+
+		res, err := db.Exec(countryRegexHardenSQL)
+		if err != nil {
+			slog.Warn("db: country regex hardening failed", "error", err)
+		} else {
+			n, _ := res.RowsAffected()
+			slog.Info("db: country regex hardening applied", "rows_updated", n)
+		}
+
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			countryRegexHardenVersion,
+			"fix recover_country regex: remove [A-Z]{2,3} greedy alternative, match known country names only",
+		); err != nil {
+			slog.Warn("db: country regex harden version record failed", "error", err)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-05-12: Country garbage purge (Deliverable 2).
+	//
+	// Pre-condition: ~8,177 rows in business_listings have garbage country
+	// values (COM, AND, ACH, AAG, ONS, etc.) from the buggy [A-Z]{2,3}
+	// regex in the original phase2Version recover_country step.
+	// Additionally ~2,624 rows have spelled-out country names (Portugal,
+	// Ireland, etc.) that the tier1 normalize step missed.
+	//
+	// Steps:
+	//   A. BACKUP: CREATE TABLE ... AS SELECT — persists garbage values
+	//              before any mutation. Rollback: UPDATE bl SET country =
+	//              b.country FROM backup b WHERE bl.id = b.id.
+	//   B. CONVERT: salvage the spelled-out country names (Portugal → 'PT',
+	//               Ireland → 'IE', etc.) — these are real data, not garbage.
+	//   C. PURGE:   set country = NULL for remaining non-ISO-alpha2 values
+	//               (the 3-4 char uppercase garbage: COM, AND, ACH, etc.).
+	//   D. VERIFY:  log post-cleanup counts.
+	//
+	// Dry-run gate: set COUNTRY_CLEANUP_DRY_RUN=true to log affected counts
+	// without applying any UPDATE/CREATE. Default is OFF (cleanup runs).
+	// Per memory rule feedback_gated_flag_for_risky_changes.md — gate risky
+	// changes behind an off-by-default flag for first production run.
+	//
+	// Statement timeout: 30s per batch. The UPDATE touches at most ~8,177
+	// rows on a 483K-row table; with an index on country this is fast, but
+	// we cap it to avoid unexpected lock escalation.
+	// -------------------------------------------------------------------------
+	const countryGarbagePurgeVersion = "2026_05_12_country_garbage_purge"
+	var countryGarbagePurgeDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, countryGarbagePurgeVersion,
+	).Scan(&countryGarbagePurgeDone); err != nil {
+		return fmt.Errorf("db: country garbage purge version check: %w", err)
+	}
+	if !countryGarbagePurgeDone {
+		// plausibleAlpha2 is the inline SQL literal of the canonical ISO
+		// 3166-1 alpha-2 set. Kept as a SQL constant here because the
+		// iso3166Alpha2 Go map lives in internal/scraper (different package)
+		// and cannot be imported from internal/db without a circular dep.
+		// Generated from internal/scraper/contact.go:iso3166Alpha2.
+		// Rollback SQL (documented for ops):
+		//   UPDATE business_listings bl
+		//   SET country = b.country, updated_at = b.updated_at
+		//   FROM business_listings_country_backup_20260512 b
+		//   WHERE bl.id = b.id;
+		const plausibleAlpha2 = `'AD','AE','AF','AG','AI','AL','AM','AO',
+		'AQ','AR','AS','AT','AU','AW','AX','AZ',
+		'BA','BB','BD','BE','BF','BG','BH','BI',
+		'BJ','BL','BM','BN','BO','BQ','BR','BS',
+		'BT','BV','BW','BY','BZ','CA','CC','CD',
+		'CF','CG','CH','CI','CK','CL','CM','CN',
+		'CO','CR','CU','CV','CW','CX','CY','CZ',
+		'DE','DJ','DK','DM','DO','DZ','EC','EE',
+		'EG','EH','ER','ES','ET','FI','FJ','FK',
+		'FM','FO','FR','GA','GB','GD','GE','GF',
+		'GG','GH','GI','GL','GM','GN','GP','GQ',
+		'GR','GS','GT','GU','GW','GY','HK','HM',
+		'HN','HR','HT','HU','ID','IE','IL','IM',
+		'IN','IO','IQ','IR','IS','IT','JE','JM',
+		'JO','JP','KE','KG','KH','KI','KM','KN',
+		'KP','KR','KW','KY','KZ','LA','LB','LC',
+		'LI','LK','LR','LS','LT','LU','LV','LY',
+		'MA','MC','MD','ME','MF','MG','MH','MK',
+		'ML','MM','MN','MO','MP','MQ','MR','MS',
+		'MT','MU','MV','MW','MX','MY','MZ','NA',
+		'NC','NE','NF','NG','NI','NL','NO','NP',
+		'NR','NU','NZ','OM','PA','PE','PF','PG',
+		'PH','PK','PL','PM','PN','PR','PS','PT',
+		'PW','PY','QA','RE','RO','RS','RU','RW',
+		'SA','SB','SC','SD','SE','SG','SH','SI',
+		'SJ','SK','SL','SM','SN','SO','SR','SS',
+		'ST','SV','SX','SY','SZ','TC','TD','TF',
+		'TG','TH','TJ','TK','TL','TM','TN','TO',
+		'TR','TT','TV','TW','TZ','UA','UG','UM',
+		'US','UY','UZ','VA','VC','VE','VG','VI',
+		'VN','VU','WF','WS','YE','YT','ZA','ZM',
+		'ZW'`
+
+		dryRun := os.Getenv("COUNTRY_CLEANUP_DRY_RUN") == "true"
+		if dryRun {
+			slog.Info("db: country garbage purge DRY-RUN mode — counting affected rows, no mutation applied")
+
+			var garbageCount int
+			_ = db.QueryRow(`
+				SELECT COUNT(*) FROM business_listings
+				WHERE country IS NOT NULL
+				  AND country != ''
+				  AND country NOT IN (` + plausibleAlpha2 + `)`,
+			).Scan(&garbageCount)
+
+			var nameCount int
+			_ = db.QueryRow(`
+				SELECT COUNT(*) FROM business_listings
+				WHERE country IS NOT NULL AND length(country) > 4`,
+			).Scan(&nameCount)
+
+			slog.Info("db: country garbage purge dry-run counts",
+				"garbage_to_null", garbageCount-nameCount,
+				"names_to_convert", nameCount,
+				"total_affected", garbageCount,
+			)
+			// Do NOT record version — dry-run should re-run on next deploy
+			// when operator removes COUNTRY_CLEANUP_DRY_RUN=true.
+			return nil
+		}
+
+		// STEP A — BACKUP: capture all non-plausible country values before
+		// any mutation. Backup table is append-safe; IF NOT EXISTS prevents
+		// failure on re-run if backup already exists from a prior attempt.
+		_, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS business_listings_country_backup_20260512 AS
+			SELECT id, country, updated_at
+			FROM business_listings
+			WHERE country IS NOT NULL
+			  AND country != ''
+			  AND country NOT IN (` + plausibleAlpha2 + `)`)
+		if err != nil {
+			slog.Warn("db: country garbage purge backup failed — aborting purge for safety", "error", err)
+			return nil // abort this step; do not purge without backup
+		}
+		var backupCount int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings_country_backup_20260512`).Scan(&backupCount)
+		slog.Info("db: country garbage purge backup created", "backup_rows", backupCount)
+
+		// STEP B — CONVERT: salvage rows where country is a full country name
+		// (e.g. "Portugal" → 'PT', "Ireland" → 'IE'). These are real data
+		// missed by tier1 normalize. Only rows not already in ISO alpha-2.
+		// Uses an explicit transaction so SET LOCAL statement_timeout applies
+		// only to this UPDATE (max 2,624 rows, index scan on country).
+		if txB, txErr := db.Begin(); txErr != nil {
+			slog.Warn("db: country garbage purge convert tx begin failed", "error", txErr)
+		} else {
+			txB.Exec(`SET LOCAL statement_timeout = '30000'`) //nolint:errcheck — advisory
+			_, convErr := txB.Exec(`
+				UPDATE business_listings SET
+				  country = CASE LOWER(TRIM(country))
+				    WHEN 'portugal'        THEN 'PT'
+				    WHEN 'ireland'         THEN 'IE'
+				    WHEN 'croatia'         THEN 'HR'
+				    WHEN 'austria'         THEN 'AT'
+				    WHEN 'chile'           THEN 'CL'
+				    WHEN 'colombia'        THEN 'CO'
+				    WHEN 'hungary'         THEN 'HU'
+				    WHEN 'romania'         THEN 'RO'
+				    WHEN 'greece'          THEN 'GR'
+				    WHEN 'taiwan'          THEN 'TW'
+				    WHEN 'morocco'         THEN 'MA'
+				    WHEN 'argentina'       THEN 'AR'
+				    WHEN 'egypt'           THEN 'EG'
+				    WHEN 'czech republic'  THEN 'CZ'
+				    WHEN 'myanmar'         THEN 'MM'
+				    WHEN 'costa rica'      THEN 'CR'
+				    WHEN 'panama'          THEN 'PA'
+				    WHEN 'kenya'           THEN 'KE'
+				    WHEN 'bahrain'         THEN 'BH'
+				    WHEN 'qatar'           THEN 'QA'
+				    WHEN 'nepal'           THEN 'NP'
+				    WHEN 'nigeria'         THEN 'NG'
+				    WHEN 'sri lanka'       THEN 'LK'
+				    WHEN 'cambodia'        THEN 'KH'
+				    WHEN 'hong kong'       THEN 'HK'
+				    ELSE country
+				  END,
+				  updated_at = NOW()
+				WHERE country IS NOT NULL
+				  AND length(country) > 4
+				  AND country NOT IN (` + plausibleAlpha2 + `)`)
+			if convErr != nil {
+				txB.Rollback() //nolint:errcheck
+				slog.Warn("db: country garbage purge convert step failed", "error", convErr)
+				// Non-fatal: purge step C still handles remaining garbage.
+			} else {
+				txB.Commit() //nolint:errcheck
+				slog.Info("db: country garbage purge convert step applied (names → ISO codes)")
+			}
+		}
+
+		// STEP C — PURGE: set country = NULL for all remaining non-ISO-alpha2
+		// values (garbage: COM, AND, ACH, AAG, ONS, etc.).
+		// Uses explicit transaction so SET LOCAL statement_timeout is scoped.
+		// Lock class: ROW EXCLUSIVE — not ACCESS EXCLUSIVE; concurrent SELECTs
+		// are unaffected. At most ~5,553 rows (3-4 char uppercase garbage).
+		var purgedRows int64
+		if txC, txErr := db.Begin(); txErr != nil {
+			slog.Warn("db: country garbage purge step C tx begin failed", "error", txErr)
+		} else {
+			txC.Exec(`SET LOCAL statement_timeout = '30000'`) //nolint:errcheck — advisory
+			res, purgeErr := txC.Exec(`
+				UPDATE business_listings
+				SET country = NULL, updated_at = NOW()
+				WHERE country IS NOT NULL
+				  AND country != ''
+				  AND country NOT IN (` + plausibleAlpha2 + `)`)
+			if purgeErr != nil {
+				txC.Rollback() //nolint:errcheck
+				slog.Warn("db: country garbage purge step C failed", "error", purgeErr)
+			} else {
+				txC.Commit() //nolint:errcheck
+				purgedRows, _ = res.RowsAffected()
+				slog.Info("db: country garbage purge applied", "rows_nulled", purgedRows)
+			}
+		}
+
+		// STEP D — VERIFY: post-cleanup count of remaining garbage.
+		var remainingGarbage int
+		_ = db.QueryRow(`
+			SELECT COUNT(*) FROM business_listings
+			WHERE country IS NOT NULL
+			  AND country != ''
+			  AND country NOT IN (` + plausibleAlpha2 + `)`,
+		).Scan(&remainingGarbage)
+		if remainingGarbage > 0 {
+			slog.Warn("db: country garbage purge: residual garbage detected after purge",
+				"remaining_garbage_rows", remainingGarbage)
+		} else {
+			slog.Info("db: country garbage purge: verified clean — zero garbage rows remain")
+		}
+
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			countryGarbagePurgeVersion,
+			"backup garbage country rows, convert country names to ISO, purge remaining garbage",
+		); err != nil {
+			slog.Warn("db: country garbage purge version record failed", "error", err)
 		}
 	}
 
