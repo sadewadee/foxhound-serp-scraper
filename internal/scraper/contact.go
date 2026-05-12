@@ -531,6 +531,36 @@ var ccTLDToISO = map[string]string{
 	"za": "ZA",
 }
 
+// collisionCountryCodes are 2-letter codes that are BOTH legitimate ISO 3166-1
+// alpha-2 country codes AND US state codes (in usStateCodes). normalizeCountry
+// rejects them unconditionally because the false-positive cost of treating a
+// US row as Indonesia/Israel/India outweighs the benefit. The collision
+// heuristic in tailParseCountry rescues them only when surrounding tokens
+// indicate a non-US address shape.
+var collisionCountryCodes = map[string]bool{
+	"ID": true, // Indonesia vs Idaho
+	"IL": true, // Israel vs Illinois
+	"IN": true, // India vs Indiana
+}
+
+// usStateFullNames lists single-word US state names used by the collision
+// heuristic. Multi-word names ("New York", "North Carolina") are NOT here —
+// matching them needs span-aware logic and is out of scope; the 2-letter
+// codes (NY, NC) in usStateCodes catch the same cases anyway. Lowercase.
+var usStateFullNames = map[string]bool{
+	"alabama": true, "alaska": true, "arizona": true, "arkansas": true,
+	"california": true, "colorado": true, "connecticut": true,
+	"delaware": true, "florida": true, "georgia": true,
+	"hawaii": true, "idaho": true, "illinois": true, "indiana": true,
+	"iowa": true, "kansas": true, "kentucky": true, "louisiana": true,
+	"maine": true, "maryland": true, "massachusetts": true, "michigan": true,
+	"minnesota": true, "mississippi": true, "missouri": true, "montana": true,
+	"nebraska": true, "nevada": true, "ohio": true, "oklahoma": true,
+	"oregon": true, "pennsylvania": true, "tennessee": true, "texas": true,
+	"utah": true, "vermont": true, "virginia": true, "washington": true,
+	"wisconsin": true, "wyoming": true,
+}
+
 // tailParseCountry walks the comma-separated tokens of an address from the
 // tail backward and returns the first token that resolves via normalizeCountry
 // to a non-empty ISO alpha-2 code. Used as a fallback when JSON-LD did not
@@ -542,6 +572,12 @@ var ccTLDToISO = map[string]string{
 // 1..3 whitespace-separated words) so embedded forms like "239222\nSingapore"
 // or "6011\nNew Zealand" — common when a postal code and country share the
 // final comma segment — still resolve to SG / NZ.
+//
+// Collision heuristic: 2-letter codes that are both ISO country codes AND
+// US state codes (ID/IL/IN) are accepted as country codes when the rest of
+// the address contains no US state markers (codes or full state names) and
+// the preceding token is postal-shape numeric. Conservative — biases toward
+// "" over wrong tagging when the signal is ambiguous.
 func tailParseCountry(addr string) string {
 	if addr == "" {
 		return ""
@@ -555,6 +591,13 @@ func tailParseCountry(addr string) string {
 		if iso := normalizeCountry(candidate); iso != "" {
 			return iso
 		}
+		// Collision rescue for ID/IL/IN (Indonesia/Israel/India vs
+		// Idaho/Illinois/Indiana) — only when the address shape signals
+		// non-US format. See acceptCollisionCountryCode for the gate.
+		upper := strings.ToUpper(candidate)
+		if collisionCountryCodes[upper] && acceptCollisionCountryCode(parts, i) {
+			return upper
+		}
 		// Collapse internal whitespace (incl. \n, \t) and try right-anchored
 		// word slices. Right-anchored only: avoids "USA Drive, ..." style
 		// false positives where the country-looking token is at the START
@@ -566,12 +609,66 @@ func tailParseCountry(addr string) string {
 		}
 		for w := 1; w <= maxSlice; w++ {
 			slice := strings.Join(words[len(words)-w:], " ")
+			// Skip single-word 2-letter slices — the full-candidate
+			// normalizeCountry call above already handled the 2-letter
+			// path with its state-code blocklist; a 2-letter slice
+			// matching here is almost always a coincidental street
+			// abbreviation (e.g. "St" → "ST" = São Tomé) rather than
+			// an actual country mention.
+			if w == 1 && len(slice) == 2 {
+				continue
+			}
 			if iso := normalizeCountry(slice); iso != "" {
 				return iso
 			}
 		}
 	}
 	return ""
+}
+
+// acceptCollisionCountryCode returns true when a 2-letter collision code at
+// parts[idx] (e.g. "ID" / "IL" / "IN") should be treated as a country code
+// rather than a US state code. ACCEPT only when both conditions hold:
+//
+//   - No US state code (2-letter from usStateCodes) AND no single-word US
+//     state name (from usStateFullNames) appears in the preceding tokens.
+//     Either presence indicates US-format address.
+//   - The immediately preceding token (parts[idx-1]) is postal-shape — at
+//     least 4 digits. Indonesian postal codes are 5 digits, Indian PINs are
+//     6 digits, Israeli ZIPs are 5-7 digits, so the floor of 4 stays
+//     conservative without missing the target geographies.
+//
+// Conservative — prefers false negatives (missed Indonesia/Israel/India)
+// over false positives (US row mis-tagged), matching the project-wide
+// "prefer empty over wrong" policy.
+func acceptCollisionCountryCode(parts []string, idx int) bool {
+	if idx == 0 {
+		return false // need a preceding postal token to anchor non-US shape
+	}
+	// Scan preceding tokens for any US state marker.
+	for _, p := range parts[:idx] {
+		for _, raw := range strings.Fields(p) {
+			word := strings.TrimRight(raw, ".,;:")
+			if len(word) == 2 && usStateCodes[strings.ToUpper(word)] {
+				return false
+			}
+			if usStateFullNames[strings.ToLower(word)] {
+				return false
+			}
+		}
+	}
+	// Verify the immediately preceding token is postal-shape (mostly digits).
+	prev := strings.TrimSpace(parts[idx-1])
+	if prev == "" {
+		return false
+	}
+	digits := 0
+	for _, r := range prev {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	return digits >= 4
 }
 
 // tailParseCity returns the city from a US-style trailing address segment of

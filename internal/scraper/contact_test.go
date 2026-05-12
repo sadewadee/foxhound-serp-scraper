@@ -63,6 +63,22 @@ func TestTailParseCountry(t *testing.T) {
 		// Word-slice must NOT create false positives mid-segment.
 		{"usa drive false positive guard", "1 USA Drive, Some City", ""},
 		{"africa street guard", "South Africa Street, Boston, MA, 02134", ""},
+
+		// Sprint 6: collision heuristic for ID/IL/IN (Indonesia/Israel/India vs
+		// Idaho/Illinois/Indiana). ACCEPT when non-US shape; REJECT when US.
+		{"indonesia ID at tail with 5-digit postal", "Jl. Sudirman 1, Jakarta Selatan, 12550, ID", "ID"},
+		{"indonesia ID compact short form", "Some St, 80572, ID", "ID"},
+		{"israel IL with 7-digit postal", "21 Abba Hillel Silver Rd, Ramat Gan, 5252213, IL", "IL"},
+		{"india IN with 6-digit PIN", "Manjalikulam Rd, Thiruvananthapuram, 695001, IN", "IN"},
+		{"india IN mumbai PIN", "Some St, Mumbai, 400001, IN", "IN"},
+		{"reject IL when illinois city explicit", "1 Main St, Chicago, IL, 60601", ""},
+		{"reject IN when NY state code preceding", "1 Main St, NY 12345, IN", ""},
+		{"reject ID with idaho full name", "Some St, Idaho, 83001, ID", ""},
+		{"reject IL with illinois full name", "Some St, Illinois, 60601, IL", ""},
+		{"reject IN with indiana full name", "Some St, Indiana, 46001, IN", ""},
+		{"reject ID no preceding postal", "Some Address, ID", ""},
+		{"reject ID non-numeric preceding", "Some St, City Name, ID", ""},
+		{"reject ID too-few-digit preceding", "Some St, 123, ID", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
