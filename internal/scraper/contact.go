@@ -594,6 +594,19 @@ func tailParseCity(addr string) string {
 	return strings.TrimSpace(m[1])
 }
 
+// ParseAddressFallback runs tail-based country and city derivation on a raw
+// address string. Returns ISO alpha-2 country (or "") and US-style city
+// (or "") — the same logic that ExtractContacts applies internally after
+// HTML address fallback. Pure offline transform — no network. Exposed so
+// the reenrich worker can pre-pass existing DB rows before paying for a
+// network refetch, and the backfill CLI can sweep historical NULL rows.
+func ParseAddressFallback(address string) (country, city string) {
+	if address == "" {
+		return "", ""
+	}
+	return tailParseCountry(address), tailParseCity(address)
+}
+
 // tldCountryHint returns the ISO 3166-1 alpha-2 code suggested by the host's
 // ccTLD, or "" if the TLD is not in the curated allowlist. Tries the
 // two-segment compound form first (.co.uk, .com.au) before falling back to
