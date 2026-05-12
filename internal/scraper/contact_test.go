@@ -116,6 +116,35 @@ func TestTailParseCity_USStyle(t *testing.T) {
 	}
 }
 
+func TestParseAddressFallback(t *testing.T) {
+	cases := []struct {
+		name        string
+		addr        string
+		wantCountry string
+		wantCity    string
+	}{
+		{"empty", "", "", ""},
+		{"both filled US-style", "521 Oak Grove Rd, Flat Rock, NC, United States", "US", "Flat Rock"},
+		{"country only no US city", "Compagnonsplein 1, 1234 AB Amsterdam, Netherlands", "NL", ""},
+		{"country only newline embedded", "20 Leonie Hill, Singapore, 239222\nSingapore", "SG", ""},
+		{"neither resolves", "Compagnonsplein 1", "", ""},
+		{"both empty inputs", "   ", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotCountry, gotCity := ParseAddressFallback(tc.addr)
+			if gotCountry != tc.wantCountry {
+				t.Errorf("ParseAddressFallback(%q) country = %q; want %q",
+					tc.addr, gotCountry, tc.wantCountry)
+			}
+			if gotCity != tc.wantCity {
+				t.Errorf("ParseAddressFallback(%q) city = %q; want %q",
+					tc.addr, gotCity, tc.wantCity)
+			}
+		})
+	}
+}
+
 func TestTLDCountryHint(t *testing.T) {
 	cases := []struct {
 		name string

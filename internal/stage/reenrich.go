@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,11 +46,21 @@ func NewReenrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Re
 	return &ReenrichStage{cfg: cfg, db: database, dedup: dd}
 }
 
-// reenrichRow is a candidate row from the eligibility query.
+// reenrichRow is a candidate row from the eligibility query. Address /
+// Country / City are surfaced for the offline pre-pass (applyOfflineParse)
+// so we can fill missing geo fields from the existing address blob without
+// paying a network refetch. EmailCount / PhoneCount drive the skip-fetch
+// decision — a row that already has contact data and just needs geo can
+// graduate via offline parse alone.
 type reenrichRow struct {
-	ID     int64
-	Domain string
-	URL    string
+	ID         int64
+	Domain     string
+	URL        string
+	Address    sql.NullString
+	Country    sql.NullString
+	City       sql.NullString
+	EmailCount int64
+	PhoneCount int64
 }
 
 // Run starts numWorkers goroutines each running the continuous re-enrich loop.
@@ -212,7 +223,16 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 		SET re_enrich_locked_at = NOW()
 		FROM eligible
 		WHERE bl.id = eligible.id
-		RETURNING bl.id, bl.domain, COALESCE(bl.website, 'https://' || bl.domain)
+		RETURNING
+			bl.id,
+			bl.domain,
+			COALESCE(bl.website, 'https://' || bl.domain),
+			bl.address,
+			bl.country,
+			bl.city,
+			(SELECT COUNT(*) FROM business_emails be WHERE be.business_id = bl.id),
+			(CASE WHEN bl.phone IS NOT NULL AND bl.phone != '' THEN 1 ELSE 0 END
+			 + COALESCE(array_length(bl.phones, 1), 0))
 	`
 
 	tx, err := r.db.BeginTx(queryCtx, nil)
@@ -234,7 +254,11 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 	var result []reenrichRow
 	for dbRows.Next() {
 		var row reenrichRow
-		if err := dbRows.Scan(&row.ID, &row.Domain, &row.URL); err != nil {
+		if err := dbRows.Scan(
+			&row.ID, &row.Domain, &row.URL,
+			&row.Address, &row.Country, &row.City,
+			&row.EmailCount, &row.PhoneCount,
+		); err != nil {
 			slog.Warn("reenrich: scan row failed", "error", err)
 			continue
 		}
@@ -251,6 +275,14 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 }
 
 func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFetcher, row reenrichRow, workerID int) {
+	// Offline pre-pass: derive country/city from the existing address blob
+	// before paying for a network refetch. If the row already had contact
+	// data (emails/phones) and the offline parse fills in country+city, we
+	// can mark it done and skip the fetch entirely.
+	if r.applyOfflineParse(ctx, row, workerID) {
+		return
+	}
+
 	timeout := time.Duration(r.cfg.Enrich.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -356,6 +388,86 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 			"phones", len(phones),
 			"worker", workerID)
 	}
+}
+
+// applyOfflineParse derives country/city from row.Address via the tail-parse
+// logic used by ExtractContacts, then writes any newly-derived values back to
+// business_listings. If the row already had at least one email/phone AND the
+// offline parse produced (or row already had) both country and city, the row
+// is marked re_enriched_at = NOW() and the function returns true — caller
+// skips the network fetch.
+//
+// Returns true when the network fetch can be skipped, false when the worker
+// should proceed with the normal fetch path. Errors fall through to the
+// network path (defensive — better to refetch than lose a row).
+func (r *ReenrichStage) applyOfflineParse(ctx context.Context, row reenrichRow, workerID int) bool {
+	if !row.Address.Valid || strings.TrimSpace(row.Address.String) == "" {
+		return false
+	}
+
+	parsedCountry, parsedCity := internalScraper.ParseAddressFallback(row.Address.String)
+	newCountry, newCity, skipFetch := offlineParseDecision(row, parsedCountry, parsedCity)
+
+	if newCountry.Valid || newCity.Valid {
+		// COALESCE on the SQL side mirrors the trigger's merge semantics: only
+		// overwrite when the existing column is NULL. Defensive against races
+		// where another worker filled the column between our SELECT and UPDATE.
+		_, err := r.db.ExecContext(ctx, `
+			UPDATE business_listings
+			SET country    = COALESCE(country, $2),
+			    city       = COALESCE(city,    $3),
+			    updated_at = NOW()
+			WHERE id = $1
+		`, row.ID, newCountry, newCity)
+		if err != nil {
+			slog.Warn("reenrich: offline parse update failed, will fall through to fetch",
+				"id", row.ID, "domain", row.Domain, "error", err, "worker", workerID)
+			return false
+		}
+		slog.Debug("reenrich: offline parse filled",
+			"id", row.ID, "domain", row.Domain,
+			"new_country", newCountry.String, "new_city", newCity.String,
+			"worker", workerID)
+	}
+
+	if !skipFetch {
+		return false
+	}
+
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE business_listings
+		SET re_enriched_at = NOW(), re_enrich_locked_at = NULL
+		WHERE id = $1
+	`, row.ID)
+	if err != nil {
+		slog.Warn("reenrich: mark done after offline parse failed, falling through to fetch",
+			"id", row.ID, "domain", row.Domain, "error", err, "worker", workerID)
+		return false
+	}
+	r.processed.Add(1)
+	slog.Info("reenrich: completed via offline parse (no network)",
+		"id", row.ID, "domain", row.Domain,
+		"filled_country", newCountry.Valid, "filled_city", newCity.Valid,
+		"worker", workerID)
+	return true
+}
+
+// offlineParseDecision is the pure-logic core of applyOfflineParse — given
+// the row's current state and the parsed (country, city) values from
+// scraper.ParseAddressFallback, it decides what to write back and whether
+// the network fetch can be skipped. No I/O; trivially unit-testable.
+func offlineParseDecision(row reenrichRow, parsedCountry, parsedCity string) (newCountry, newCity sql.NullString, skipFetch bool) {
+	if (!row.Country.Valid || row.Country.String == "") && parsedCountry != "" {
+		newCountry = sql.NullString{String: parsedCountry, Valid: true}
+	}
+	if (!row.City.Valid || row.City.String == "") && parsedCity != "" {
+		newCity = sql.NullString{String: parsedCity, Valid: true}
+	}
+	hasContact := row.EmailCount > 0 || row.PhoneCount > 0
+	countryFinal := (row.Country.Valid && row.Country.String != "") || newCountry.Valid
+	cityFinal := (row.City.Valid && row.City.String != "") || newCity.Valid
+	skipFetch = hasContact && countryFinal && cityFinal
+	return
 }
 
 // releaseLock clears re_enrich_locked_at so another worker can immediately
