@@ -861,11 +861,15 @@ func runMigrations(db *sql.DB) error {
 		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings_country_backup_20260512`).Scan(&backupCount)
 		slog.Info("db: country garbage purge backup created", "backup_rows", backupCount)
 
-		// STEP B — CONVERT: salvage rows where country is a full country name
-		// (e.g. "Portugal" → 'PT', "Ireland" → 'IE'). These are real data
-		// missed by tier1 normalize. Only rows not already in ISO alpha-2.
+		// STEP B — CONVERT: salvage all recognizable country names and common
+		// aliases not in the ISO alpha-2 set. Covers:
+		//   • Spelled-out names (>4 chars): Portugal, Ireland, Croatia, etc.
+		//   • Short country names (3-4 chars): Peru, Cuba, Oman, Laos
+		//   • Common aliases (2 chars): UK → GB
+		// The CASE uses ELSE country (not NULL) so unrecognized values pass
+		// through unchanged — they are caught by STEP C.
 		// Uses an explicit transaction so SET LOCAL statement_timeout applies
-		// only to this UPDATE (max 2,624 rows, index scan on country).
+		// only to this UPDATE (~2,812 rows after adding UK+Peru).
 		if txB, txErr := db.Begin(); txErr != nil {
 			slog.Warn("db: country garbage purge convert tx begin failed", "error", txErr)
 		} else {
@@ -873,6 +877,21 @@ func runMigrations(db *sql.DB) error {
 			_, convErr := txB.Exec(`
 				UPDATE business_listings SET
 				  country = CASE LOWER(TRIM(country))
+				    -- 2-char aliases not in ISO alpha-2
+				    WHEN 'uk'              THEN 'GB'
+				    -- Short country names (3-4 chars)
+				    WHEN 'peru'            THEN 'PE'
+				    WHEN 'cuba'            THEN 'CU'
+				    WHEN 'iran'            THEN 'IR'
+				    WHEN 'iraq'            THEN 'IQ'
+				    WHEN 'oman'            THEN 'OM'
+				    WHEN 'laos'            THEN 'LA'
+				    WHEN 'fiji'            THEN 'FJ'
+				    WHEN 'mali'            THEN 'ML'
+				    WHEN 'chad'            THEN 'TD'
+				    WHEN 'togo'            THEN 'TG'
+				    WHEN 'guam'            THEN 'GU'
+				    -- Spelled-out country names (>4 chars)
 				    WHEN 'portugal'        THEN 'PT'
 				    WHEN 'ireland'         THEN 'IE'
 				    WHEN 'croatia'         THEN 'HR'
@@ -898,11 +917,45 @@ func runMigrations(db *sql.DB) error {
 				    WHEN 'sri lanka'       THEN 'LK'
 				    WHEN 'cambodia'        THEN 'KH'
 				    WHEN 'hong kong'       THEN 'HK'
+				    WHEN 'switzerland'     THEN 'CH'
+				    WHEN 'south africa'    THEN 'ZA'
+				    WHEN 'united arab emirates' THEN 'AE'
+				    WHEN 'saudi arabia'    THEN 'SA'
+				    WHEN 'united states'   THEN 'US'
+				    WHEN 'united kingdom'  THEN 'GB'
+				    WHEN 'indonesia'       THEN 'ID'
+				    WHEN 'australia'       THEN 'AU'
+				    WHEN 'canada'          THEN 'CA'
+				    WHEN 'germany'         THEN 'DE'
+				    WHEN 'france'          THEN 'FR'
+				    WHEN 'singapore'       THEN 'SG'
+				    WHEN 'malaysia'        THEN 'MY'
+				    WHEN 'thailand'        THEN 'TH'
+				    WHEN 'brazil'          THEN 'BR'
+				    WHEN 'mexico'          THEN 'MX'
+				    WHEN 'spain'           THEN 'ES'
+				    WHEN 'italy'           THEN 'IT'
+				    WHEN 'netherlands'     THEN 'NL'
+				    WHEN 'belgium'         THEN 'BE'
+				    WHEN 'sweden'          THEN 'SE'
+				    WHEN 'norway'          THEN 'NO'
+				    WHEN 'denmark'         THEN 'DK'
+				    WHEN 'finland'         THEN 'FI'
+				    WHEN 'poland'          THEN 'PL'
+				    WHEN 'turkey'          THEN 'TR'
+				    WHEN 'india'           THEN 'IN'
+				    WHEN 'china'           THEN 'CN'
+				    WHEN 'korea'           THEN 'KR'
+				    WHEN 'south korea'     THEN 'KR'
+				    WHEN 'vietnam'         THEN 'VN'
+				    WHEN 'philippines'     THEN 'PH'
+				    WHEN 'new zealand'     THEN 'NZ'
+				    WHEN 'japan'           THEN 'JP'
 				    ELSE country
 				  END,
 				  updated_at = NOW()
 				WHERE country IS NOT NULL
-				  AND length(country) > 4
+				  AND country != ''
 				  AND country NOT IN (` + plausibleAlpha2 + `)`)
 			if convErr != nil {
 				txB.Rollback() //nolint:errcheck

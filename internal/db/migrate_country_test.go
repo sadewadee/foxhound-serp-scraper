@@ -28,9 +28,24 @@ import (
 const hardenedRegexPattern = `(?i)(United States|United Kingdom|Indonesia|Australia|Canada|Germany|France|Singapore|Malaysia|Thailand|Japan|Brazil|Mexico|Spain|Italy|Netherlands|Belgium|Sweden|Norway|Denmark|Finland|Poland|Turkey|India|China|Korea|Vietnam|Philippines|New Zealand|Portugal|Ireland|Croatia|Austria|Chile|Colombia|Hungary|Romania|Greece|Taiwan|Morocco|Argentina|Egypt|Myanmar|Costa Rica|Panama|Kenya|Bahrain|Qatar|Nepal|Nigeria|Sri Lanka|Cambodia|Switzerland|South Africa|United Arab Emirates|Saudi Arabia|South Korea|New Zealand|Czech Republic|Hong Kong)\s*$`
 
 // countryNameToISO mirrors the CASE blocks in both the regex-hardening SQL
-// and the garbage-purge convert SQL. Any name present in the SQL CASE must
-// appear here with the correct ISO code.
+// and the garbage-purge STEP B convert SQL. Any name present in the SQL CASE
+// must appear here with the correct ISO code.
 var countryNameToISOTest = map[string]string{
+	// 2-char aliases (not in ISO alpha-2 set itself)
+	"uk": "GB",
+	// Short country names (3-4 chars), verified by auditor scan
+	"peru": "PE",
+	"cuba": "CU",
+	"iran": "IR",
+	"iraq": "IQ",
+	"oman": "OM",
+	"laos": "LA",
+	"fiji": "FJ",
+	"mali": "ML",
+	"chad": "TD",
+	"togo": "TG",
+	"guam": "GU",
+	// Spelled-out country names (>4 chars)
 	"united states":        "US",
 	"united kingdom":       "GB",
 	"indonesia":            "ID",
@@ -240,6 +255,19 @@ func TestCountryNameToISO_Mapping(t *testing.T) {
 		"vietnam":              "VN",
 		"philippines":          "PH",
 		"new zealand":          "NZ",
+		// Short names and aliases added by auditor P1 fix
+		"uk":   "GB",
+		"peru": "PE",
+		"cuba": "CU",
+		"iran": "IR",
+		"iraq": "IQ",
+		"oman": "OM",
+		"laos": "LA",
+		"fiji": "FJ",
+		"mali": "ML",
+		"chad": "TD",
+		"togo": "TG",
+		"guam": "GU",
 	}
 
 	for name, expectedISO := range wantISO {
