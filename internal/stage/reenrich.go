@@ -63,7 +63,12 @@ type reenrichRow struct {
 	PhoneCount int64
 }
 
-// Run starts numWorkers goroutines each running the continuous re-enrich loop.
+// Run starts numWorkers goroutines each running the continuous re-enrich loop
+// plus one lock-reaper goroutine that deterministically releases stale claims.
+// The reaper exists because the worker's eligibility-query stale-claim recovery
+// is probabilistic (ORDER BY RANDOM over a 261K-row pool) — a row's specific
+// stale lock has 0.04% chance of being re-picked per batch, so rows stuck for
+// hours/days accumulate. The reaper closes that gap with a deterministic sweep.
 func (r *ReenrichStage) Run(ctx context.Context) error {
 	numWorkers := r.cfg.ReenrichWorkerCount
 	if numWorkers < 1 {
@@ -73,6 +78,11 @@ func (r *ReenrichStage) Run(ctx context.Context) error {
 
 	// Health file so the container healthcheck doesn't kill us while idle.
 	go touchHealthFile(ctx, "/tmp/worker-healthy")
+
+	// Lock-leak reaper — deterministic stale-lock release every 5 minutes.
+	// Operates independently of worker loops; idempotent UPDATE so multiple
+	// reaper instances would be safe but we only spawn one.
+	go r.lockReaper(ctx)
 
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -159,17 +169,32 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 	}
 }
 
+// reenrichMaxAttempts caps how many times a row can be claimed by the reenrich
+// worker before being treated as permanently dead. Cap chosen at 10 — high
+// enough to absorb transient fetch/network errors, low enough that genuinely
+// broken sites (DNS gone, perpetual 403, etc.) drop out of the eligibility
+// pool instead of cycling forever and burning proxy budget.
+//
+// Mirrors the enrich reconciler cap (15) from .dev-squad/gotchas.md — same
+// anti-pattern (zero-reset retry) caused the 2026-04-06 pipeline deadlock.
+const reenrichMaxAttempts = 10
+
 // fetchEligibleBatch atomically claims up to limit business_listings rows.
 //
 // Multi-worker correctness: uses CTE with FOR UPDATE OF bl SKIP LOCKED to
 // prevent two workers from picking the same row. Claim is recorded by
-// setting re_enrich_locked_at = NOW() in the same statement, so the row
-// stops appearing in subsequent eligibility queries even after the lock
-// is released by COMMIT.
+// setting re_enrich_locked_at = NOW() and incrementing re_enrich_attempts
+// in the same statement.
 //
 // Stale-claim recovery: rows with re_enrich_locked_at older than 15 min
-// are considered abandoned (worker crashed mid-processing) and become
-// eligible again — no separate janitor needed.
+// are considered abandoned. The lockReaper goroutine sweeps them out
+// deterministically every 5 min; the WHERE here also covers them as a
+// secondary safety net for the gap between reaper ticks.
+//
+// Retry cap: rows with re_enrich_attempts >= reenrichMaxAttempts (10) are
+// excluded so genuinely broken sites stop cycling. Manual reset via
+// `UPDATE business_listings SET re_enrich_attempts = 0 WHERE domain = ...`
+// brings them back if needed.
 //
 // Score (must be < threshold to be eligible):
 //   - 40 pts: has a valid email (is_acceptable=true OR score>=0.7)
@@ -192,6 +217,7 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 			WHERE re_enriched_at IS NULL
 			  AND (re_enrich_locked_at IS NULL
 			       OR re_enrich_locked_at < NOW() - INTERVAL '15 minutes')
+			  AND COALESCE(bl.re_enrich_attempts, 0) < $3
 			  AND (
 				CASE WHEN EXISTS(
 					SELECT 1 FROM business_emails be
@@ -220,7 +246,8 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 			FOR UPDATE OF bl SKIP LOCKED
 		)
 		UPDATE business_listings bl
-		SET re_enrich_locked_at = NOW()
+		SET re_enrich_locked_at = NOW(),
+		    re_enrich_attempts  = COALESCE(bl.re_enrich_attempts, 0) + 1
 		FROM eligible
 		WHERE bl.id = eligible.id
 		RETURNING
@@ -245,7 +272,7 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 		return nil, err
 	}
 
-	dbRows, err := tx.QueryContext(queryCtx, q, scoreThreshold, limit)
+	dbRows, err := tx.QueryContext(queryCtx, q, scoreThreshold, limit, reenrichMaxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -479,6 +506,57 @@ func (r *ReenrichStage) releaseLock(ctx context.Context, id int64) {
 		`UPDATE business_listings SET re_enrich_locked_at = NULL WHERE id = $1`, id)
 	if err != nil {
 		slog.Debug("reenrich: release lock failed (will auto-expire)", "id", id, "error", err)
+	}
+}
+
+// lockReaper releases stale re_enrich_locked_at claims deterministically on
+// a 5-minute tick. Without this, the probabilistic ORDER BY RANDOM eligibility
+// query rarely re-rolls specific stuck rows — production audit (2026-05-12)
+// found 708 rows stale-locked, oldest 3 days. The reaper closes that gap.
+//
+// Idempotent — clearing a non-stale lock is a no-op. Safe to run alongside
+// workers; the 15-min threshold is much longer than max processRow timeout
+// (30s default), so we cannot race against an in-flight worker.
+func (r *ReenrichStage) lockReaper(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// Run once at startup to clear any existing stale locks from a prior
+	// crash before workers begin claiming. Production audit found this
+	// snapshot can be hundreds of rows.
+	r.reapStaleLocks(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.reapStaleLocks(ctx)
+		}
+	}
+}
+
+// reapStaleLocks performs one reaper sweep — released rows go back into the
+// eligibility pool on the next worker batch. Tight context timeout so a slow
+// DB doesn't pile up overlapping reaper UPDATEs.
+func (r *ReenrichStage) reapStaleLocks(ctx context.Context) {
+	queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	res, err := r.db.ExecContext(queryCtx, `
+		UPDATE business_listings
+		SET re_enrich_locked_at = NULL
+		WHERE re_enrich_locked_at IS NOT NULL
+		  AND re_enrich_locked_at < NOW() - INTERVAL '15 minutes'
+		  AND re_enriched_at IS NULL
+	`)
+	if err != nil {
+		slog.Warn("reenrich: lock reaper sweep failed", "error", err)
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		slog.Info("reenrich: lock reaper released stale claims", "released", n)
 	}
 }
 
