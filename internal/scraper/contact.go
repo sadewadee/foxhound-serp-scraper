@@ -5,6 +5,8 @@ package scraper
 import (
 	"fmt"
 	"net"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
@@ -151,6 +153,19 @@ func ExtractContacts(body []byte) *ContactData {
 	// ── HTML address fallback (if JSON-LD didn't provide one) ──
 	if cd.Address == "" {
 		extractHTMLAddress(resp, cd)
+	}
+
+	// ── Address tail-parse fallback for City + Country ──
+	// Catches the common case where JSON-LD had no addressCountry/addressLocality
+	// and we have a raw address blob like "...Flat Rock, NC, United States" with
+	// the country (and a US-style city) embedded as trailing tokens.
+	if cd.Address != "" {
+		if cd.Country == "" {
+			cd.Country = tailParseCountry(cd.Address)
+		}
+		if cd.City == "" {
+			cd.City = tailParseCity(cd.Address)
+		}
 	}
 
 	// ── Page title fallback ──
@@ -459,6 +474,180 @@ func extractLDCityCountry(ld map[string]any) (string, string) {
 		}
 	}
 	return city, normalizeCountry(rawCountry)
+}
+
+// usStateCodes is the set of US state 2-letter codes used by tailParseCity to
+// recognize the canonical US-style "..., <city>, <ST>[ <zip>][, <country>]"
+// pattern. Mirrors the stateBlocklist in normalizeCountry — kept here as a
+// dedicated set so the city parser does not silently broaden to non-US
+// state-like tokens.
+var usStateCodes = map[string]bool{
+	"CA": true, "NY": true, "TX": true, "WA": true, "OR": true,
+	"FL": true, "IL": true, "MA": true, "PA": true, "AZ": true,
+	"CO": true, "NV": true, "NJ": true, "GA": true, "NC": true,
+	"VA": true, "MI": true, "OH": true, "IN": true, "MN": true,
+	"WI": true, "MO": true, "MD": true, "TN": true, "SC": true,
+	"AL": true, "KY": true, "LA": true, "OK": true, "CT": true,
+	"UT": true, "NM": true, "NH": true, "VT": true, "ME": true,
+	"RI": true, "DE": true, "HI": true, "AK": true, "ID": true,
+	"MT": true, "ND": true, "SD": true, "NE": true, "KS": true,
+	"WV": true, "AR": true, "MS": true, "IA": true, "DC": true,
+}
+
+// usCityRe matches a US-style trailing "<city>, <STATE>[<sep><zip>][, <country>]"
+// segment. Group 1 = city candidate, Group 2 = state code. The separator
+// between state and zip can be either a space ("TX 75244") or a comma
+// (", TX, 75244, USA") — both forms are common in scraped data. Anchored
+// to end of string so we extract the LAST city in the address (the
+// business location, not a street-level token).
+var usCityRe = regexp.MustCompile(`(?:^|,)\s*([^,]+?)\s*,\s*([A-Z]{2})\b(?:[\s,]+\d{5}(?:-\d{4})?)?(?:[\s,].*)?$`)
+
+// ccTLDToISO maps reliable ccTLDs to their ISO 3166-1 alpha-2 country code.
+// Curated allowlist — generic-looking ccTLDs (.io, .co, .me, .tv, .cc) are
+// deliberately excluded because they are dominated by global startups and
+// would mis-flag US/EU companies as British-Indian-Ocean-Territory etc.
+// Compound entries (".co.uk") must precede their single-component form.
+var ccTLDToISO = map[string]string{
+	// Compound (longest match first via lookup order below).
+	"co.uk": "GB", "org.uk": "GB", "ac.uk": "GB", "gov.uk": "GB",
+	"com.au": "AU", "net.au": "AU", "org.au": "AU",
+	"co.jp": "JP", "or.jp": "JP", "ne.jp": "JP",
+	"co.kr": "KR",
+	"co.id": "ID", "or.id": "ID", "ac.id": "ID",
+	"co.in":  "IN",
+	"co.nz":  "NZ",
+	"co.za":  "ZA",
+	"com.br": "BR", "com.mx": "MX", "com.sg": "SG", "com.my": "MY",
+	"com.tr": "TR", "com.tw": "TW", "com.hk": "HK", "com.ph": "PH",
+	// Single-component ccTLDs (high-signal: dominantly used by local entities).
+	"nl": "NL", "de": "DE", "fr": "FR", "it": "IT", "es": "ES",
+	"be": "BE", "at": "AT", "ch": "CH", "se": "SE", "no": "NO",
+	"dk": "DK", "fi": "FI", "pl": "PL", "pt": "PT", "ie": "IE",
+	"gr": "GR", "hu": "HU", "cz": "CZ", "ro": "RO", "ru": "RU",
+	"au": "AU", "nz": "NZ", "ca": "CA", "br": "BR", "mx": "MX",
+	"id": "ID", "jp": "JP", "kr": "KR", "in": "IN", "my": "MY",
+	"th": "TH", "vn": "VN", "ph": "PH", "sg": "SG", "tw": "TW",
+	"hk": "HK", "ae": "AE", "sa": "SA", "il": "IL", "tr": "TR",
+	"za": "ZA",
+}
+
+// tailParseCountry walks the comma-separated tokens of an address from the
+// tail backward and returns the first token that resolves via normalizeCountry
+// to a non-empty ISO alpha-2 code. Used as a fallback when JSON-LD did not
+// provide an addressCountry — e.g. raw HTML addresses like
+// "521 Oak Grove Rd, Flat Rock, NC, United States" where the country is
+// embedded as the trailing free-form token.
+//
+// Within each candidate segment we also try right-anchored word slices (last
+// 1..3 whitespace-separated words) so embedded forms like "239222\nSingapore"
+// or "6011\nNew Zealand" — common when a postal code and country share the
+// final comma segment — still resolve to SG / NZ.
+func tailParseCountry(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	parts := strings.Split(addr, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		candidate := strings.TrimRight(strings.TrimSpace(parts[i]), ".,;: ")
+		if candidate == "" {
+			continue
+		}
+		if iso := normalizeCountry(candidate); iso != "" {
+			return iso
+		}
+		// Collapse internal whitespace (incl. \n, \t) and try right-anchored
+		// word slices. Right-anchored only: avoids "USA Drive, ..." style
+		// false positives where the country-looking token is at the START
+		// of a street-name segment.
+		words := strings.Fields(candidate)
+		maxSlice := 3
+		if maxSlice > len(words) {
+			maxSlice = len(words)
+		}
+		for w := 1; w <= maxSlice; w++ {
+			slice := strings.Join(words[len(words)-w:], " ")
+			if iso := normalizeCountry(slice); iso != "" {
+				return iso
+			}
+		}
+	}
+	return ""
+}
+
+// tailParseCity returns the city from a US-style trailing address segment of
+// the form "..., <city>, <STATE>[ <zip>][, <country>]". Returns "" for any
+// address that does not match this canonical US shape — non-US addresses
+// have too many regional formats to parse reliably, and a wrong city is
+// worse than an empty one (per the "prefer empty over wrong" policy that
+// normalizeCountry also follows).
+func tailParseCity(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	m := usCityRe.FindStringSubmatch(addr)
+	if len(m) < 3 {
+		return ""
+	}
+	if !usStateCodes[strings.ToUpper(m[2])] {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// tldCountryHint returns the ISO 3166-1 alpha-2 code suggested by the host's
+// ccTLD, or "" if the TLD is not in the curated allowlist. Tries the
+// two-segment compound form first (.co.uk, .com.au) before falling back to
+// the single-segment ccTLD. Generic TLDs (.com, .io, .co, .me) deliberately
+// return "" to avoid false positives.
+func tldCountryHint(host string) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || !strings.Contains(host, ".") {
+		return ""
+	}
+	segs := strings.Split(host, ".")
+	if len(segs) >= 2 {
+		compound := segs[len(segs)-2] + "." + segs[len(segs)-1]
+		if iso, ok := ccTLDToISO[compound]; ok {
+			return iso
+		}
+	}
+	if iso, ok := ccTLDToISO[segs[len(segs)-1]]; ok {
+		return iso
+	}
+	return ""
+}
+
+// ApplyTLDCountryFallback fills cd.Country from the page URL's ccTLD when
+// it is still empty after all other extraction paths. Gated behind the
+// COUNTRY_TLD_FALLBACK_ENABLED env flag because ccTLD is a soft signal —
+// global companies on .com mask their origin and local sites occasionally
+// host on .io/.co. Off by default; callers opt in per-deployment.
+func ApplyTLDCountryFallback(cd *ContactData, pageURL string) {
+	if cd == nil || cd.Country != "" || pageURL == "" {
+		return
+	}
+	if !envFlagEnabled("COUNTRY_TLD_FALLBACK_ENABLED") {
+		return
+	}
+	u, err := url.Parse(pageURL)
+	if err != nil || u.Host == "" {
+		return
+	}
+	if iso := tldCountryHint(u.Host); iso != "" {
+		cd.Country = iso
+	}
+}
+
+// envFlagEnabled returns true when the named env var is set to a truthy
+// value ("1", "true", "yes", "on" — case-insensitive). All other values
+// (including unset / empty) return false.
+func envFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // whichYouTubePath reconstructs a canonical YouTube URL from the matched

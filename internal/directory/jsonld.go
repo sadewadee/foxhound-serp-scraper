@@ -33,7 +33,7 @@ func extractFromJSONLD(ld map[string]any, source string) Listing {
 	// Address.
 	if addr, ok := ld["address"].(map[string]any); ok {
 		var parts []string
-		for _, key := range []string{"streetAddress", "addressLocality", "addressRegion", "postalCode"} {
+		for _, key := range []string{"streetAddress", "addressLocality", "addressRegion", "postalCode", "addressCountry"} {
 			if v, ok := addr[key].(string); ok && v != "" {
 				parts = append(parts, v)
 			}

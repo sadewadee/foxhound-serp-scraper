@@ -317,6 +317,7 @@ func (r *Runner) runEnrichment(ctx context.Context, workerID int) {
 
 		// Regular page — extract contacts.
 		cd := scraper.ExtractContacts([]byte(body))
+		scraper.ApplyTLDCountryFallback(cd, pageURL)
 
 		// Store results.
 		for _, email := range cd.Emails {

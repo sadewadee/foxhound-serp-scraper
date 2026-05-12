@@ -270,6 +270,7 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 
 	// Extract contacts from fetched body.
 	cd := internalScraper.ExtractContacts([]byte(body))
+	internalScraper.ApplyTLDCountryFallback(cd, row.URL)
 	emails := internalScraper.FilterEmails(cd.Emails)
 	phones := internalScraper.FilterPhones(cd.Phones)
 	socialLinks := buildSocialLinks(cd) // reuse enrich.go helper — same package
