@@ -30,8 +30,14 @@ func buildCountCacheKey(where string, args []any) string {
 //
 // fromClause includes any join alias, e.g. "business_listings bl".
 // where includes the leading "WHERE", e.g. "WHERE bl.domain = $1" or "WHERE 1=1".
+//
+// SECURITY: fromClause and where are interpolated directly into the SQL string.
+// Both MUST be compile-time constants. NEVER pass user input as either; pass
+// user values through args and reference them via $N placeholders in where.
 func (s *Server) cachedCount(ctx context.Context, fromClause, where string, args []any, ttl, timeout time.Duration) (int, error) {
-	key := buildCountCacheKey(fromClause+"|"+where, args)
+	// %q quotes both parts so concatenation is unambiguous: an unquoted "|"
+	// inside either string cannot collide with the separator.
+	key := buildCountCacheKey(fmt.Sprintf("%q|%q", fromClause, where), args)
 
 	if s.redis != nil {
 		if v, err := s.redis.Get(ctx, key).Result(); err == nil {
@@ -145,7 +151,14 @@ func (s *Server) cachedJSON(
 		}
 		// Timed out waiting — fall through to compute (degraded).
 	}
-	defer s.releaseSingleFlight(context.Background(), key)
+	// Only release if WE acquired the lock. BYPASS callers (timed out waiting)
+	// must NOT delete a key they don't own — that would let other concurrent
+	// callers re-acquire and partially defeat thundering-herd protection.
+	// context.Background() (not ctx) so release fires even if request ctx is
+	// already cancelled by the time compute() returns.
+	if gotLock {
+		defer s.releaseSingleFlight(context.Background(), key)
+	}
 
 	value, err := compute()
 	if err != nil {
