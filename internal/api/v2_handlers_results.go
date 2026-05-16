@@ -2,80 +2,24 @@ package api
 
 import (
 	"context"
-	"crypto/sha1"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	pq "github.com/lib/pq"
 )
 
-// resultsCountTTL is the Redis cache window for filtered COUNT(*) results.
-// Polling clients re-hit the same filter combo within this window for free.
+// resultsCountTTL is the cache TTL for filtered COUNT(*) on business_listings.
 const resultsCountTTL = 60 * time.Second
 
-// cachedFilteredCount returns COUNT(*) for the given WHERE+args, served from
-// Redis when fresh. On query timeout/error, returns (-1, err) so the caller can
-// still serve the page with a "many" sentinel instead of HTTP 500.
-//
-// Cache key shape: "v2:count:<sha1(where|args)>" — args serialized via fmt to
-// keep numbers/strings/timestamps stable across calls.
+// cachedFilteredCount is the existing call signature, now thin wrapper over cachedCount.
 func (s *Server) cachedFilteredCount(ctx context.Context, where string, args []any) (int, error) {
-	key := buildCountCacheKey(where, args)
-
-	if s.redis != nil {
-		if v, err := s.redis.Get(ctx, key).Result(); err == nil {
-			if n, perr := strconv.Atoi(v); perr == nil {
-				return n, nil
-			}
-		}
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return -1, err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '12000'"); err != nil {
-		return -1, err
-	}
-
-	var total int
-	q := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
-	if err := tx.QueryRowContext(ctx, q, args...).Scan(&total); err != nil {
-		return -1, err
-	}
-	if err := tx.Commit(); err != nil {
-		// Commit failure means the COUNT result may be from a tx that did not
-		// fully reconcile — never cache it and signal the caller to skip.
-		return -1, err
-	}
-
-	if s.redis != nil {
-		// Best-effort SETEX; cache miss isn't worth failing the request over.
-		_ = s.redis.Set(ctx, key, strconv.Itoa(total), resultsCountTTL).Err()
-	}
-	return total, nil
-}
-
-// buildCountCacheKey hashes WHERE + args into a stable Redis key. Args are
-// formatted with %q so adjacent string values cannot transpose into the same
-// byte stream (e.g. ["a","bc"] and ["ab","c"] used to collide under %v).
-func buildCountCacheKey(where string, args []any) string {
-	h := sha1.New()
-	h.Write([]byte(where))
-	for _, a := range args {
-		fmt.Fprintf(h, "|%q|", a)
-	}
-	return "v2:count:" + hex.EncodeToString(h.Sum(nil))
+	return s.cachedCount(ctx, "business_listings bl", where, args, resultsCountTTL, 12*time.Second)
 }
 
 // buildResultsFilter builds a WHERE clause + args from query parameters.
