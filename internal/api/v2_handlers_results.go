@@ -77,11 +77,45 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 
 	where, args, argIdx := buildResultsFilter(q)
 
-	// Count total via Redis-cached helper. On timeout/error the helper returns -1
+	// Cursor mode (?cursor=base64): keyset pagination — O(log N) at any depth
+	// via the existing bl.id PK index. Skips COUNT entirely and returns
+	// {next_cursor, has_more} instead of a total. Detected by presence of the
+	// cursor param; if absent we fall through to the existing OFFSET path so
+	// existing consumers keep working unchanged.
+	cursorParam := q.Get("cursor")
+	useCursor := cursorParam != ""
+
+	if useCursor {
+		cursorID, derr := decodeCursor(cursorParam)
+		if derr != nil {
+			writeV2Error(w, http.StatusBadRequest, "invalid_cursor", "cursor is malformed")
+			return
+		}
+		dir := q.Get("cursor_dir")
+		if dir == "prev" {
+			where += fmt.Sprintf(" AND bl.id > $%d", argIdx)
+		} else {
+			where += fmt.Sprintf(" AND bl.id < $%d", argIdx)
+		}
+		args = append(args, cursorID)
+		argIdx++
+	}
+
+	// Count only applies in OFFSET mode. On timeout/error the helper returns -1
 	// so we serve the page with a sentinel instead of 500.
-	total, err := s.cachedFilteredCount(ctx, where, args)
-	if err != nil {
-		slog.Warn("v2: count failed (returning -1 sentinel)", "error", err)
+	var total int
+	if !useCursor {
+		var err error
+		total, err = s.cachedFilteredCount(ctx, where, args)
+		if err != nil {
+			slog.Warn("v2: count failed (returning -1 sentinel)", "error", err)
+		}
+	}
+
+	// Cursor mode fetches perPage+1 to detect has_more without a second query.
+	limit := perPage
+	if useCursor {
+		limit = perPage + 1
 	}
 
 	// Query 1: Fetch paginated listings (all columns).
@@ -97,9 +131,14 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		       bl.source_query_id, bl.created_at, bl.updated_at
 		FROM business_listings bl %s
 		ORDER BY bl.id DESC
-		LIMIT $%d OFFSET $%d
-	`, where, argIdx, argIdx+1)
-	args = append(args, perPage, offset)
+		LIMIT $%d`, where, argIdx)
+	args = append(args, limit)
+	argIdx++
+
+	if !useCursor {
+		dataQuery += fmt.Sprintf(" OFFSET $%d", argIdx)
+		args = append(args, offset)
+	}
 
 	rows, err := s.db.QueryContext(ctx, dataQuery, args...)
 	if err != nil {
@@ -142,6 +181,15 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		l.Phone = phone
 		listings = append(listings, l)
 		listingIDs = append(listingIDs, l.ID)
+	}
+
+	// Cursor mode: detect has_more via the sentinel row, then trim it BEFORE
+	// the email batch fetch so we don't waste a query on a row we're dropping.
+	hasMore := false
+	if useCursor && len(listings) > perPage {
+		hasMore = true
+		listings = listings[:perPage]
+		listingIDs = listingIDs[:perPage]
 	}
 
 	// Query 2: Batch-fetch ALL email columns for those listing IDs.
@@ -199,6 +247,23 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 
 	if listings == nil {
 		listings = []V2BusinessListing{}
+	}
+
+	if useCursor {
+		// Cursor envelope: explicit fields instead of pagination meta. Skip
+		// writeV2Single because that wraps in "data" and we also need
+		// next_cursor + has_more at the same level as the JSON-RPC-ish v2 style.
+		var nextCursor string
+		if hasMore && len(listings) > 0 {
+			nextCursor = encodeCursor(listings[len(listings)-1].ID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data":        listings,
+			"next_cursor": nextCursor,
+			"has_more":    hasMore,
+		})
+		return
 	}
 
 	writeV2Paginated(w, listings, total, page, perPage)
