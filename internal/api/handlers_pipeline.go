@@ -12,10 +12,32 @@ import (
 )
 
 func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	// 10s budget — must exceed the 8s statement_timeout below so PG cancels
+	// the query first and we observe a clean error rather than a context-cancel.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
 	stats := map[string]any{}
 
-	// Table counts.
+	// Wrap big-table COUNT(*) in a single tx with statement_timeout so a slow
+	// query can't hold the manager's 2-conn pool open indefinitely (the cascade
+	// that was causing v2 endpoints to balas 500 with context deadline exceeded).
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("v1: pipeline-stats tx error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '8000'"); err != nil {
+		slog.Error("v1: pipeline-stats set timeout error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	// Table counts. tables is compile-time only — no user input flows into the
+	// SQL string here, so fmt.Sprintf is safe.
 	tables := map[string]string{
 		"queries": "queries", "serp_jobs": "serp_jobs",
 		"enrichment_jobs": "enrichment_jobs", "emails": "emails",
@@ -23,9 +45,12 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 	}
 	for key, table := range tables {
 		var total int
-		s.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&total)
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&total); err != nil {
+			slog.Warn("v1: pipeline-stats count failed", "table", table, "error", err)
+		}
 		stats[key+"_total"] = total
 	}
+	tx.Commit()
 
 	// Queue depths from Redis (buffers are LISTs, queries queue is sorted set).
 	queueStats := map[string]int64{}
@@ -41,11 +66,15 @@ func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
+	// 18s — same budget as v2_response.v2RequestContext so the V1 dashboard
+	// won't outlive V2 requests. Statement timeout below is 15s; PG cancels first.
+	ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
+	defer cancel()
 
-	// -- Queries --
+	// -- Queries (small table — runs outside the big tx since CSV-style status
+	// rollup is cheap and we want it to complete even if the tx hits timeout.) --
 	queries := map[string]int{}
-	qRows, _ := s.db.Query(`SELECT status, COUNT(*) FROM queries GROUP BY status`)
+	qRows, _ := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM queries GROUP BY status`)
 	if qRows != nil {
 		for qRows.Next() {
 			var status string
@@ -61,11 +90,28 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	queries["total"] = qTotal
 
+	// Big-table aggregates wrapped in a tx + statement_timeout to bound the
+	// time these can hold the manager's 2-conn pool. Without this V2 endpoints
+	// see 500 with context deadline exceeded when this handler runs slow.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("v1: dashboard tx error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'"); err != nil {
+		slog.Error("v1: dashboard set timeout error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
 	// -- SERP Jobs --
 	serp := map[string]any{}
 	var serpTotal, serpNew, serpProcessing, serpCompleted, serpFailed int
 	var serpURLsFound, serpPerHour, serpToday int
-	s.db.QueryRow(`
+	tx.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
 			COUNT(*) FILTER (WHERE status = 'new'),
@@ -90,7 +136,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	enrich := map[string]any{}
 	var enrichTotal, enrichPending, enrichProcessing, enrichCompleted, enrichFailed, enrichDead int
 	var enrichPerHour, enrichToday int
-	s.db.QueryRow(`
+	tx.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
 			COUNT(*) FILTER (WHERE status = 'pending'),
@@ -114,11 +160,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// -- Contacts (from normalized tables) --
 	contacts := map[string]any{}
 	var totalEmails, uniqueEmails, emailsToday, emailsLastHour, uniqueDomains int
-	s.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&totalEmails)
+	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails`).Scan(&totalEmails)
 	uniqueEmails = totalEmails // emails table has UNIQUE constraint, so total == unique
-	s.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
-	s.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsLastHour)
-	s.db.QueryRow(`SELECT COUNT(DISTINCT domain) FROM business_listings`).Scan(&uniqueDomains)
+	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
+	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsLastHour)
+	tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT domain) FROM business_listings`).Scan(&uniqueDomains)
 
 	contacts["total_emails"] = totalEmails
 	contacts["unique_emails"] = uniqueEmails
@@ -126,7 +172,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	contacts["emails_per_hour"] = emailsLastHour
 
 	// Top email providers.
-	providerRows, _ := s.db.Query(`
+	providerRows, _ := tx.QueryContext(ctx, `
 		SELECT domain, COUNT(*) AS cnt
 		FROM emails
 		GROUP BY domain ORDER BY cnt DESC LIMIT 10
@@ -143,6 +189,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	contacts["providers"] = providers
 	contacts["unique_domains"] = uniqueDomains
+
+	tx.Commit()
 
 	// -- Queues (Redis) --
 	queueMap := map[string]int64{}
