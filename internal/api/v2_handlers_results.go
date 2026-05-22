@@ -57,8 +57,48 @@ func buildResultsFilter(q url.Values) (string, []any, int) {
 		args = append(args, "%"+search+"%")
 		argIdx++
 	}
+	if country := q.Get("country"); country != "" {
+		// Stored values are ISO alpha-2 ("ID", "DE", ...) — accept any case
+		// from the caller and normalize via UPPER on both sides.
+		where += fmt.Sprintf(" AND UPPER(bl.country) = UPPER($%d)", argIdx)
+		args = append(args, country)
+		argIdx++
+	}
+	if city := q.Get("city"); city != "" {
+		// Prefix ILIKE so "?city=Berlin" matches "Berlin", "Berlin-Mitte", etc.
+		// Cheaper than substring %x% and friendlier to a btree(city) index.
+		where += fmt.Sprintf(" AND bl.city ILIKE $%d", argIdx)
+		args = append(args, city+"%")
+		argIdx++
+	}
+	if hasPhone := q.Get("has_phone"); hasPhone == "true" {
+		where += " AND bl.phone IS NOT NULL AND bl.phone <> ''"
+	}
+	if hasSocial := q.Get("has_social"); hasSocial == "true" {
+		where += " AND bl.social_links IS NOT NULL AND bl.social_links::text NOT IN ('{}', '')"
+	}
 
 	return where, args, argIdx
+}
+
+// resultsOrderBy returns a safe ORDER BY clause for the results endpoint.
+// Whitelist-only to prevent SQL injection — q.Get("sort") is user input.
+// Defaults to id_desc for compat with the original hardcoded ordering.
+func resultsOrderBy(sort string) string {
+	switch sort {
+	case "id_asc":
+		return "ORDER BY bl.id ASC"
+	case "updated_desc":
+		return "ORDER BY bl.updated_at DESC, bl.id DESC"
+	case "updated_asc":
+		return "ORDER BY bl.updated_at ASC, bl.id ASC"
+	case "created_desc":
+		return "ORDER BY bl.created_at DESC, bl.id DESC"
+	case "created_asc":
+		return "ORDER BY bl.created_at ASC, bl.id ASC"
+	default:
+		return "ORDER BY bl.id DESC"
+	}
 }
 
 // handleV2ListResults returns paginated business listings with full email info.
@@ -118,6 +158,14 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		limit = perPage + 1
 	}
 
+	// Cursor mode is keyed on bl.id, so ?sort= only takes effect in OFFSET mode.
+	// Forcing id-order in cursor mode keeps the keyset boundary consistent —
+	// mixing sort keys with a cursor would skip or duplicate rows.
+	orderBy := "ORDER BY bl.id DESC"
+	if !useCursor {
+		orderBy = resultsOrderBy(q.Get("sort"))
+	}
+
 	// Query 1: Fetch paginated listings (all columns).
 	dataQuery := fmt.Sprintf(`
 		SELECT bl.id, COALESCE(bl.business_name,''), COALESCE(bl.category,''),
@@ -130,8 +178,8 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.tiktok,''), COALESCE(bl.youtube,''), COALESCE(bl.telegram,''),
 		       bl.source_query_id, bl.created_at, bl.updated_at
 		FROM business_listings bl %s
-		ORDER BY bl.id DESC
-		LIMIT $%d`, where, argIdx)
+		%s
+		LIMIT $%d`, where, orderBy, argIdx)
 	args = append(args, limit)
 	argIdx++
 

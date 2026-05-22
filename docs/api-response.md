@@ -264,7 +264,42 @@ Semua V2 list/single response dibungkus:
 
 ### `GET /api/v2/results`
 
-Query: `page`, `per_page≤200`, `domain`, `has_email`, `email`, `email_provider`, `email_status`, `search`
+Query (semua optional, kecuali pagination):
+
+| Param | Tipe | Catatan |
+|---|---|---|
+| `page` | int | OFFSET mode. Default 1. Tidak dipakai jika `cursor` di-set. |
+| `per_page` | int | Default 50, max 200. |
+| `cursor` | base64 | **Cursor mode** — keyset pagination O(log N). Opaque value dari response sebelumnya. Lihat bawah. |
+| `cursor_dir` | `next`\|`prev` | Default `next`. Hanya berlaku bila `cursor` di-set. |
+| `sort` | string | OFFSET mode only. Whitelist: `id_desc` (default), `id_asc`, `updated_desc`, `updated_asc`, `created_desc`, `created_asc`. Cursor mode dipaksa `id_desc` agar keyset boundary konsisten. |
+| `domain` | string | Match exact `bl.domain`. |
+| `country` | string | ISO alpha-2, case-insensitive (`id` ≡ `ID`). |
+| `city` | string | Prefix ILIKE — `?city=Berlin` cocok dengan "Berlin", "Berlin-Mitte". |
+| `has_email` | `true` | Hanya yang punya minimal 1 email. |
+| `has_phone` | `true` | Hanya yang `phone` non-empty. |
+| `has_social` | `true` | Hanya yang `social_links` non-empty (`{}` dianggap kosong). |
+| `email` | string | Match exact email address. |
+| `email_provider` | string | Match suffix — `?email_provider=gmail.com` cocok dengan `*@gmail.com`. |
+| `email_status` | string | Filter `validation_status` (`valid`, `pending`, `invalid`, dst). |
+| `search` | string | ILIKE `%x%` pada `business_name`. |
+
+**Cursor mode response** (saat `cursor` di-set) — tanpa `meta`, ganti dengan `next_cursor` + `has_more`:
+
+```json
+{
+  "data": [ /* V2BusinessListing[], lihat schema di bawah */ ],
+  "next_cursor": "eyJpZCI6MTIyOTV9",
+  "has_more": true
+}
+```
+
+- `next_cursor` opaque — perlakukan sebagai black box. Pakai persis di request berikutnya: `?cursor=<next_cursor>&per_page=...`.
+- Kalau `has_more=false`, `next_cursor` kosong → akhir hasil.
+- Cursor mode TIDAK mengembalikan `meta.total`. Kalau butuh total, panggil `GET /api/v2/results/count?<filter>` terpisah (cached 60s).
+- Cursor malformed → HTTP 400 `{"error":{"code":"invalid_cursor",...}}`.
+
+**OFFSET mode response** (default, saat `cursor` tidak di-set):
 
 ```json
 {
