@@ -12,6 +12,8 @@ type V2BusinessListing struct {
 	URL             string          `json:"url"`
 	BusinessName    string          `json:"business_name"`
 	Category        string          `json:"category"`
+	NicheCategory   string          `json:"niche_category"`
+	OffNiche        bool            `json:"off_niche"`
 	Description     string          `json:"description"`
 	Address         string          `json:"address"`
 	Location        string          `json:"location"`

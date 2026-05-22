@@ -283,6 +283,8 @@ Query (semua optional, kecuali pagination):
 | `email_provider` | string | Match suffix — `?email_provider=gmail.com` cocok dengan `*@gmail.com`. |
 | `email_status` | string | Filter `validation_status` (`valid`, `pending`, `invalid`, dst). |
 | `search` | string | ILIKE `%x%` pada `business_name`. |
+| `niche` | string | Filter `niche_category` eksak: `yoga`, `pilates`, `fitness`, `wellness`, `meditation`, `healing`, `ayurveda`, `spa`. |
+| `include_off_niche` | `true` | **Default tertutup**: off_niche rows (Hotel/AutoDealer/Dentist/dst) di-filter habis. Set `true` untuk lihat semua row apa adanya (debugging/manual review). |
 
 **Cursor mode response** (saat `cursor` di-set) — tanpa `meta`, ganti dengan `next_cursor` + `has_more`:
 

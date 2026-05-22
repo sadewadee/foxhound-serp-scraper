@@ -9,14 +9,51 @@ import (
 func TestBuildResultsFilter_NoParams(t *testing.T) {
 	q := url.Values{}
 	where, args, idx := buildResultsFilter(q)
-	if where != "WHERE 1=1" {
-		t.Fatalf("expected baseline WHERE 1=1, got %q", where)
+	// Default-safe: off_niche IS NOT TRUE is always applied unless
+	// include_off_niche=true. Without the safe default a consumer would see
+	// AutoDealer/Hotel/Dentist rows mixed in by default.
+	if !strings.Contains(where, "bl.off_niche IS NOT TRUE") {
+		t.Fatalf("default must include off_niche guard, got %q", where)
 	}
 	if len(args) != 0 {
-		t.Fatalf("expected no args, got %d", len(args))
+		t.Fatalf("expected no args for params-less call, got %d", len(args))
 	}
 	if idx != 1 {
 		t.Fatalf("expected argIdx=1, got %d", idx)
+	}
+}
+
+func TestBuildResultsFilter_IncludeOffNiche(t *testing.T) {
+	q := url.Values{"include_off_niche": {"true"}}
+	where, _, _ := buildResultsFilter(q)
+	if strings.Contains(where, "off_niche") {
+		t.Fatalf("include_off_niche=true must drop the off_niche clause, got %q", where)
+	}
+}
+
+func TestBuildResultsFilter_IncludeOffNicheOnlyTrue(t *testing.T) {
+	// Anything other than literal "true" preserves the default safe filter.
+	for _, v := range []string{"1", "yes", "on", "TRUE", ""} {
+		q := url.Values{"include_off_niche": {v}}
+		where, _, _ := buildResultsFilter(q)
+		if !strings.Contains(where, "off_niche IS NOT TRUE") {
+			t.Errorf("include_off_niche=%q should NOT disable off_niche filter (only 'true' opts in), got %q", v, where)
+		}
+	}
+}
+
+func TestBuildResultsFilter_Niche(t *testing.T) {
+	q := url.Values{"niche": {"yoga"}}
+	where, args, _ := buildResultsFilter(q)
+	if !strings.Contains(where, "bl.niche_category = $1") {
+		t.Fatalf("niche clause missing, got %q", where)
+	}
+	if len(args) != 1 || args[0] != "yoga" {
+		t.Fatalf("unexpected args: %v", args)
+	}
+	// And the off_niche default still applies — niche filter doesn't disable it.
+	if !strings.Contains(where, "off_niche IS NOT TRUE") {
+		t.Fatalf("niche filter must still respect off_niche default, got %q", where)
 	}
 }
 
