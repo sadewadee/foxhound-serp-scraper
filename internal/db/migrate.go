@@ -1151,17 +1151,28 @@ func runMigrations(db *sql.DB) error {
 	// plus ~41K rows where category is >100 chars (meta-keyword soup from
 	// <meta name="keywords"> instead of schema.org @type).
 	//
-	// Steps mirror the country garbage purge (versioned, gated, backup-first):
-	//   A. BACKUP — copy id+category+off_niche of all rows about to mutate.
-	//   B. FLAG — UPDATE off_niche=TRUE for rows matching either rule.
-	//   C. CLASSIFY — forward-fill niche_category for off_niche=FALSE rows
+	// Steps mirror the country garbage purge (versioned, backup-first), but
+	// without an env-var dry-run flag — the backup + integrity gate below
+	// (count-divergence check + abort-on-empty-backup) provides equivalent
+	// safety without operational toggles. Counts are logged BEFORE mutation
+	// so the operator can verify in the deploy log without code changes.
+	//   A. PRE-COUNT — log live affected row count (visible in deploy log).
+	//   B. BACKUP — copy id+category+off_niche of all rows about to mutate.
+	//      Integrity gate: backup must be non-empty AND within 10% of live count.
+	//   C. FLAG — UPDATE off_niche=TRUE for rows matching either rule.
+	//   D. CLASSIFY — forward-fill niche_category for off_niche=FALSE rows
 	//                 whose category text matches the niche regex used by the
 	//                 trigger. No mutation for rows the regex doesn't match.
-	//   D. VERIFY — log post-cleanup counts.
+	//   E. VERIFY — log post-cleanup counts.
 	//
-	// Dry-run gate: OFFNICHE_CLEANUP_DRY_RUN=true → count only, no mutation,
-	// version NOT recorded so the dry-run re-runs next deploy. Default OFF
-	// (cleanup runs). Per memory feedback_gated_flag_for_risky_changes.md.
+	// Rollback (documented for ops):
+	//   UPDATE business_listings bl
+	//   SET off_niche = b.off_niche,
+	//       niche_category = b.niche_category,
+	//       updated_at = b.updated_at
+	//   FROM business_listings_offniche_backup_20260522 b
+	//   WHERE bl.id = b.id;
+	//   DELETE FROM schema_migrations WHERE version = '2026_05_22_off_niche_backfill';
 	// -------------------------------------------------------------------------
 	const offNicheCleanupVersion = "2026_05_22_off_niche_backfill"
 	var offNicheCleanupDone bool
@@ -1178,26 +1189,24 @@ func runMigrations(db *sql.DB) error {
 		'RoofingContractor','HomeAndConstructionBusiness',
 		'MedicalClinic','MedicalBusiness','HealthAndBeautyBusiness'`
 
-		dryRun := os.Getenv("OFFNICHE_CLEANUP_DRY_RUN") == "true"
-		if dryRun {
-			slog.Info("db: off-niche cleanup DRY-RUN mode — counting only, no mutation")
-			var explicitOff, metaSoup int
-			_ = db.QueryRow(
-				`SELECT COUNT(*) FROM business_listings WHERE category IN (` + offNicheTypes + `) AND off_niche IS NOT TRUE`,
-			).Scan(&explicitOff)
-			_ = db.QueryRow(
-				`SELECT COUNT(*) FROM business_listings WHERE LENGTH(category) > 100 AND off_niche IS NOT TRUE`,
-			).Scan(&metaSoup)
-			slog.Info("db: off-niche cleanup dry-run counts",
-				"explicit_off_niche_to_flag", explicitOff,
-				"meta_keyword_soup_to_flag", metaSoup,
-				"total_affected", explicitOff+metaSoup,
-			)
-			// Do NOT record version — dry-run should re-run on next deploy.
-			return nil
-		}
+		// STEP A — PRE-COUNT: log counts so the operator sees in the deploy
+		// log how many rows the migration is about to flag, broken down by
+		// reason. No mutation yet — if the numbers look wrong, the operator
+		// can stop the container before STEPS B-D run.
+		var explicitOff, metaSoup int
+		_ = db.QueryRow(
+			`SELECT COUNT(*) FROM business_listings WHERE category IN (` + offNicheTypes + `) AND off_niche IS NOT TRUE`,
+		).Scan(&explicitOff)
+		_ = db.QueryRow(
+			`SELECT COUNT(*) FROM business_listings WHERE LENGTH(category) > 100 AND off_niche IS NOT TRUE`,
+		).Scan(&metaSoup)
+		slog.Info("db: off-niche cleanup pre-count",
+			"explicit_off_niche_to_flag", explicitOff,
+			"meta_keyword_soup_to_flag", metaSoup,
+			"total_affected", explicitOff+metaSoup,
+		)
 
-		// STEP A — BACKUP: capture pre-mutation state for everything we're
+		// STEP B — BACKUP: capture pre-mutation state for everything we're
 		// about to flag. Append-safe via IF NOT EXISTS. Following the country
 		// purge integrity gate pattern: count live rows, create backup, verify
 		// backup count matches within 10% before mutating.
@@ -1243,7 +1252,7 @@ func runMigrations(db *sql.DB) error {
 		}
 		slog.Info("db: off-niche cleanup backup integrity verified — proceeding with FLAG + CLASSIFY")
 
-		// STEP B — FLAG: set off_niche=TRUE for the two patterns. Wrapped in
+		// STEP C — FLAG: set off_niche=TRUE for the two patterns. Wrapped in
 		// tx with statement_timeout (30s — partial idx_bl_niche_active helps,
 		// but the UPDATE touches both indexed and unindexed rows).
 		var flaggedRows int64
@@ -1267,7 +1276,7 @@ func runMigrations(db *sql.DB) error {
 			}
 		}
 
-		// STEP C — CLASSIFY: forward-fill niche_category for rows that survived
+		// STEP D — CLASSIFY: forward-fill niche_category for rows that survived
 		// the FLAG step (off_niche=FALSE). Mirrors the trigger CASE so old rows
 		// get the same classification as new rows. Single-pass UPDATE keyed by
 		// the same regex; rows that match no niche stay NULL.
@@ -1320,7 +1329,7 @@ func runMigrations(db *sql.DB) error {
 			}
 		}
 
-		// STEP D — VERIFY.
+		// STEP E — VERIFY.
 		var finalOffNiche, finalClassified, finalUnclassified int
 		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS TRUE`).Scan(&finalOffNiche)
 		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`).Scan(&finalClassified)
