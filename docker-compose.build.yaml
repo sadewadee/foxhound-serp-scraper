@@ -1,24 +1,25 @@
-# Build-only compose for kurama. Runs docker build then pushes to ghcr.io.
+# Build-only compose for kurama. Builds the image then pushes it to the
+# self-hosted kremlit registry (ghcr.mcpke.dev) so the production serp
+# stack can pull it.
 #
-# Usage (on kurama, from /home/sadewa/serp-scraper-canary or equivalent):
-#   git fetch origin && git checkout canary/v0.8.0-country-extraction
-#   export GHCR_PAT=<your-personal-access-token-with-write:packages>
+# Usage (on kurama, or via the Dokploy build target serp-build-v071fix):
+#   git fetch origin && git checkout feat/api-niche-classifier
+#   export KREMLIT_USER=docker KREMLIT_PASS=<registry password>
 #   docker compose -f docker-compose.build.yaml up --abort-on-container-exit
 #
-# Tags produced:
-#   ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction
-#   ghcr.io/sadewadee/foxhound-serp-scraper:canary-latest
+# Tag produced:
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche
 #
-# After successful push, redeploy the canary stack via Dokploy pointing at
-# either tag. The :canary-latest moving tag is convenient for redeploys
-# while iterating; the version-specific tag is the rollback anchor.
+# After a successful push, deploy by setting IMAGE_TAG=v0.8.1-niche on the
+# serp stack and redeploying via Dokploy (pull_policy: always picks it up).
+# v0.8.1-niche is immutable — it does not overwrite :v0.7.1 or :v0.8.0-canary.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the
     # image is built (we're not running the binary here, just producing
     # the image layer set).
@@ -26,35 +27,20 @@ services:
     command: ["true"]
     restart: "no"
 
-  retagger:
+  pusher:
     image: docker:24-cli
     depends_on:
       builder:
         condition: service_completed_successfully
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: >
-      sh -c "
-      docker tag ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction
-                 ghcr.io/sadewadee/foxhound-serp-scraper:canary-latest
-      "
-    restart: "no"
-
-  pusher:
-    image: docker:24-cli
-    depends_on:
-      retagger:
-        condition: service_completed_successfully
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      GHCR_USER: sadewadee
-      GHCR_PAT: ${GHCR_PAT}
+      KREMLIT_USER: ${KREMLIT_USER}
+      KREMLIT_PASS: ${KREMLIT_PASS}
     command: >
       sh -c "
-      echo \"$$GHCR_PAT\" | docker login ghcr.io -u \"$$GHCR_USER\" --password-stdin &&
-      docker push ghcr.io/sadewadee/foxhound-serp-scraper:canary-v0.8.0-country-extraction &&
-      docker push ghcr.io/sadewadee/foxhound-serp-scraper:canary-latest &&
-      echo 'PUSH COMPLETE: canary-v0.8.0-country-extraction + canary-latest'
+      echo \"$$KREMLIT_PASS\" | docker login ghcr.mcpke.dev -u \"$$KREMLIT_USER\" --password-stdin &&
+      docker push ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche &&
+      echo 'PUSH COMPLETE: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche'
       "
     restart: "no"
