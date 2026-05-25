@@ -77,6 +77,18 @@ func buildResultsFilter(q url.Values) (string, []any, int) {
 	if hasSocial := q.Get("has_social"); hasSocial == "true" {
 		where += " AND bl.social_links IS NOT NULL AND bl.social_links::text NOT IN ('{}', '')"
 	}
+	// off_niche default-filtered out so consumer doesn't see polluted rows
+	// (Hotel, AutoDealer, Dentist, ...) unless they explicitly opt in.
+	// `include_off_niche=true` opts in for full view; anything else preserves
+	// the default safe path.
+	if q.Get("include_off_niche") != "true" {
+		where += " AND bl.off_niche IS NOT TRUE"
+	}
+	if niche := q.Get("niche"); niche != "" {
+		where += fmt.Sprintf(" AND bl.niche_category = $%d", argIdx)
+		args = append(args, niche)
+		argIdx++
+	}
 
 	return where, args, argIdx
 }
@@ -169,6 +181,7 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 	// Query 1: Fetch paginated listings (all columns).
 	dataQuery := fmt.Sprintf(`
 		SELECT bl.id, COALESCE(bl.business_name,''), COALESCE(bl.category,''),
+		       COALESCE(bl.niche_category,''), COALESCE(bl.off_niche, FALSE),
 		       COALESCE(bl.description,''), COALESCE(bl.website,''),
 		       bl.domain, bl.url, COALESCE(bl.social_links,'{}'),
 		       COALESCE(bl.address,''), COALESCE(bl.location,''),
@@ -203,7 +216,9 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		var socialLinksJSON []byte
 		var phone string
 		var phones pq.StringArray
-		err := rows.Scan(&l.ID, &l.BusinessName, &l.Category, &l.Description, &l.Website,
+		err := rows.Scan(&l.ID, &l.BusinessName, &l.Category,
+			&l.NicheCategory, &l.OffNiche,
+			&l.Description, &l.Website,
 			&l.Domain, &l.URL, &socialLinksJSON,
 			&l.Address, &l.Location, &l.City, &l.Country, &l.ContactName,
 			&l.OpeningHours, &l.Rating,
@@ -522,7 +537,7 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		w.Header().Set("Content-Disposition", "attachment; filename=results.csv")
-		fmt.Fprintln(w, "id,business_name,category,domain,website,address,location,phone,emails,email_count,valid_email_count,created_at")
+		fmt.Fprintln(w, "id,business_name,category,niche_category,off_niche,domain,website,address,location,phone,emails,email_count,valid_email_count,created_at")
 	} else {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Disposition", "attachment; filename=results.json")
@@ -539,6 +554,7 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 
 		batchQuery := fmt.Sprintf(`
 			SELECT bl.id, COALESCE(bl.business_name,''), COALESCE(bl.category,''),
+			       COALESCE(bl.niche_category,''), COALESCE(bl.off_niche, FALSE),
 			       COALESCE(bl.description,''), COALESCE(bl.website,''),
 			       bl.domain, bl.url, COALESCE(bl.social_links,'{}'),
 			       COALESCE(bl.address,''), COALESCE(bl.location,''),
@@ -565,7 +581,9 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 			var socialLinksJSON []byte
 			var phone string
 			var phones pq.StringArray
-			if err := rows.Scan(&l.ID, &l.BusinessName, &l.Category, &l.Description, &l.Website,
+			if err := rows.Scan(&l.ID, &l.BusinessName, &l.Category,
+				&l.NicheCategory, &l.OffNiche,
+				&l.Description, &l.Website,
 				&l.Domain, &l.URL, &socialLinksJSON,
 				&l.Address, &l.Location, &l.City, &l.Country, &l.ContactName,
 				&l.OpeningHours, &l.Rating,
@@ -640,9 +658,10 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 		// Write batch to output.
 		for _, l := range batch {
 			if format == "csv" {
-				fmt.Fprintf(w, "%d,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%s\n",
+				fmt.Fprintf(w, "%d,%s,%s,%s,%t,%s,%s,%s,%s,%s,%s,%d,%d,%s\n",
 					l.ID,
 					csvEscape(l.BusinessName), csvEscape(l.Category),
+					csvEscape(l.NicheCategory), l.OffNiche,
 					csvEscape(l.Domain), csvEscape(l.Website),
 					csvEscape(l.Address), csvEscape(l.Location),
 					csvEscape(l.Phone),
