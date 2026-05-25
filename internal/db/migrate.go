@@ -262,17 +262,42 @@ func runMigrations(db *sql.DB) error {
 		// trigger below so new rows get tagged at insert time.
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS off_niche BOOLEAN DEFAULT FALSE`,
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_category TEXT`,
-		// Partial index serves the default API path (?include_off_niche=false +
-		// optional ?niche=X). Skipping NULL keeps the index small on the long
-		// tail of rows whose category text didn't match any niche regex.
-		`CREATE INDEX IF NOT EXISTS idx_bl_niche_active ON business_listings(niche_category) WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`,
-		// Separate index for the default-listing path (no niche filter, just
-		// off_niche=false). business_listings(id) PK already covers the
-		// ORDER BY, but the planner can use this partial idx for the WHERE.
-		`CREATE INDEX IF NOT EXISTS idx_bl_off_niche_false ON business_listings(id) WHERE off_niche IS NOT TRUE`,
+		// idx_bl_niche_active + idx_bl_off_niche_false are created BELOW with
+		// CONCURRENTLY (auditor P1 fix): plain CREATE INDEX takes ShareLock on
+		// business_listings (779K rows), and with 7 deploy containers racing
+		// db.Migrate() against PG_MAX_OPEN_CONNS=2 the lock contention saturates
+		// the pool. CONCURRENTLY uses ShareUpdateExclusiveLock instead, which
+		// doesn't block concurrent writes. Cannot live inside this batch since
+		// CONCURRENTLY is illegal inside a transaction block.
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
+		}
+	}
+
+	// Niche indexes — created CONCURRENTLY outside any tx (CLAUDE.md /
+	// CONCURRENTLY is illegal inside a tx block).
+	//
+	//   idx_bl_niche_active   — serves ?include_off_niche=false + ?niche=X.
+	//                            Skips NULL niche_category to keep idx small
+	//                            on the long tail of unclassified rows.
+	//   idx_bl_off_niche_false — serves the default-listing path (no niche
+	//                            filter, just off_niche=false). PK already
+	//                            covers ORDER BY bl.id, this partial idx
+	//                            backs the WHERE predicate.
+	//
+	// Failure handling: CONCURRENTLY can race with parallel deploys; one of
+	// the 7 containers will succeed, the rest will see IF NOT EXISTS and skip.
+	// We log+continue on error rather than failing the entire migration, since
+	// the partial idx is an optimization, not a correctness requirement (the
+	// planner falls back to PK scan + filter, slower but correct).
+	for _, stmt := range []string{
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_niche_active ON business_listings(niche_category) WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_off_niche_false ON business_listings(id) WHERE off_niche IS NOT TRUE`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("db: niche index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
+				"stmt", stmt, "error", err)
 		}
 	}
 
