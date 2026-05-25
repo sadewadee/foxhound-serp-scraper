@@ -1,10 +1,11 @@
 # docker-compose.yaml — Production deployment
 #
 # Scaling:
-#   SERP_WORKER_COUNT=2     → 2 SERP containers
-#   ENRICH_WORKER_COUNT=4   → 4 Enrich containers
-#   SERP_CONCURRENCY=4      → 4 browser tabs per SERP container
-#   ENRICH_CONCURRENCY=20   → 20 concurrent fetchers per Enrich container
+#   SERP_WORKER_COUNT=2       → 2 SERP containers
+#   ENRICH_WORKER_COUNT=2     → 2 Enrich containers
+#   REENRICH_WORKER_COUNT=3   → 3 Reenrich containers × 3 goroutines = 9 reenrich workers
+#   SERP_CONCURRENCY=4        → 4 browser tabs per SERP container
+#   ENRICH_CONCURRENCY=20     → 20 concurrent fetchers per Enrich container
 
 services:
 
@@ -220,7 +221,7 @@ services:
       - scraper-network
     deploy:
       mode: replicated
-      replicas: ${ENRICH_WORKER_COUNT:-4}
+      replicas: ${ENRICH_WORKER_COUNT:-2}
       resources:
         limits:
           cpus: "1"
@@ -256,10 +257,10 @@ services:
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       BETA_FEATURES: "${BETA_FEATURES:-0}"
       TZ: "${TZ:-Asia/Jakarta}"
-      REENRICH_WORKER_COUNT: "${REENRICH_WORKER_COUNT:-1}"
+      REENRICH_WORKER_COUNT: "${REENRICH_WORKER_COUNT:-3}"
       REENRICH_SCORE: "${REENRICH_SCORE:-90}"
     shm_size: "512mb"
-    command: ["run", "-stage", "reenrich", "-workers", "${REENRICH_WORKER_COUNT:-1}"]
+    command: ["run", "-stage", "reenrich", "-workers", "${REENRICH_WORKER_COUNT:-3}"]
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/worker-healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/worker-healthy) )) -lt 120"]
       interval: 30s
@@ -270,7 +271,7 @@ services:
       - scraper-network
     deploy:
       mode: replicated
-      replicas: ${REENRICH_WORKER_COUNT:-1}
+      replicas: ${REENRICH_WORKER_COUNT:-3}
       resources:
         limits:
           cpus: "1"

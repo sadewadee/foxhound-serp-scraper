@@ -2,80 +2,24 @@ package api
 
 import (
 	"context"
-	"crypto/sha1"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	pq "github.com/lib/pq"
 )
 
-// resultsCountTTL is the Redis cache window for filtered COUNT(*) results.
-// Polling clients re-hit the same filter combo within this window for free.
+// resultsCountTTL is the cache TTL for filtered COUNT(*) on business_listings.
 const resultsCountTTL = 60 * time.Second
 
-// cachedFilteredCount returns COUNT(*) for the given WHERE+args, served from
-// Redis when fresh. On query timeout/error, returns (-1, err) so the caller can
-// still serve the page with a "many" sentinel instead of HTTP 500.
-//
-// Cache key shape: "v2:count:<sha1(where|args)>" — args serialized via fmt to
-// keep numbers/strings/timestamps stable across calls.
+// cachedFilteredCount is the existing call signature, now thin wrapper over cachedCount.
 func (s *Server) cachedFilteredCount(ctx context.Context, where string, args []any) (int, error) {
-	key := buildCountCacheKey(where, args)
-
-	if s.redis != nil {
-		if v, err := s.redis.Get(ctx, key).Result(); err == nil {
-			if n, perr := strconv.Atoi(v); perr == nil {
-				return n, nil
-			}
-		}
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return -1, err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '12000'"); err != nil {
-		return -1, err
-	}
-
-	var total int
-	q := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
-	if err := tx.QueryRowContext(ctx, q, args...).Scan(&total); err != nil {
-		return -1, err
-	}
-	if err := tx.Commit(); err != nil {
-		// Commit failure means the COUNT result may be from a tx that did not
-		// fully reconcile — never cache it and signal the caller to skip.
-		return -1, err
-	}
-
-	if s.redis != nil {
-		// Best-effort SETEX; cache miss isn't worth failing the request over.
-		_ = s.redis.Set(ctx, key, strconv.Itoa(total), resultsCountTTL).Err()
-	}
-	return total, nil
-}
-
-// buildCountCacheKey hashes WHERE + args into a stable Redis key. Args are
-// formatted with %q so adjacent string values cannot transpose into the same
-// byte stream (e.g. ["a","bc"] and ["ab","c"] used to collide under %v).
-func buildCountCacheKey(where string, args []any) string {
-	h := sha1.New()
-	h.Write([]byte(where))
-	for _, a := range args {
-		fmt.Fprintf(h, "|%q|", a)
-	}
-	return "v2:count:" + hex.EncodeToString(h.Sum(nil))
+	return s.cachedCount(ctx, "business_listings bl", where, args, resultsCountTTL, 12*time.Second)
 }
 
 // buildResultsFilter builds a WHERE clause + args from query parameters.
@@ -133,11 +77,45 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 
 	where, args, argIdx := buildResultsFilter(q)
 
-	// Count total via Redis-cached helper. On timeout/error the helper returns -1
+	// Cursor mode (?cursor=base64): keyset pagination — O(log N) at any depth
+	// via the existing bl.id PK index. Skips COUNT entirely and returns
+	// {next_cursor, has_more} instead of a total. Detected by presence of the
+	// cursor param; if absent we fall through to the existing OFFSET path so
+	// existing consumers keep working unchanged.
+	cursorParam := q.Get("cursor")
+	useCursor := cursorParam != ""
+
+	if useCursor {
+		cursorID, derr := decodeCursor(cursorParam)
+		if derr != nil {
+			writeV2Error(w, http.StatusBadRequest, "invalid_cursor", "cursor is malformed")
+			return
+		}
+		dir := q.Get("cursor_dir")
+		if dir == "prev" {
+			where += fmt.Sprintf(" AND bl.id > $%d", argIdx)
+		} else {
+			where += fmt.Sprintf(" AND bl.id < $%d", argIdx)
+		}
+		args = append(args, cursorID)
+		argIdx++
+	}
+
+	// Count only applies in OFFSET mode. On timeout/error the helper returns -1
 	// so we serve the page with a sentinel instead of 500.
-	total, err := s.cachedFilteredCount(ctx, where, args)
-	if err != nil {
-		slog.Warn("v2: count failed (returning -1 sentinel)", "error", err)
+	var total int
+	if !useCursor {
+		var err error
+		total, err = s.cachedFilteredCount(ctx, where, args)
+		if err != nil {
+			slog.Warn("v2: count failed (returning -1 sentinel)", "error", err)
+		}
+	}
+
+	// Cursor mode fetches perPage+1 to detect has_more without a second query.
+	limit := perPage
+	if useCursor {
+		limit = perPage + 1
 	}
 
 	// Query 1: Fetch paginated listings (all columns).
@@ -153,9 +131,14 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		       bl.source_query_id, bl.created_at, bl.updated_at
 		FROM business_listings bl %s
 		ORDER BY bl.id DESC
-		LIMIT $%d OFFSET $%d
-	`, where, argIdx, argIdx+1)
-	args = append(args, perPage, offset)
+		LIMIT $%d`, where, argIdx)
+	args = append(args, limit)
+	argIdx++
+
+	if !useCursor {
+		dataQuery += fmt.Sprintf(" OFFSET $%d", argIdx)
+		args = append(args, offset)
+	}
 
 	rows, err := s.db.QueryContext(ctx, dataQuery, args...)
 	if err != nil {
@@ -198,6 +181,15 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		l.Phone = phone
 		listings = append(listings, l)
 		listingIDs = append(listingIDs, l.ID)
+	}
+
+	// Cursor mode: detect has_more via the sentinel row, then trim it BEFORE
+	// the email batch fetch so we don't waste a query on a row we're dropping.
+	hasMore := false
+	if useCursor && len(listings) > perPage {
+		hasMore = true
+		listings = listings[:perPage]
+		listingIDs = listingIDs[:perPage]
 	}
 
 	// Query 2: Batch-fetch ALL email columns for those listing IDs.
@@ -255,6 +247,23 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 
 	if listings == nil {
 		listings = []V2BusinessListing{}
+	}
+
+	if useCursor {
+		// Cursor envelope: explicit fields instead of pagination meta. Skip
+		// writeV2Single because that wraps in "data" and we also need
+		// next_cursor + has_more at the same level as the JSON-RPC-ish v2 style.
+		var nextCursor string
+		if hasMore && len(listings) > 0 {
+			nextCursor = encodeCursor(listings[len(listings)-1].ID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data":        listings,
+			"next_cursor": nextCursor,
+			"has_more":    hasMore,
+		})
+		return
 	}
 
 	writeV2Paginated(w, listings, total, page, perPage)

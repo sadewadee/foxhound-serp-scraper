@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -98,7 +99,7 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 		}
 
 		contacts = append(contacts, map[string]any{
-			"id": id,
+			"id":            id,
 			"business_name": businessName, "business_category": category,
 			"description": description, "website": website,
 			"emails": emails, "phones": phones, "domain": domain,
@@ -198,29 +199,62 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 			"business_name": businessName, "business_category": category,
 			"website": website, "emails": emails, "domain": domain,
 			"social_links": json.RawMessage(socialLinksJSON),
-			"address": address, "location": location, "phone": phone,
+			"address":      address, "location": location, "phone": phone,
 		})
 	}
 	w.Write([]byte("]"))
 }
 
 func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
+	// 10s budget — must exceed the 8s statement_timeout below.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
 	var totalBiz, withEmail, uniqueDomains, totalEmails, lastHour, last24h int
 	var validEmails, pendingEmails, invalidEmails int
 
-	s.db.QueryRow("SELECT COUNT(*) FROM business_listings").Scan(&totalBiz)
-	s.db.QueryRow("SELECT COUNT(DISTINCT bl.id) FROM business_listings bl JOIN business_emails be ON be.business_id = bl.id").Scan(&withEmail)
-	s.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM business_listings").Scan(&uniqueDomains)
-	s.db.QueryRow("SELECT COUNT(*) FROM emails").Scan(&totalEmails)
-	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
-	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
-	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE validation_status = 'valid'").Scan(&validEmails)
-	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE validation_status = 'pending'").Scan(&pendingEmails)
-	s.db.QueryRow("SELECT COUNT(*) FROM emails WHERE validation_status = 'invalid'").Scan(&invalidEmails)
+	// 9 serial QueryRow on a 2-conn pool was the cascade root: 1 slow query
+	// held both pool conns ~40s and v2 endpoints saw 500 with context deadline.
+	// Fold into 3 queries (business, email, providers) inside one tx with
+	// statement_timeout to bound the damage on the pool.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("v1: contact-stats tx error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '8000'"); err != nil {
+		slog.Error("v1: contact-stats set timeout error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	// Business listings: 2 aggregates in 1 pass.
+	tx.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COUNT(DISTINCT domain)
+		FROM business_listings
+	`).Scan(&totalBiz, &uniqueDomains)
+
+	// with_email needs a join; separate query (still inside tx).
+	tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT business_id) FROM business_emails`).Scan(&withEmail)
+
+	// Emails: 6 aggregates in 1 pass.
+	tx.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE validation_status = 'valid'),
+		       COUNT(*) FILTER (WHERE validation_status = 'pending'),
+		       COUNT(*) FILTER (WHERE validation_status = 'invalid'),
+		       COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour'),
+		       COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')
+		FROM emails
+	`).Scan(&totalEmails, &validEmails, &pendingEmails, &invalidEmails, &lastHour, &last24h)
 
 	// Top email providers.
 	providers := map[string]int{}
-	providerRows, _ := s.db.Query(`
+	providerRows, _ := tx.QueryContext(ctx, `
 		SELECT domain, COUNT(*) AS cnt
 		FROM emails
 		GROUP BY domain
@@ -228,14 +262,16 @@ func (s *Server) handleContactStats(w http.ResponseWriter, r *http.Request) {
 		LIMIT 10
 	`)
 	if providerRows != nil {
-		defer providerRows.Close()
 		for providerRows.Next() {
 			var provider string
 			var cnt int
 			providerRows.Scan(&provider, &cnt)
 			providers[provider] = cnt
 		}
+		providerRows.Close()
 	}
+
+	tx.Commit()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"total":          totalBiz,
