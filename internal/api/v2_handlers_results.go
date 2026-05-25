@@ -537,7 +537,7 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		w.Header().Set("Content-Disposition", "attachment; filename=results.csv")
-		fmt.Fprintln(w, "id,business_name,category,domain,website,address,location,phone,emails,email_count,valid_email_count,created_at")
+		fmt.Fprintln(w, "id,business_name,category,niche_category,off_niche,domain,website,address,location,phone,emails,email_count,valid_email_count,created_at")
 	} else {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Disposition", "attachment; filename=results.json")
@@ -658,9 +658,10 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 		// Write batch to output.
 		for _, l := range batch {
 			if format == "csv" {
-				fmt.Fprintf(w, "%d,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%s\n",
+				fmt.Fprintf(w, "%d,%s,%s,%s,%t,%s,%s,%s,%s,%s,%s,%d,%d,%s\n",
 					l.ID,
 					csvEscape(l.BusinessName), csvEscape(l.Category),
+					csvEscape(l.NicheCategory), l.OffNiche,
 					csvEscape(l.Domain), csvEscape(l.Website),
 					csvEscape(l.Address), csvEscape(l.Location),
 					csvEscape(l.Phone),

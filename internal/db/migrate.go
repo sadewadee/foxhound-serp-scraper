@@ -344,7 +344,7 @@ func runMigrations(db *sql.DB) error {
 		            'RealEstateAgent','LegalService','HairSalon','BeautySalon',
 		            'TravelAgency','LodgingBusiness','GeneralContractor',
 		            'RoofingContractor','HomeAndConstructionBusiness',
-		            'MedicalClinic','MedicalBusiness'
+		            'MedicalClinic','MedicalBusiness','HealthAndBeautyBusiness'
 		          ) THEN TRUE
 		          ELSE FALSE
 		        END,
@@ -1193,13 +1193,22 @@ func runMigrations(db *sql.DB) error {
 		// log how many rows the migration is about to flag, broken down by
 		// reason. No mutation yet — if the numbers look wrong, the operator
 		// can stop the container before STEPS B-D run.
+		// Wrapped in tx + statement_timeout per CLAUDE.md Invariant #2 —
+		// business_listings is 779K rows; a slow COUNT during deploy-restart
+		// autovacuum can stall both pool conns and starve the API.
 		var explicitOff, metaSoup int
-		_ = db.QueryRow(
-			`SELECT COUNT(*) FROM business_listings WHERE category IN (` + offNicheTypes + `) AND off_niche IS NOT TRUE`,
-		).Scan(&explicitOff)
-		_ = db.QueryRow(
-			`SELECT COUNT(*) FROM business_listings WHERE LENGTH(category) > 100 AND off_niche IS NOT TRUE`,
-		).Scan(&metaSoup)
+		if preTx, ptxErr := db.Begin(); ptxErr != nil {
+			slog.Warn("db: off-niche cleanup PRE-COUNT tx begin failed", "error", ptxErr)
+		} else {
+			preTx.Exec(`SET LOCAL statement_timeout = '5000'`) //nolint:errcheck — advisory
+			_ = preTx.QueryRow(
+				`SELECT COUNT(*) FROM business_listings WHERE category IN (` + offNicheTypes + `) AND off_niche IS NOT TRUE`,
+			).Scan(&explicitOff)
+			_ = preTx.QueryRow(
+				`SELECT COUNT(*) FROM business_listings WHERE LENGTH(category) > 100 AND off_niche IS NOT TRUE`,
+			).Scan(&metaSoup)
+			preTx.Rollback() //nolint:errcheck — read-only, nothing to commit
+		}
 		slog.Info("db: off-niche cleanup pre-count",
 			"explicit_off_niche_to_flag", explicitOff,
 			"meta_keyword_soup_to_flag", metaSoup,
@@ -1329,11 +1338,22 @@ func runMigrations(db *sql.DB) error {
 			}
 		}
 
-		// STEP E — VERIFY.
+		// STEP E — VERIFY. Wrapped in tx + statement_timeout per CLAUDE.md
+		// Invariant #2 (same reason as PRE-COUNT above). The partial indexes
+		// idx_bl_niche_active + idx_bl_off_niche_false back these COUNTs so
+		// the planner should pick index-only scans, but the timeout is the
+		// safety net for cases where the planner picks a seqscan instead
+		// (e.g. statistics not yet refreshed after the bulk UPDATEs above).
 		var finalOffNiche, finalClassified, finalUnclassified int
-		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS TRUE`).Scan(&finalOffNiche)
-		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`).Scan(&finalClassified)
-		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS NOT TRUE AND niche_category IS NULL`).Scan(&finalUnclassified)
+		if vTx, vtxErr := db.Begin(); vtxErr != nil {
+			slog.Warn("db: off-niche cleanup VERIFY tx begin failed", "error", vtxErr)
+		} else {
+			vTx.Exec(`SET LOCAL statement_timeout = '5000'`) //nolint:errcheck — advisory
+			_ = vTx.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS TRUE`).Scan(&finalOffNiche)
+			_ = vTx.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`).Scan(&finalClassified)
+			_ = vTx.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS NOT TRUE AND niche_category IS NULL`).Scan(&finalUnclassified)
+			vTx.Rollback() //nolint:errcheck — read-only, nothing to commit
+		}
 		slog.Info("db: off-niche cleanup VERIFY",
 			"total_off_niche", finalOffNiche,
 			"total_in_niche_classified", finalClassified,
