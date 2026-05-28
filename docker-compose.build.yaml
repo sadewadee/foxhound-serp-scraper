@@ -1,46 +1,25 @@
-# Build-only compose for kurama. Builds the image then pushes it to the
-# self-hosted kremlit registry (ghcr.mcpke.dev) so the production serp
-# stack can pull it.
+# Build-only compose for kurama. Builds the image and tags it for the kremlit
+# registry. The push is done MANUALLY (not here) because the Traefik ingress in
+# front of ghcr.mcpke.dev kills large blob uploads at ~60s ("client disconnected"
+# 500 → docker retries forever). Proven push path instead:
+#   kurama: docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.2-niche | gzip
+#         | ssh (via Mac) hachibi: docker load
+#   hachibi: docker tag …:v0.8.2-niche localhost:32769/foxhound-serp-scraper:v0.8.2-niche
+#          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
 #
-# Usage (on kurama, or via the Dokploy build target serp-build-v071fix):
-#   git fetch origin && git checkout feat/api-niche-classifier
-#   export KREMLIT_USER=docker KREMLIT_PASS=<registry password>
-#   docker compose -f docker-compose.build.yaml up --abort-on-container-exit
+# Tag produced (foxhound v0.0.22 — TLS-renegotiation-panic-free, niche feature):
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.2-niche
 #
-# Tag produced:
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche
-#
-# After a successful push, deploy by setting IMAGE_TAG=v0.8.1-niche on the
-# serp stack and redeploying via Dokploy (pull_policy: always picks it up).
-# v0.8.1-niche is immutable — it does not overwrite :v0.7.1 or :v0.8.0-canary.
+# Deploy: set IMAGE_TAG=v0.8.2-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche
-    # Override Dockerfile ENTRYPOINT so the container exits 0 once the
-    # image is built (we're not running the binary here, just producing
-    # the image layer set).
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.2-niche
+    # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
+    # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
     command: ["true"]
-    restart: "no"
-
-  pusher:
-    image: docker:24-cli
-    depends_on:
-      builder:
-        condition: service_completed_successfully
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      KREMLIT_USER: ${KREMLIT_USER}
-      KREMLIT_PASS: ${KREMLIT_PASS}
-    command: >
-      sh -c "
-      echo \"$$KREMLIT_PASS\" | docker login ghcr.mcpke.dev -u \"$$KREMLIT_USER\" --password-stdin &&
-      docker push ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche &&
-      echo 'PUSH COMPLETE: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.1-niche'
-      "
     restart: "no"
