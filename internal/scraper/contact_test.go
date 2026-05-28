@@ -28,14 +28,23 @@ func TestTailParseCountry(t *testing.T) {
 		{"trailing punct", "1 Main St, Indonesia.", "ID"},
 		{"trailing space", "1 Main St, Indonesia ", "ID"},
 
-		// Must NOT match — state codes & junk.
-		{"US state CA alone", "1 Infinite Loop, Cupertino, CA 95014", ""},
+		// US state + ZIP → US (issue #26 policy: state+ZIP is an unambiguous
+		// US signal; previously these were left empty, the dominant empty class).
+		{"US state CA + zip", "1 Infinite Loop, Cupertino, CA 95014", "US"},
+		{"state TX + zip combined", "TX 77489", "US"},
+		{"US full state name + zip", "5251 Westheimer Rd, Houston, Texas, 77056", "US"},
+		{"US PA + zip", "3535 Pine Avenue, Erie, PA 16504", "US"},
+		{"US IA + zip", "105 E. 9th St., Coralville, IA 52241", "US"},
+		{"US CA comma zip", "17592 Irvine Blvd, Tustin, CA, 92780", "US"},
+
+		// Must NOT match — state code without ZIP, junk, non-US postal-first.
 		{"US state NC alone", "Foo, Flat Rock, NC", ""},
 		{"no comma cvsf.nl style", "Compagnonsplein 1", ""},
 		{"empty", "", ""},
 		{"single token", "FooBar", ""},
 		{"only zip", "12345", ""},
-		{"state with zip combined token", "TX 77489", ""},
+		{"german postal-first not US", "Altmarkt, 01067 Dresden", ""},
+		{"french postal not US", "7 Rue Linois, Paris, 75015", ""},
 
 		// Tail-walk: country deeper than last token.
 		{"country before postal token", "1 Main St, Jakarta, Indonesia, 12345", "ID"},
@@ -62,7 +71,9 @@ func TestTailParseCountry(t *testing.T) {
 
 		// Word-slice must NOT create false positives mid-segment.
 		{"usa drive false positive guard", "1 USA Drive, Some City", ""},
-		{"africa street guard", "South Africa Street, Boston, MA, 02134", ""},
+		// "South Africa Street" must not match ZA — but MA + 02134 IS US, so
+		// the correct answer is US (street-name guard still holds: not ZA).
+		{"africa street guard not ZA but US via MA zip", "South Africa Street, Boston, MA, 02134", "US"},
 
 		// Sprint 6: collision heuristic for ID/IL/IN (Indonesia/Israel/India vs
 		// Idaho/Illinois/Indiana). ACCEPT when non-US shape; REJECT when US.
@@ -71,11 +82,15 @@ func TestTailParseCountry(t *testing.T) {
 		{"israel IL with 7-digit postal", "21 Abba Hillel Silver Rd, Ramat Gan, 5252213, IL", "IL"},
 		{"india IN with 6-digit PIN", "Manjalikulam Rd, Thiruvananthapuram, 695001, IN", "IN"},
 		{"india IN mumbai PIN", "Some St, Mumbai, 400001, IN", "IN"},
-		{"reject IL when illinois city explicit", "1 Main St, Chicago, IL, 60601", ""},
-		{"reject IN when NY state code preceding", "1 Main St, NY 12345, IN", ""},
-		{"reject ID with idaho full name", "Some St, Idaho, 83001, ID", ""},
-		{"reject IL with illinois full name", "Some St, Illinois, 60601, IL", ""},
-		{"reject IN with indiana full name", "Some St, Indiana, 46001, IN", ""},
+		// IL/IN here are US states with ZIPs → US (not Israel/India). The
+		// collision rescue correctly declines; the state+ZIP fallback tags US.
+		{"chicago IL + zip is US not israel", "1 Main St, Chicago, IL, 60601", "US"},
+		{"NY zip is US not india", "1 Main St, NY 12345, IN", "US"},
+		// Idaho/Illinois/Indiana + ZIP → US (the state-name+ZIP is a real US
+		// address; "ID"/"IL"/"IN" here are the state abbrevs, not country codes).
+		{"idaho full name + zip is US", "Some St, Idaho, 83001, ID", "US"},
+		{"illinois full name + zip is US", "Some St, Illinois, 60601, IL", "US"},
+		{"indiana full name + zip is US", "Some St, Indiana, 46001, IN", "US"},
 		{"reject ID no preceding postal", "Some Address, ID", ""},
 		{"reject ID non-numeric preceding", "Some St, City Name, ID", ""},
 		{"reject ID too-few-digit preceding", "Some St, 123, ID", ""},

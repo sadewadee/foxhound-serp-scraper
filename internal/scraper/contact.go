@@ -561,6 +561,47 @@ var usStateFullNames = map[string]bool{
 	"wisconsin": true, "wyoming": true,
 }
 
+// usStateZipRe finds a US "<2-letter token> <ZIP5>" / "<2-letter>, <ZIP5>"
+// marker anywhere in an address. Group 1 (the 2-letter token) is validated
+// against usStateCodes by the caller — the regex alone is intentionally loose
+// so the state-set is the single source of truth. ZIP is exactly 5 digits
+// (US format), optional +4. Non-US postal formats put the postal code FIRST
+// ("01067 Dresden") or use 3-letter/alphanumeric region codes ("NSW 2000",
+// "ON M5J 1V6"), so this shape is dominated by real US addresses.
+var usStateZipRe = regexp.MustCompile(`(?:^|[\s,])([A-Za-z]{2})[\s,]+(\d{5})(?:-\d{4})?(?:[\s,]|$)`)
+
+// usFullStateZipRe finds "<single-word state name> <ZIP5>" (e.g. "Texas 77056",
+// "Texas, 77056") — the full-name analogue of usStateZipRe. Built from
+// usStateFullNames so the name-set stays the single source of truth.
+var usFullStateZipRe = func() *regexp.Regexp {
+	names := make([]string, 0, len(usStateFullNames))
+	for n := range usStateFullNames {
+		names = append(names, n)
+	}
+	return regexp.MustCompile(`(?i)\b(` + strings.Join(names, "|") + `)\b[\s,]+\d{5}(?:-\d{4})?\b`)
+}()
+
+// inferUSFromStateZip returns true when the address carries a US state+ZIP
+// marker — a 2-letter US state code OR a single-word US state name immediately
+// followed by a 5-digit ZIP. This is a high-precision US signal that recovers
+// the large class of scraped US addresses omitting an explicit "USA"/"United
+// States" token (issue #26: e.g. "Houston, Texas, 77056", "Erie, PA 16504").
+// Output is always the validated ISO code "US", so it never pollutes the
+// country column. Used as a last-resort fallback in tailParseCountry, AFTER
+// the explicit-country tail walk and the ID/IL/IN collision rescue, so a
+// genuine trailing country name (incl. India/Israel/Indonesia) still wins.
+func inferUSFromStateZip(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	for _, m := range usStateZipRe.FindAllStringSubmatch(addr, -1) {
+		if usStateCodes[strings.ToUpper(m[1])] {
+			return true
+		}
+	}
+	return usFullStateZipRe.MatchString(addr)
+}
+
 // tailParseCountry walks the comma-separated tokens of an address from the
 // tail backward and returns the first token that resolves via normalizeCountry
 // to a non-empty ISO alpha-2 code. Used as a fallback when JSON-LD did not
@@ -622,6 +663,12 @@ func tailParseCountry(addr string) string {
 				return iso
 			}
 		}
+	}
+	// Last resort: no explicit country token anywhere, but a US state+ZIP
+	// marker ("city, ST 12345" / "city, Texas, 12345") is an unambiguous US
+	// signal. Recovers the dominant empty-country class (issue #26).
+	if inferUSFromStateZip(addr) {
+		return "US"
 	}
 	return ""
 }
