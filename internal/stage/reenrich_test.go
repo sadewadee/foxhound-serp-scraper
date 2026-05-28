@@ -211,3 +211,32 @@ func TestReaperSweepSQL_Shape(t *testing.T) {
 		}
 	}
 }
+
+// TestEligibilityQuery_NoOrderByRandom guards the issue-#28 regression: the
+// reenrich eligibility query MUST NOT use ORDER BY RANDOM(). Sorting the whole
+// re_enriched_at IS NULL pool (~340K rows) by random() forced a full index
+// scan + sort and blew the 5s statement_timeout on every loop, stalling the
+// worker at ~88 rows/hr. Without the sort, LIMIT short-circuits the scan after
+// the first batch of eligible rows (~4ms measured on prod). This test inspects
+// the actual SQL the worker runs (package-level eligibilityQuery), not a copy.
+func TestEligibilityQuery_NoOrderByRandom(t *testing.T) {
+	if strings.Contains(strings.ToUpper(eligibilityQuery), "ORDER BY RANDOM") {
+		t.Error("eligibilityQuery contains ORDER BY RANDOM() — reintroduces the issue-#28 stall (full scan+sort blows the 5s statement_timeout). Rely on LIMIT + FOR UPDATE SKIP LOCKED instead.")
+	}
+
+	// The clauses that keep the query both correct and able to short-circuit.
+	required := []struct {
+		clause string
+		why    string
+	}{
+		{"re_enriched_at IS NULL", "candidate set must be unprocessed rows only"},
+		{"COALESCE(bl.re_enrich_attempts, 0) < $3", "retry cap stops genuinely-broken sites from cycling"},
+		{"LIMIT $2", "bounds the batch and lets the index scan short-circuit"},
+		{"FOR UPDATE OF bl SKIP LOCKED", "multi-worker safety + distributes work without random ordering"},
+	}
+	for _, c := range required {
+		if !strings.Contains(eligibilityQuery, c.clause) {
+			t.Errorf("eligibilityQuery missing clause %q — %s", c.clause, c.why)
+		}
+	}
+}
