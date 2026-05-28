@@ -4,10 +4,11 @@ go 1.25.0
 
 require (
 	github.com/PuerkitoBio/goquery v1.12.0
+	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/lib/pq v1.11.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0
-	github.com/sadewadee/foxhound v0.0.22
+	github.com/sadewadee/foxhound v0.0.27
 	golang.org/x/net v0.52.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -19,7 +20,6 @@ require (
 	github.com/Noooste/uquic-go v1.0.5 // indirect
 	github.com/Noooste/utls v1.3.20 // indirect
 	github.com/Noooste/websocket v1.0.3 // indirect
-	github.com/alicebob/miniredis/v2 v2.38.0 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/bdandy/go-errors v1.2.2 // indirect
