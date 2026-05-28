@@ -66,9 +66,10 @@ type reenrichRow struct {
 // Run starts numWorkers goroutines each running the continuous re-enrich loop
 // plus one lock-reaper goroutine that deterministically releases stale claims.
 // The reaper exists because the worker's eligibility-query stale-claim recovery
-// is probabilistic (ORDER BY RANDOM over a 261K-row pool) — a row's specific
-// stale lock has 0.04% chance of being re-picked per batch, so rows stuck for
-// hours/days accumulate. The reaper closes that gap with a deterministic sweep.
+// is best-effort: the query scans re_enriched_at IS NULL rows in index order
+// and stops at the first LIMIT eligible rows, so a stale lock deep in the pool
+// may not resurface for a long time. Rows stuck for hours/days would otherwise
+// accumulate; the reaper closes that gap with a deterministic sweep.
 func (r *ReenrichStage) Run(ctx context.Context) error {
 	numWorkers := r.cfg.ReenrichWorkerCount
 	if numWorkers < 1 {
@@ -179,6 +180,69 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 // anti-pattern (zero-reset retry) caused the 2026-04-06 pipeline deadlock.
 const reenrichMaxAttempts = 10
 
+// eligibilityQuery is the exact SQL fetchEligibleBatch runs, lifted to package
+// scope so TestEligibilityQuery_NoOrderByRandom can guard against the ORDER BY
+// RANDOM() regression that stalled the reenrich worker (issue #28).
+const eligibilityQuery = `
+		WITH eligible AS (
+			SELECT bl.id
+			FROM business_listings bl
+			WHERE re_enriched_at IS NULL
+			  AND (re_enrich_locked_at IS NULL
+			       OR re_enrich_locked_at < NOW() - INTERVAL '15 minutes')
+			  AND COALESCE(bl.re_enrich_attempts, 0) < $3
+			  AND (
+				CASE WHEN EXISTS(
+					SELECT 1 FROM business_emails be
+					JOIN emails e ON e.id = be.email_id
+					WHERE be.business_id = bl.id
+					  AND (e.is_acceptable = true OR e.score >= 0.7)
+				) THEN 40 ELSE 0 END
+				+
+				CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
+					OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0)
+				THEN 20 ELSE 0 END
+				+
+				CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
+					AND (bl.category IS NOT NULL AND bl.category != '')
+				THEN 15 ELSE 0 END
+				+
+				CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
+					OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != ''))
+				THEN 15 ELSE 0 END
+				+
+				CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb
+				THEN 10 ELSE 0 END
+			  ) < $1
+			-- Deliberately NOT randomly ordered: a random sort over the whole
+			-- eligible pool forced a full index scan + sort of every
+			-- re_enriched_at IS NULL row (~340K), so the SELECT blew the 5s
+			-- statement_timeout on every loop and the worker claimed ~0 rows
+			-- (issue #28 — reenrich stalled at ~88 rows/hr). Index-order scan +
+			-- LIMIT short-circuits after the first $2 eligible rows (~4ms on
+			-- prod). Work is still spread across workers/iterations by FOR UPDATE
+			-- OF bl SKIP LOCKED plus the 15-min re_enrich_locked_at window, which
+			-- advances the scan as claimed rows drop out of the candidate set.
+			LIMIT $2
+			FOR UPDATE OF bl SKIP LOCKED
+		)
+		UPDATE business_listings bl
+		SET re_enrich_locked_at = NOW(),
+		    re_enrich_attempts  = COALESCE(bl.re_enrich_attempts, 0) + 1
+		FROM eligible
+		WHERE bl.id = eligible.id
+		RETURNING
+			bl.id,
+			bl.domain,
+			COALESCE(bl.website, 'https://' || bl.domain),
+			bl.address,
+			bl.country,
+			bl.city,
+			(SELECT COUNT(*) FROM business_emails be WHERE be.business_id = bl.id),
+			(CASE WHEN bl.phone IS NOT NULL AND bl.phone != '' THEN 1 ELSE 0 END
+			 + COALESCE(array_length(bl.phones, 1), 0))
+	`
+
 // fetchEligibleBatch atomically claims up to limit business_listings rows.
 //
 // Multi-worker correctness: uses CTE with FOR UPDATE OF bl SKIP LOCKED to
@@ -210,57 +274,7 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	const q = `
-		WITH eligible AS (
-			SELECT bl.id
-			FROM business_listings bl
-			WHERE re_enriched_at IS NULL
-			  AND (re_enrich_locked_at IS NULL
-			       OR re_enrich_locked_at < NOW() - INTERVAL '15 minutes')
-			  AND COALESCE(bl.re_enrich_attempts, 0) < $3
-			  AND (
-				CASE WHEN EXISTS(
-					SELECT 1 FROM business_emails be
-					JOIN emails e ON e.id = be.email_id
-					WHERE be.business_id = bl.id
-					  AND (e.is_acceptable = true OR e.score >= 0.7)
-				) THEN 40 ELSE 0 END
-				+
-				CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
-					OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0)
-				THEN 20 ELSE 0 END
-				+
-				CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
-					AND (bl.category IS NOT NULL AND bl.category != '')
-				THEN 15 ELSE 0 END
-				+
-				CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
-					OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != ''))
-				THEN 15 ELSE 0 END
-				+
-				CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb
-				THEN 10 ELSE 0 END
-			  ) < $1
-			ORDER BY RANDOM()
-			LIMIT $2
-			FOR UPDATE OF bl SKIP LOCKED
-		)
-		UPDATE business_listings bl
-		SET re_enrich_locked_at = NOW(),
-		    re_enrich_attempts  = COALESCE(bl.re_enrich_attempts, 0) + 1
-		FROM eligible
-		WHERE bl.id = eligible.id
-		RETURNING
-			bl.id,
-			bl.domain,
-			COALESCE(bl.website, 'https://' || bl.domain),
-			bl.address,
-			bl.country,
-			bl.city,
-			(SELECT COUNT(*) FROM business_emails be WHERE be.business_id = bl.id),
-			(CASE WHEN bl.phone IS NOT NULL AND bl.phone != '' THEN 1 ELSE 0 END
-			 + COALESCE(array_length(bl.phones, 1), 0))
-	`
+	const q = eligibilityQuery
 
 	tx, err := r.db.BeginTx(queryCtx, nil)
 	if err != nil {
@@ -510,9 +524,10 @@ func (r *ReenrichStage) releaseLock(ctx context.Context, id int64) {
 }
 
 // lockReaper releases stale re_enrich_locked_at claims deterministically on
-// a 5-minute tick. Without this, the probabilistic ORDER BY RANDOM eligibility
-// query rarely re-rolls specific stuck rows — production audit (2026-05-12)
-// found 708 rows stale-locked, oldest 3 days. The reaper closes that gap.
+// a 5-minute tick. Without this, the eligibility query (which scans in index
+// order and stops at the LIMIT) may not revisit specific stuck rows for a long
+// time — production audit (2026-05-12) found 708 rows stale-locked, oldest 3
+// days. The reaper closes that gap.
 //
 // Idempotent — clearing a non-stale lock is a no-op. Safe to run alongside
 // workers; the 15-min threshold is much longer than max processRow timeout
