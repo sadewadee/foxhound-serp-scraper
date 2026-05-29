@@ -14,26 +14,29 @@
 //	  teacher: classname @udd/01pTR000001kCE1  method getTeacherDetails params {"teacherId":"<id>"}
 //	  school : classname @udd/01pTR000001kCED  method getSchoolDetails  params {"schoolId":"<id>"}
 //
-// Teacher IDs come from app.yogaalliance.org/sitemap.xml (contact-*.xml). The
-// account-*.xml "schools" are mostly individual household accounts that
-// getSchoolDetails rejects, so the default crawl is teachers — each teacher
-// record carries its school via teachingHistoryList ("assign to school").
+// IDs come from app.yogaalliance.org/sitemap.xml:
+//   - teacher (-mode teacher): contact-*.xml → getTeacherDetails per ID.
+//   - school  (-mode school):  account-*.xml → getSchoolDetails per ID. The
+//     account sitemap is mostly individual household accounts that getSchoolDetails
+//     rejects ("no valid School profile") — those are skipped; the IDs that DO
+//     resolve are the published RYS schools (the real studios, with their own
+//     website/email/social/address).
 //
 // DB mapping (uses EXISTING tables — no migration):
-//   - emails              ← teacher email (UNIQUE email)
-//   - business_listings   ← one row per teacher; business_name = school (if the
-//     teacher has one) else teacher name; contact_name =
-//     teacher; niche_category='yoga'; off_niche=false;
-//     category='yogaalliance'; synthetic unique domain
-//     "<id>.ryt.yogaalliance.org"
-//   - business_emails     ← link, source='yogaalliance'  ← the source tag
+//   - emails            ← teacher/school email (UNIQUE email)
+//   - business_listings ← teacher: business_name = school-or-teacher,
+//     contact_name = teacher, domain "<id>.ryt.yogaalliance.org",
+//     category='yogaalliance'. school: business_name = studio, website = real
+//     studio site, social_links = IG/FB/Twitter, domain "<id>.rys.yogaalliance.org",
+//     category='yogaalliance-school'. Both niche_category='yoga', off_niche=false.
+//   - business_emails   ← link, source 'yogaalliance' / 'yogaalliance-school'
 //
 // Build & run:
 //
 //	go build -o yoga ./cmd/yogaalliance
-//	./yoga -mode teacher -out teachers.csv -concurrency 12               # CSV only
-//	./yoga -mode teacher -insert -concurrency 8                          # → DB (POSTGRES_DSN)
-//	./yoga -mode teacher -insert -dsn "postgres://..." -limit 200        # test slice
+//	./yoga -mode teacher -insert -concurrency 8     # RYT teachers → DB
+//	./yoga -mode school  -insert -concurrency 8     # RYS schools  → DB
+//	./yoga -mode school  -insert -limit 200         # test slice
 package main
 
 import (
@@ -70,15 +73,7 @@ const (
 	methodTeacher = "getTeacherDetails"
 	srcTag        = "yogaalliance"
 
-	// Directory search controller (YaDirectorySearchController). fetchSchoolRecords
-	// with EMPTY location fields returns ALL published RYS schools globally (~6.8K),
-	// paginated; max pageSize is 25 (50+ errors). fetchSchoolRecordsCount gives the
-	// total. Discovered via the /directory page network calls (2026-05-29).
-	classSchoolSearch   = "@udd/01pTR000001kCE3"
-	methodSchoolRecords = "fetchSchoolRecords"
-	methodSchoolCount   = "fetchSchoolRecordsCount"
-	schoolPageSize      = 25
-	schoolSrcTag        = "yogaalliance-school"
+	schoolSrcTag = "yogaalliance-school"
 )
 
 var (
@@ -192,7 +187,7 @@ func main() {
 	if *idsFile != "" {
 		ids = readLines(*idsFile)
 	} else {
-		ids = crawlSitemapIDs(client)
+		ids = crawlSitemapIDs(client, "sitemap-contact")
 	}
 	if *limit > 0 && len(ids) > *limit {
 		ids = ids[:*limit]
@@ -284,11 +279,14 @@ func bootstrap(c *http.Client) {
 	resp.Body.Close()
 }
 
-func crawlSitemapIDs(c *http.Client) []string {
+// crawlSitemapIDs returns the unique profile IDs from the sitemap files whose
+// URL contains `kind`: "sitemap-contact" for teacher (RYT) IDs, "sitemap-account"
+// for school (RYS) account IDs. idRe matches both teacher/school publicprofile URLs.
+func crawlSitemapIDs(c *http.Client, kind string) []string {
 	idxBody := httpGet(c, sitemapIndex)
 	var subs []string
 	for _, m := range locRe.FindAllStringSubmatch(string(idxBody), -1) {
-		if strings.Contains(m[1], "sitemap-contact") && !strings.Contains(m[1], "weekly") {
+		if strings.Contains(m[1], kind) && !strings.Contains(m[1], "weekly") {
 			subs = append(subs, m[1])
 		}
 	}
@@ -456,17 +454,6 @@ func clean(s string) string {
 
 // ---- School crawl (RYS directory) ----
 
-type schoolListResp struct {
-	ReturnValue []schoolRec `json:"returnValue"`
-}
-type schoolRec struct {
-	Id            string `json:"Id"`
-	DirectoryName string `json:"directoryName"`
-	Address       string `json:"address"`
-	Website       string `json:"schoolWebsite"`
-	Designation   string `json:"schoolDesignation"`
-	ParentName    string `json:"parentName"`
-}
 type schoolDetailResp struct {
 	ReturnValue struct {
 		Id            string `json:"Id"`
@@ -488,103 +475,6 @@ type school struct {
 	id, name, address, website, email string
 	instagram, facebook, twitter, bio string
 	designation, parentName, yoga     string
-}
-
-// searchParams builds the fetchSchoolRecords/Count param map. Empty addr =>
-// global result set (capped ~2000 by the backend); a non-empty addr+lat/lng
-// filters to schools within searchRadius miles (sorted by distance), which is
-// how we sweep past the global cap. page* only used by the records call.
-func searchParams(lat, lng float64, addr, country string, pageSize, pageNumber int) map[string]any {
-	return map[string]any{
-		"schoolId": "", "schoolGoogleAddress": addr, "schoolLatitude": lat, "schoolLongitude": lng,
-		"schoolStreet": "", "schoolCity": "", "schoolState": "", "schoolCountry": country,
-		"searchRadius": 50, "name": "", "designation": "",
-		"onlineServices": false, "closedCaptioning": false,
-		"selectedDesignations": []any{}, "selectedTrainingFormats": []any{},
-		"offerScholarship": false, "offerExchangePrograms": false,
-		"acceptsMyCAA": false, "acceptsGiBill": false,
-		"ratings": []any{}, "typesOfYoga": []any{}, "language": "",
-		"sortDirection": "ASC", "pageSize": pageSize, "pageNumber": pageNumber, "SearchFlag": true,
-	}
-}
-
-// geoCenter is a sweep search center. The global pass caps at ~2000; sweeping
-// these worldwide centers (radius 50mi, deduped by Id) surfaces the rest.
-type geoCenter struct {
-	lat, lng      float64
-	addr, country string
-}
-
-// schoolCenters: yoga-dense metros worldwide (heavy US — most RYS schools are
-// US). Coords are approximate; radius 50mi tolerates imprecision. The sweep
-// stops early once the deduped unique count reaches the reported total.
-var schoolCenters = []geoCenter{
-	{40.71, -74.01, "New York, NY, USA", "United States"}, {34.05, -118.24, "Los Angeles, CA, USA", "United States"},
-	{41.88, -87.63, "Chicago, IL, USA", "United States"}, {29.76, -95.37, "Houston, TX, USA", "United States"},
-	{33.45, -112.07, "Phoenix, AZ, USA", "United States"}, {39.95, -75.17, "Philadelphia, PA, USA", "United States"},
-	{29.42, -98.49, "San Antonio, TX, USA", "United States"}, {32.72, -117.16, "San Diego, CA, USA", "United States"},
-	{32.78, -96.80, "Dallas, TX, USA", "United States"}, {30.27, -97.74, "Austin, TX, USA", "United States"},
-	{30.33, -81.66, "Jacksonville, FL, USA", "United States"}, {39.96, -82.99, "Columbus, OH, USA", "United States"},
-	{35.23, -80.84, "Charlotte, NC, USA", "United States"}, {37.77, -122.42, "San Francisco, CA, USA", "United States"},
-	{39.77, -86.16, "Indianapolis, IN, USA", "United States"}, {47.61, -122.33, "Seattle, WA, USA", "United States"},
-	{39.74, -104.99, "Denver, CO, USA", "United States"}, {38.91, -77.04, "Washington, DC, USA", "United States"},
-	{42.36, -71.06, "Boston, MA, USA", "United States"}, {36.16, -86.78, "Nashville, TN, USA", "United States"},
-	{45.52, -122.68, "Portland, OR, USA", "United States"}, {36.17, -115.14, "Las Vegas, NV, USA", "United States"},
-	{42.33, -83.05, "Detroit, MI, USA", "United States"}, {35.15, -90.05, "Memphis, TN, USA", "United States"},
-	{38.25, -85.76, "Louisville, KY, USA", "United States"}, {43.04, -87.91, "Milwaukee, WI, USA", "United States"},
-	{35.08, -106.65, "Albuquerque, NM, USA", "United States"}, {32.22, -110.97, "Tucson, AZ, USA", "United States"},
-	{38.58, -121.49, "Sacramento, CA, USA", "United States"}, {39.10, -94.58, "Kansas City, MO, USA", "United States"},
-	{33.75, -84.39, "Atlanta, GA, USA", "United States"}, {25.76, -80.19, "Miami, FL, USA", "United States"},
-	{35.78, -78.64, "Raleigh, NC, USA", "United States"}, {41.26, -95.93, "Omaha, NE, USA", "United States"},
-	{44.98, -93.27, "Minneapolis, MN, USA", "United States"}, {27.95, -82.46, "Tampa, FL, USA", "United States"},
-	{29.95, -90.07, "New Orleans, LA, USA", "United States"}, {41.50, -81.69, "Cleveland, OH, USA", "United States"},
-	{21.31, -157.86, "Honolulu, HI, USA", "United States"}, {40.76, -111.89, "Salt Lake City, UT, USA", "United States"},
-	{43.62, -116.21, "Boise, ID, USA", "United States"}, {37.54, -77.44, "Richmond, VA, USA", "United States"},
-	{35.60, -82.55, "Asheville, NC, USA", "United States"}, {40.01, -105.27, "Boulder, CO, USA", "United States"},
-	{35.69, -105.94, "Santa Fe, NM, USA", "United States"}, {43.66, -70.26, "Portland, ME, USA", "United States"},
-	{44.48, -73.21, "Burlington, VT, USA", "United States"}, {28.54, -81.38, "Orlando, FL, USA", "United States"},
-	{26.12, -80.14, "Fort Lauderdale, FL, USA", "United States"}, {32.08, -81.09, "Savannah, GA, USA", "United States"},
-	{36.85, -76.29, "Norfolk, VA, USA", "United States"}, {39.29, -76.61, "Baltimore, MD, USA", "United States"},
-	{40.44, -79.99, "Pittsburgh, PA, USA", "United States"}, {42.89, -78.88, "Buffalo, NY, USA", "United States"},
-	{43.16, -77.61, "Rochester, NY, USA", "United States"}, {42.65, -73.76, "Albany, NY, USA", "United States"},
-	{41.76, -72.69, "Hartford, CT, USA", "United States"}, {40.74, -74.17, "Newark, NJ, USA", "United States"},
-	{34.00, -81.03, "Columbia, SC, USA", "United States"}, {30.44, -84.28, "Tallahassee, FL, USA", "United States"},
-	{32.30, -90.18, "Jackson, MS, USA", "United States"}, {34.75, -92.29, "Little Rock, AR, USA", "United States"},
-	{35.47, -97.52, "Oklahoma City, OK, USA", "United States"}, {41.59, -93.62, "Des Moines, IA, USA", "United States"},
-	{43.07, -89.40, "Madison, WI, USA", "United States"}, {46.59, -112.04, "Helena, MT, USA", "United States"},
-	{33.45, -94.04, "Texarkana, USA", "United States"}, {31.76, -106.49, "El Paso, TX, USA", "United States"},
-	{36.75, -119.77, "Fresno, CA, USA", "United States"}, {34.42, -119.70, "Santa Barbara, CA, USA", "United States"},
-	{37.34, -121.89, "San Jose, CA, USA", "United States"}, {38.44, -122.71, "Santa Rosa, CA, USA", "United States"},
-	{51.51, -0.13, "London, UK", "United Kingdom"}, {53.48, -2.24, "Manchester, UK", "United Kingdom"},
-	{55.95, -3.19, "Edinburgh, UK", "United Kingdom"}, {53.41, -2.98, "Liverpool, UK", "United Kingdom"},
-	{52.49, -1.89, "Birmingham, UK", "United Kingdom"}, {53.35, -6.26, "Dublin, Ireland", "Ireland"},
-	{48.86, 2.35, "Paris, France", "France"}, {52.52, 13.40, "Berlin, Germany", "Germany"},
-	{48.14, 11.58, "Munich, Germany", "Germany"}, {50.94, 6.96, "Cologne, Germany", "Germany"},
-	{52.37, 4.90, "Amsterdam, Netherlands", "Netherlands"}, {41.39, 2.17, "Barcelona, Spain", "Spain"},
-	{40.42, -3.70, "Madrid, Spain", "Spain"}, {41.90, 12.50, "Rome, Italy", "Italy"},
-	{45.46, 9.19, "Milan, Italy", "Italy"}, {47.37, 8.54, "Zurich, Switzerland", "Switzerland"},
-	{48.21, 16.37, "Vienna, Austria", "Austria"}, {55.68, 12.57, "Copenhagen, Denmark", "Denmark"},
-	{59.33, 18.07, "Stockholm, Sweden", "Sweden"}, {59.91, 10.75, "Oslo, Norway", "Norway"},
-	{38.72, -9.14, "Lisbon, Portugal", "Portugal"}, {37.98, 23.73, "Athens, Greece", "Greece"},
-	{50.08, 14.44, "Prague, Czech Republic", "Czechia"}, {52.23, 21.01, "Warsaw, Poland", "Poland"},
-	{43.65, -79.38, "Toronto, ON, Canada", "Canada"}, {49.28, -123.12, "Vancouver, BC, Canada", "Canada"},
-	{45.50, -73.57, "Montreal, QC, Canada", "Canada"}, {51.05, -114.07, "Calgary, AB, Canada", "Canada"},
-	{-33.87, 151.21, "Sydney, Australia", "Australia"}, {-37.81, 144.96, "Melbourne, Australia", "Australia"},
-	{-27.47, 153.03, "Brisbane, Australia", "Australia"}, {-31.95, 115.86, "Perth, Australia", "Australia"},
-	{-36.85, 174.76, "Auckland, New Zealand", "New Zealand"}, {19.08, 72.88, "Mumbai, India", "India"},
-	{28.61, 77.21, "Delhi, India", "India"}, {12.97, 77.59, "Bangalore, India", "India"},
-	{18.52, 73.86, "Pune, India", "India"}, {30.09, 78.27, "Rishikesh, India", "India"},
-	{15.30, 74.12, "Goa, India", "India"}, {13.08, 80.27, "Chennai, India", "India"},
-	{-8.65, 115.22, "Bali, Indonesia", "Indonesia"}, {13.76, 100.50, "Bangkok, Thailand", "Thailand"},
-	{1.35, 103.82, "Singapore", "Singapore"}, {3.14, 101.69, "Kuala Lumpur, Malaysia", "Malaysia"},
-	{22.32, 114.17, "Hong Kong", "Hong Kong"}, {35.68, 139.69, "Tokyo, Japan", "Japan"},
-	{37.57, 126.98, "Seoul, South Korea", "South Korea"}, {25.20, 55.27, "Dubai, UAE", "United Arab Emirates"},
-	{32.08, 34.78, "Tel Aviv, Israel", "Israel"}, {-33.92, 18.42, "Cape Town, South Africa", "South Africa"},
-	{-26.20, 28.05, "Johannesburg, South Africa", "South Africa"}, {19.43, -99.13, "Mexico City, Mexico", "Mexico"},
-	{20.21, -87.47, "Tulum, Mexico", "Mexico"}, {-23.55, -46.63, "Sao Paulo, Brazil", "Brazil"},
-	{-22.91, -43.17, "Rio de Janeiro, Brazil", "Brazil"}, {-34.60, -58.38, "Buenos Aires, Argentina", "Argentina"},
-	{4.71, -74.07, "Bogota, Colombia", "Colombia"}, {-12.05, -77.04, "Lima, Peru", "Peru"},
-	{-33.45, -70.67, "Santiago, Chile", "Chile"}, {9.93, -84.08, "San Jose, Costa Rica", "Costa Rica"},
 }
 
 func apexPOST(c *http.Client, class, method string, params map[string]any) ([]byte, error) {
@@ -612,128 +502,33 @@ func apexPOST(c *http.Client, class, method string, params map[string]any) ([]by
 	return nil, lastErr
 }
 
-func fetchSchoolCount(c *http.Client) int {
-	body, err := apexPOST(c, classSchoolSearch, methodSchoolCount, searchParams(0, 0, "", "", schoolPageSize, 1))
+// fetchSchool fetches one school by its sitemap account ID via getSchoolDetails.
+// Returns nil when the ID has no published RYS school profile (household account
+// — the bulk of the account sitemap), so the caller skips it.
+func fetchSchool(c *http.Client, id string) *school {
+	body, err := apexPOST(c, classSchool, methodSchool, map[string]any{"schoolId": id})
 	if err != nil {
-		return 0
+		return nil
 	}
-	var r struct {
-		ReturnValue int `json:"returnValue"`
+	var d schoolDetailResp
+	if json.Unmarshal(body, &d) != nil || d.ReturnValue.Id == "" {
+		return nil // no valid school profile — household account, skip
 	}
-	json.Unmarshal(body, &r)
-	return r.ReturnValue
-}
-
-// fetchSchoolPage returns one page of school records for the given search params.
-func fetchSchoolPage(c *http.Client, params map[string]any) ([]schoolRec, error) {
-	body, err := apexPOST(c, classSchoolSearch, methodSchoolRecords, params)
-	if err != nil {
-		return nil, err
+	v := d.ReturnValue
+	return &school{
+		id:          v.Id,
+		name:        clean(v.DirectoryName),
+		address:     clean(v.Address),
+		website:     strings.TrimSpace(v.Website),
+		email:       strings.TrimSpace(v.Email),
+		instagram:   strings.TrimSpace(v.Instagram),
+		facebook:    strings.TrimSpace(v.Facebook),
+		twitter:     strings.TrimSpace(v.Twitter),
+		bio:         clean(v.Biography),
+		designation: clean(v.Designation),
+		parentName:  clean(v.ParentName),
+		yoga:        clean(v.TypesOfYoga),
 	}
-	var r schoolListResp
-	if json.Unmarshal(body, &r) != nil {
-		return nil, fmt.Errorf("parse school records")
-	}
-	return r.ReturnValue, nil
-}
-
-// enumerateSchools returns unique RYS school records (deduped by Id). The global
-// pass (empty location) caps at ~2000, so we then sweep schoolCenters worldwide
-// (radius 50mi each) until the deduped count reaches the reported total. limit
-// caps the result (0 = all).
-func enumerateSchools(c *http.Client, total, limit int) []schoolRec {
-	seen := map[string]bool{}
-	var out []schoolRec
-
-	add := func(recs []schoolRec) {
-		for _, rec := range recs {
-			if rec.Id == "" || seen[rec.Id] {
-				continue
-			}
-			seen[rec.Id] = true
-			out = append(out, rec)
-		}
-	}
-	// paginate one location (empty addr = global) up to 120 pages. Results are
-	// distance-sorted, so a center's NEW schools cluster in the early pages; once
-	// we hit 3 consecutive all-duplicate pages the center is exhausted (its far
-	// rows belong to other centers) — stop early instead of grinding ~80 pages of
-	// dupes. This is the fix for the 2h/plateau stall: dup-heavy overlapping metros
-	// finish in a few pages. The global pass never trips it (every page is new).
-	sweep := func(lat, lng float64, addr, country string) {
-		zeroNew := 0
-		for page := 1; page <= 120; page++ {
-			before := len(out)
-			recs, err := fetchSchoolPage(c, searchParams(lat, lng, addr, country, schoolPageSize, page))
-			if err != nil {
-				log.Printf("  sweep %q page %d: %v — stopping this location (may undercount it)", addr, page, err)
-				break
-			}
-			if len(recs) == 0 {
-				break
-			}
-			add(recs)
-			if len(out) == before {
-				if zeroNew++; zeroNew >= 3 {
-					break
-				}
-			} else {
-				zeroNew = 0
-			}
-			if limit > 0 && len(out) >= limit {
-				return
-			}
-		}
-	}
-
-	sweep(0, 0, "", "") // global pass
-	log.Printf("  global pass: %d unique (of %d total)", len(out), total)
-
-	for i, ctr := range schoolCenters {
-		if (limit > 0 && len(out) >= limit) || (total > 0 && len(out) >= total) {
-			break
-		}
-		sweep(ctr.lat, ctr.lng, ctr.addr, ctr.country)
-		if (i+1)%15 == 0 || len(out) >= total {
-			log.Printf("  swept %d/%d centers: %d/%d unique schools", i+1, len(schoolCenters), len(out), total)
-		}
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
-}
-
-// fetchSchool merges the list record with getSchoolDetails (email/social/bio).
-func fetchSchool(c *http.Client, rec schoolRec) *school {
-	s := &school{
-		id: rec.Id, name: clean(rec.DirectoryName), address: clean(rec.Address),
-		website: strings.TrimSpace(rec.Website), designation: clean(rec.Designation),
-		parentName: clean(rec.ParentName),
-	}
-	body, err := apexPOST(c, classSchool, methodSchool, map[string]any{"schoolId": rec.Id})
-	if err == nil {
-		var d schoolDetailResp
-		if json.Unmarshal(body, &d) == nil && d.ReturnValue.Id != "" {
-			v := d.ReturnValue
-			if clean(v.DirectoryName) != "" {
-				s.name = clean(v.DirectoryName)
-			}
-			if clean(v.Address) != "" {
-				s.address = clean(v.Address)
-			}
-			if strings.TrimSpace(v.Website) != "" {
-				s.website = strings.TrimSpace(v.Website)
-			}
-			s.email = strings.TrimSpace(v.Email)
-			s.instagram = strings.TrimSpace(v.Instagram)
-			s.facebook = strings.TrimSpace(v.Facebook)
-			s.twitter = strings.TrimSpace(v.Twitter)
-			s.bio = clean(v.Biography)
-			s.yoga = clean(v.TypesOfYoga)
-		}
-	}
-	return s
 }
 
 func (s *school) row() []string {
@@ -741,10 +536,11 @@ func (s *school) row() []string {
 }
 
 func runSchools(c *http.Client, db *sql.DB, conc, limit int, outPath string) {
-	total := fetchSchoolCount(c)
-	log.Printf("yogaalliance: school — directory reports %d published RYS schools globally", total)
-	recs := enumerateSchools(c, total, limit)
-	log.Printf("yogaalliance: school — %d unique schools to fetch (concurrency=%d, insert=%v, csv=%q)", len(recs), conc, db != nil, outPath)
+	ids := crawlSitemapIDs(c, "sitemap-account")
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	log.Printf("yogaalliance: school — %d account IDs from sitemap (concurrency=%d, insert=%v, csv=%q)", len(ids), conc, db != nil, outPath)
 
 	var w *csv.Writer
 	var csvMu sync.Mutex
@@ -760,14 +556,14 @@ func runSchools(c *http.Client, db *sql.DB, conc, limit int, outPath string) {
 	}
 
 	var done, ok, withEmail, withWeb, inserted int64
-	jobs := make(chan schoolRec, conc*2)
+	jobs := make(chan string, conc*2)
 	var wg sync.WaitGroup
 	for i := 0; i < conc; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for rec := range jobs {
-				s := fetchSchool(c, rec)
+			for id := range jobs {
+				s := fetchSchool(c, id)
 				n := atomic.AddInt64(&done, 1)
 				if s != nil && s.name != "" {
 					atomic.AddInt64(&ok, 1)
@@ -780,7 +576,7 @@ func runSchools(c *http.Client, db *sql.DB, conc, limit int, outPath string) {
 					if w != nil {
 						csvMu.Lock()
 						w.Write(s.row())
-						if n%200 == 0 {
+						if n%500 == 0 {
 							w.Flush()
 						}
 						csvMu.Unlock()
@@ -793,22 +589,22 @@ func runSchools(c *http.Client, db *sql.DB, conc, limit int, outPath string) {
 						}
 					}
 				}
-				if n%200 == 0 {
-					log.Printf("  progress: %d/%d done, %d ok, %d web, %d email, %d inserted",
-						n, len(recs), atomic.LoadInt64(&ok), atomic.LoadInt64(&withWeb), atomic.LoadInt64(&withEmail), atomic.LoadInt64(&inserted))
+				if n%1000 == 0 {
+					log.Printf("  progress: %d/%d checked, %d schools, %d web, %d email, %d inserted",
+						n, len(ids), atomic.LoadInt64(&ok), atomic.LoadInt64(&withWeb), atomic.LoadInt64(&withEmail), atomic.LoadInt64(&inserted))
 				}
 			}
 		}()
 	}
-	for _, rec := range recs {
-		jobs <- rec
+	for _, id := range ids {
+		jobs <- id
 	}
 	close(jobs)
 	wg.Wait()
 	if w != nil {
 		w.Flush()
 	}
-	log.Printf("DONE schools: %d fetched, %d ok, %d with website, %d with email, %d inserted", done, ok, withWeb, withEmail, inserted)
+	log.Printf("DONE schools: %d account IDs checked, %d valid RYS schools, %d with website, %d with email, %d inserted", done, ok, withWeb, withEmail, inserted)
 }
 
 // upsertSchool writes one RYS school as a standalone listing (category
