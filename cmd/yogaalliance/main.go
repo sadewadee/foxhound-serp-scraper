@@ -492,12 +492,19 @@ func apexPOST(c *http.Client, class, method string, params map[string]any) ([]by
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode != 200 {
-			lastErr = fmt.Errorf("status %d", resp.StatusCode)
-			time.Sleep(time.Duration(attempt+1) * 400 * time.Millisecond)
-			continue
+		if resp.StatusCode == 200 {
+			return body, nil
 		}
-		return body, nil
+		// 4xx is a definitive answer, not a transient failure — e.g. getSchoolDetails
+		// returns 400 for the ~93% of account-sitemap IDs that are household accounts,
+		// not RYS schools. Return immediately (no retry) so the caller skips fast;
+		// retrying these would turn an ~80K-ID crawl into a ~6h grind.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return nil, fmt.Errorf("status %d", resp.StatusCode)
+		}
+		// 5xx / other: transient — back off and retry.
+		lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		time.Sleep(time.Duration(attempt+1) * 400 * time.Millisecond)
 	}
 	return nil, lastErr
 }
