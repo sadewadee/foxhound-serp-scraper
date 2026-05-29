@@ -492,6 +492,73 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			stealthCtx, stealthCancel := context.WithTimeout(ctx, 30*time.Second)
 			body, fetchErr = scraper.FetchSERPStealth(stealthCtx, stealth, job.URL, job.ID)
 			stealthCancel()
+
+			// Option C: stealth-primary with single browser fallback for engines that
+			// serve captcha or 429 via the stealth path (currently Bing — JA3 mismatch
+			// in foxhound's azuretls means ~100% of Bing stealth requests captcha).
+			// When foxhound upstream fixes the JA3 preset, stealth recovers automatically
+			// with no code change.  DDG is excluded: it rarely captchas on stealth and
+			// doesn't benefit from a browser path.
+			//
+			// Design constraints:
+			//   - Exactly ONE browser retry per stealth miss (no loop).
+			//   - The browser attempt is transparent to the retry counter: only record
+			//     an attempt if the browser also fails.
+			//   - On browser success, continue normally (job marked complete, counter reset).
+			//   - On browser failure, fall through to the normal retry/dead-letter path
+			//     with fetchErr set.
+			if fetchErr != nil || (fetchErr == nil && eng.IsCaptchaPage(body)) {
+				if scraper.EngineUsesBrowserFallback(eng) {
+					stealthErr := fetchErr
+					stealthBody := body
+					body = nil
+					fetchErr = nil
+
+					slog.Info("serp: stealth blocked, trying browser fallback",
+						"engine", job.Engine, "job", job.ID, "tab", tabID,
+						"stealth_err", stealthErr,
+						"was_captcha", stealthErr == nil && eng.IsCaptchaPage(stealthBody),
+					)
+
+					s.browserMu.Lock()
+					fallbackBrowser := s.browser
+					s.browserMu.Unlock()
+
+					if fallbackBrowser != nil {
+						fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 45*time.Second)
+						steps := eng.FetchSteps()
+						var fallbackErr error
+						if len(steps) > 0 {
+							body, fallbackErr = scraper.FetchSERPWithEngine(fallbackCtx, fallbackBrowser, job.URL, "bf-"+job.ID, steps)
+						} else {
+							// Bing has no FetchSteps (stealth-oriented engine); use plain browser fetch.
+							body, fallbackErr = scraper.FetchWithBrowser(fallbackCtx, fallbackBrowser, job.URL, "bf-"+job.ID)
+						}
+						fallbackCancel()
+
+						if fallbackErr == nil && eng.IsCaptchaPage(body) {
+							fallbackErr = fmt.Errorf("captcha on browser fallback")
+						}
+
+						if fallbackErr != nil {
+							// Browser also failed — reinstate error so the outer retry
+							// path handles it normally.  Annotate for observability.
+							fetchErr = fmt.Errorf("stealth: %v; browser-fallback: %w", stealthErr, fallbackErr)
+							body = nil
+							slog.Warn("serp: browser fallback also failed",
+								"engine", job.Engine, "job", job.ID, "tab", tabID, "error", fetchErr)
+						} else {
+							slog.Info("serp: browser fallback succeeded",
+								"engine", job.Engine, "job", job.ID, "tab", tabID)
+						}
+					} else {
+						// Browser not ready — treat as stealth failure.
+						fetchErr = fmt.Errorf("stealth: %v; browser-fallback: browser nil", stealthErr)
+						slog.Warn("serp: browser fallback skipped — browser not ready",
+							"engine", job.Engine, "job", job.ID, "tab", tabID)
+					}
+				}
+			}
 		}
 
 		if fetchErr == nil && eng.IsCaptchaPage(body) {

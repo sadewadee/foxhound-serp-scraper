@@ -58,6 +58,21 @@ func AllEngines() []SearchEngine {
 	return []SearchEngine{&GoogleEngine{}, &BingEngine{}, &DuckDuckGoEngine{}}
 }
 
+// EngineUsesBrowserFallback returns true if the engine uses stealth-primary
+// fetching but should fall back to a single browser attempt when stealth
+// returns a captcha or error.
+//
+// Bing is included because foxhound's azuretls JA3 preset does not match
+// Bing's expected fingerprint, causing ~100 % of stealth requests to receive
+// a captcha challenge.  DDG is excluded — it rarely captchas on stealth and
+// its HTML endpoint does not benefit from a browser path.
+//
+// Engines that already use NeedsBrowser() = true (e.g. Google) never reach
+// this code path; they have no stealth phase to fall back from.
+func EngineUsesBrowserFallback(eng SearchEngine) bool {
+	return eng.Name() == "bing"
+}
+
 // EnabledEngines returns engines filtered by the config string.
 // "all" = all engines, "google" = only google, "google,bing" = google+bing, etc.
 func EnabledEngines(enginesCfg string) []SearchEngine {
