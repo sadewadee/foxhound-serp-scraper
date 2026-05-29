@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -113,6 +114,58 @@ func resultsOrderBy(sort string) string {
 	}
 }
 
+// isIDDescOrder reports whether the OFFSET ordering is keyset-compatible with
+// the cursor (which walks bl.id DESC). Only the default order and the explicit
+// id_desc alias qualify — any other sort would make an id-keyed cursor skip or
+// duplicate rows, so we must not hand one out.
+func isIDDescOrder(sort string) bool {
+	return sort == "" || sort == "id_desc"
+}
+
+// offsetNextCursor decides whether an OFFSET-mode response can hand the client
+// a keyset cursor to escape deep-OFFSET timeouts (issue #32, Bug 3 — keyset was
+// previously unreachable because no next_cursor was ever emitted). Returns the
+// opaque cursor, or "" when keyset is not offerable for this page.
+//
+// The cursor is keyed on bl.id DESC, so it is only valid when the page itself
+// is ordered id-descending (isIDDescOrder). When the filtered total is known we
+// offer a cursor only if rows remain after this page; when the count failed
+// (total < 0 — issue #32 Bug 2) we offer one whenever the page came back full,
+// so a consumer with an unreliable total still has a forward path.
+func offsetNextCursor(sort string, page, perPage, total, returned int, lastID int64) string {
+	if returned == 0 || !isIDDescOrder(sort) {
+		return ""
+	}
+	more := false
+	if total >= 0 {
+		more = page*perPage < total
+	} else {
+		more = returned >= perPage
+	}
+	if !more {
+		return ""
+	}
+	return encodeCursor(lastID)
+}
+
+// isStatementTimeout reports whether err is a Postgres statement_timeout / query
+// cancellation (or the request-context deadline firing). Used to map a deep
+// OFFSET scan that blew the timeout to a clean 4xx (offset_too_deep) instead of
+// a generic 500 (issue #32, fix #3).
+func isStatementTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "57014" // query_canceled (raised by statement_timeout)
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "statement timeout")
+}
+
 // handleV2ListResults returns paginated business listings with full email info.
 // Two-query strategy: listings first, then batch email fetch.
 func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +256,16 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.QueryContext(ctx, dataQuery, args...)
 	if err != nil {
+		// A deep OFFSET scan that blows the statement timeout used to surface as
+		// a generic 500 (issue #32, Bug 1). Return a clean 4xx pointing the
+		// client at keyset pagination instead — the next_cursor emitted on a
+		// shallower page is the supported escape hatch.
+		if !useCursor && offset > 0 && isStatementTimeout(err) {
+			slog.Warn("v2: results OFFSET timed out — advising keyset cursor", "offset", offset, "error", err)
+			writeV2Error(w, http.StatusBadRequest, "offset_too_deep",
+				"this page is too deep to fetch by offset under load; switch to keyset pagination using the next_cursor returned on a shallower page")
+			return
+		}
 		slog.Error("v2: list error", "error", err)
 		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to fetch results")
 		return
@@ -329,7 +392,16 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeV2Paginated(w, listings, total, page, perPage)
+	// OFFSET mode: emit a keyset next_cursor alongside the pagination meta so a
+	// client can switch off OFFSET before it hits the deep-page timeout (issue
+	// #32, fix #1 — previously keyset was unreachable). Empty (omitted) when the
+	// sort isn't id-keyed or there are no further rows.
+	var lastID int64
+	if len(listings) > 0 {
+		lastID = listings[len(listings)-1].ID
+	}
+	nextCursor := offsetNextCursor(q.Get("sort"), page, perPage, total, len(listings), lastID)
+	writeV2PaginatedCursor(w, listings, total, page, perPage, nextCursor)
 }
 
 // handleV2ResultsStats returns clear, unambiguous stats for results.

@@ -26,6 +26,10 @@ type PaginationMeta struct {
 	Total      int  `json:"total"`
 	TotalPages int  `json:"total_pages"`
 	TotalKnown bool `json:"total_known"`
+	// NextCursor lets an OFFSET-mode consumer switch to keyset pagination to
+	// escape deep-page timeouts (issue #32). Omitted when keyset isn't offerable
+	// for this page (non-id sort, or no further rows).
+	NextCursor string `json:"next_cursor,omitempty"`
 }
 
 // SingleResponse wraps single-object endpoints.
@@ -49,6 +53,13 @@ type ErrorDetail struct {
 // see spec-compliant non-negative values plus an explicit signal that
 // pagination math is unreliable.
 func writeV2Paginated(w http.ResponseWriter, data any, total, page, perPage int) {
+	writeV2PaginatedCursor(w, data, total, page, perPage, "")
+}
+
+// writeV2PaginatedCursor is writeV2Paginated plus an optional keyset next_cursor
+// in the meta (issue #32). An empty nextCursor is omitted from the JSON, so
+// existing OFFSET consumers see an unchanged envelope.
+func writeV2PaginatedCursor(w http.ResponseWriter, data any, total, page, perPage int, nextCursor string) {
 	known := total >= 0
 	if !known {
 		total = 0
@@ -67,6 +78,7 @@ func writeV2Paginated(w http.ResponseWriter, data any, total, page, perPage int)
 			Total:      total,
 			TotalPages: totalPages,
 			TotalKnown: known,
+			NextCursor: nextCursor,
 		},
 	})
 }

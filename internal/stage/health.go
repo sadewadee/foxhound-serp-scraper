@@ -10,9 +10,28 @@ import (
 
 // touchHealthFile periodically touches a file to signal container health.
 // Docker healthcheck reads the file's mtime to determine if the worker is alive.
-func touchHealthFile(ctx context.Context, path string) {
+//
+// Optional probes make the signal honest (Operational Invariant #7): if any
+// probe reports false the file is NOT refreshed, so its mtime goes stale and
+// the container healthcheck eventually fails. This lets a worker that is up but
+// not doing useful work (e.g. reenrich whose eligibility query times out every
+// loop — issue #28) surface to autoheal instead of reporting "healthy" forever.
+// With no probes the behavior is unchanged: always healthy. Recovery is
+// automatic — once the probes pass again the next tick refreshes the file.
+func touchHealthFile(ctx context.Context, path string, probes ...func() bool) {
+	healthy := func() bool {
+		for _, p := range probes {
+			if p != nil && !p() {
+				return false
+			}
+		}
+		return true
+	}
+
 	// Touch immediately on startup.
-	os.WriteFile(path, []byte("ok"), 0644)
+	if healthy() {
+		os.WriteFile(path, []byte("ok"), 0644)
+	}
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -23,7 +42,9 @@ func touchHealthFile(ctx context.Context, path string) {
 			os.Remove(path)
 			return
 		case <-ticker.C:
-			os.WriteFile(path, []byte("ok"), 0644)
+			if healthy() {
+				os.WriteFile(path, []byte("ok"), 0644)
+			}
 		}
 	}
 }

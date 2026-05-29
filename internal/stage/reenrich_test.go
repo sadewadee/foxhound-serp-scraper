@@ -240,3 +240,38 @@ func TestEligibilityQuery_NoOrderByRandom(t *testing.T) {
 		}
 	}
 }
+
+// TestReenrichHealthGate covers the honest-healthcheck logic (issue #28, fix #4):
+// the worker stays healthy while eligibility queries succeed (even with zero
+// rows), and only reports degraded after reenrichMaxConsecutiveEligFailures
+// consecutive failures — at which point touchHealthFile stops refreshing the
+// health file so autoheal can restart the stalled worker.
+func TestReenrichHealthGate(t *testing.T) {
+	r := &ReenrichStage{}
+
+	if !r.healthy() {
+		t.Fatal("a fresh worker must report healthy")
+	}
+
+	// Failures just below the threshold keep it healthy.
+	for i := 0; i < reenrichMaxConsecutiveEligFailures-1; i++ {
+		r.recordEligibilityFailure()
+	}
+	if !r.healthy() {
+		t.Fatalf("worker should still be healthy after %d failures (threshold %d)",
+			reenrichMaxConsecutiveEligFailures-1, reenrichMaxConsecutiveEligFailures)
+	}
+
+	// One more failure crosses the threshold -> degraded.
+	r.recordEligibilityFailure()
+	if r.healthy() {
+		t.Fatalf("worker should report degraded after %d consecutive failures",
+			reenrichMaxConsecutiveEligFailures)
+	}
+
+	// A single success resets the counter — the worker is doing work again.
+	r.recordEligibilitySuccess()
+	if !r.healthy() {
+		t.Fatal("a successful eligibility query must reset health to healthy")
+	}
+}
