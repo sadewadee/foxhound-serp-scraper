@@ -320,6 +320,9 @@ func fetchTeacher(c *http.Client, id string) *teacher {
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return nil // definitive (suspended/deleted/non-teacher account) — don't retry
+		}
 		if resp.StatusCode != 200 {
 			time.Sleep(time.Duration(attempt+1) * 400 * time.Millisecond)
 			continue
