@@ -381,10 +381,10 @@ func upsertTeacher(db *sql.DB, t *teacher) error {
 	var bizID int64
 	err := db.QueryRow(`
 		INSERT INTO business_listings
-		  (domain, business_name, contact_name, address, city, country, description,
+		  (domain, url, business_name, contact_name, address, city, country, description,
 		   social_links, niche_category, off_niche, category, website, created_at, updated_at)
-		VALUES ($1,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),
-		   $8::jsonb,'yoga',false,'yogaalliance',$9,NOW(),NOW())
+		VALUES ($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),
+		   $9::jsonb,'yoga',false,'yogaalliance',$10,NOW(),NOW())
 		ON CONFLICT (domain) DO UPDATE SET
 		  business_name  = COALESCE(NULLIF(EXCLUDED.business_name,''), business_listings.business_name),
 		  contact_name   = COALESCE(NULLIF(EXCLUDED.contact_name,''),  business_listings.contact_name),
@@ -394,7 +394,7 @@ func upsertTeacher(db *sql.DB, t *teacher) error {
 		  niche_category = 'yoga', off_niche = false, category = 'yogaalliance',
 		  updated_at     = NOW()
 		RETURNING id`,
-		domain, bizName, t.name, addr, t.city, t.country, t.biography, string(socialJSON), profileURL,
+		domain, profileURL, bizName, t.name, addr, t.city, t.country, t.biography, string(socialJSON), profileURL,
 	).Scan(&bizID)
 	if err != nil {
 		return fmt.Errorf("business_listings upsert: %w", err)
