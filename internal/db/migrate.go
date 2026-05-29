@@ -3,12 +3,15 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 const schema = `
@@ -217,6 +220,12 @@ func execMigrationBatch(db *sql.DB, cols map[string]bool, errCtx string, stmts [
 	if _, err := conn.ExecContext(ctx, `SET lock_timeout = '5s'`); err != nil {
 		return fmt.Errorf("db: %s: set lock_timeout: %w", errCtx, err)
 	}
+	// Reset before the pinned connection returns to the pool. lib/pq does NOT
+	// issue RESET on pool return, so a session-level lock_timeout would leak onto
+	// pooled connections for the container's lifetime and make reconciler/persist
+	// queries that legitimately wait >5s fail with 55P03. defer runs LIFO, so this
+	// fires before conn.Close().
+	defer conn.ExecContext(ctx, `SET lock_timeout = DEFAULT`)
 	for _, stmt := range stmts {
 		if m := addColumnRe.FindStringSubmatch(stmt); m != nil {
 			if cols[strings.ToLower(m[1])+"."+strings.ToLower(m[2])] {
@@ -229,9 +238,11 @@ func execMigrationBatch(db *sql.DB, cols map[string]bool, errCtx string, stmts [
 				break
 			}
 			// 55P03 = lock_not_available (lock_timeout fired). Back off and retry;
-			// the hot path will eventually yield a lock window.
-			if !strings.Contains(lastErr.Error(), "lock_not_available") && !strings.Contains(lastErr.Error(), "55P03") {
-				break // not a lock timeout — real error, stop retrying
+			// the hot path will eventually yield a lock window. Any other error is
+			// real — stop and surface it so boot fails loudly.
+			var pqErr *pq.Error
+			if !errors.As(lastErr, &pqErr) || pqErr.Code != "55P03" {
+				break
 			}
 			slog.Warn("db: migration DDL waiting on lock, retrying", "ctx", errCtx, "attempt", attempt+1, "stmt", stmt)
 			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
