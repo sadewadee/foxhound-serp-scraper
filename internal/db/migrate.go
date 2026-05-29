@@ -1,10 +1,14 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
+	"strings"
+	"time"
 )
 
 const schema = `
@@ -162,10 +166,96 @@ CREATE TABLE IF NOT EXISTS workers (
 `
 
 // runMigrations applies incremental schema changes that are safe to re-run.
+// addColumnRe matches `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <c> ...` so we can
+// skip the statement when <c> already exists on <t>.
+var addColumnRe = regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)`)
+
+// existingColumns returns the set of "table.column" (lowercased) present in the
+// public schema. Used to skip ADD COLUMN IF NOT EXISTS migrations that would
+// otherwise take an ACCESS EXCLUSIVE lock on hot tables (enrichment_jobs/serp_jobs)
+// even as a no-op. Incident 2026-05-29: a reenrich boot ran the idempotent
+// ALTER batch, its no-op ALTER on enrichment_jobs queued for ACCESS EXCLUSIVE
+// behind the enrich hot path, and once queued it blocked all 21 enrich workers
+// behind it — boot exceeded the 120s healthcheck window, autoheal killed the
+// container, and it restart-looped, never finishing migrations. On a fully
+// migrated DB (production) every ADD COLUMN is a no-op, so skipping them means
+// boot takes ZERO hot-table DDL locks.
+func existingColumns(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	set := make(map[string]bool)
+	for rows.Next() {
+		var t, c string
+		if err := rows.Scan(&t, &c); err != nil {
+			return nil, err
+		}
+		set[strings.ToLower(t)+"."+strings.ToLower(c)] = true
+	}
+	return set, rows.Err()
+}
+
+// execMigrationBatch runs a mixed DDL batch (ALTER ... ADD COLUMN + CREATE INDEX),
+// skipping ADD COLUMN statements whose column already exists (cols) so production
+// boots take no lock on hot tables. Surviving statements run on a dedicated
+// connection with a bounded lock_timeout: a genuinely-new column on a busy table
+// fails fast and is retried with backoff rather than wedging the hot path (and
+// cascading into an autoheal restart loop, incident 2026-05-29). errCtx labels
+// failures for the original call site.
+func execMigrationBatch(db *sql.DB, cols map[string]bool, errCtx string, stmts []string) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("db: %s: acquire conn: %w", errCtx, err)
+	}
+	defer conn.Close()
+	// Bound DDL lock waits. A no-op is instant; a real ALTER on a busy table must
+	// not block enrich/serp indefinitely. lock_timeout only bounds the lock
+	// acquisition, not the (metadata-only) ALTER itself.
+	if _, err := conn.ExecContext(ctx, `SET lock_timeout = '5s'`); err != nil {
+		return fmt.Errorf("db: %s: set lock_timeout: %w", errCtx, err)
+	}
+	for _, stmt := range stmts {
+		if m := addColumnRe.FindStringSubmatch(stmt); m != nil {
+			if cols[strings.ToLower(m[1])+"."+strings.ToLower(m[2])] {
+				continue // column present — skip the lock-taking no-op ALTER
+			}
+		}
+		var lastErr error
+		for attempt := 0; attempt < 6; attempt++ {
+			if _, lastErr = conn.ExecContext(ctx, stmt); lastErr == nil {
+				break
+			}
+			// 55P03 = lock_not_available (lock_timeout fired). Back off and retry;
+			// the hot path will eventually yield a lock window.
+			if !strings.Contains(lastErr.Error(), "lock_not_available") && !strings.Contains(lastErr.Error(), "55P03") {
+				break // not a lock timeout — real error, stop retrying
+			}
+			slog.Warn("db: migration DDL waiting on lock, retrying", "ctx", errCtx, "attempt", attempt+1, "stmt", stmt)
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		}
+		if lastErr != nil {
+			return fmt.Errorf("db: %s: %w (stmt: %s)", errCtx, lastErr, stmt)
+		}
+	}
+	return nil
+}
+
 func runMigrations(db *sql.DB) error {
 	// Enable pgcrypto for SHA-256 hashing in triggers.
 	if _, err := db.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
 		return fmt.Errorf("db: create extension pgcrypto: %w", err)
+	}
+
+	// Snapshot existing columns so we skip idempotent ADD COLUMN no-ops that would
+	// otherwise take an ACCESS EXCLUSIVE lock on hot tables during worker boot
+	// (incident 2026-05-29 — see existingColumns doc). On a fresh DB this is empty
+	// and every ALTER runs; on a migrated DB it skips them all → zero-lock boot.
+	cols, err := existingColumns(db)
+	if err != nil {
+		return fmt.Errorf("db: snapshot existing columns: %w", err)
 	}
 
 	// GUARDRAIL: Legacy tables renamed to _backup, NEVER dropped.
@@ -173,9 +263,13 @@ func runMigrations(db *sql.DB) error {
 	db.Exec(`ALTER TABLE IF EXISTS enrich_jobs RENAME TO enrich_jobs_backup`)
 	db.Exec(`ALTER TABLE IF EXISTS websites RENAME TO websites_backup`)
 
-	// Add picked_at column to serp_jobs if missing (from redesign).
-	if _, err := db.Exec(`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`); err != nil {
-		return fmt.Errorf("db: add picked_at column: %w", err)
+	// Add picked_at column to serp_jobs if missing (from redesign). Routed through
+	// execMigrationBatch so a no-op skips the ACCESS EXCLUSIVE lock on the hot
+	// serp_jobs table (incident 2026-05-29).
+	if err := execMigrationBatch(db, cols, "add picked_at column", []string{
+		`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`,
+	}); err != nil {
+		return err
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_feed ON serp_jobs(created_at) WHERE status = 'new' AND picked_at IS NULL`); err != nil {
 		return fmt.Errorf("db: create idx_serp_feed: %w", err)
@@ -213,16 +307,14 @@ func runMigrations(db *sql.DB) error {
 	}
 
 	// Add delta tracking columns to workers for per-heartbeat rate calculation.
-	for _, stmt := range []string{
+	if err := execMigrationBatch(db, cols, "worker delta columns", []string{
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_prev BIGINT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_prev BIGINT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_delta INT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_delta INT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS delta_at TIMESTAMPTZ`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("db: worker delta columns: %w", err)
-		}
+	}); err != nil {
+		return err
 	}
 
 	// Schema fix 2026-04-27: extraction layer captured fields that the trigger
@@ -231,7 +323,7 @@ func runMigrations(db *sql.DB) error {
 	// Add missing columns + raw_* counterparts; the trigger update later in
 	// this file forwards them. opening_hours/rating remain optional — they
 	// stay null when extraction misses them.
-	for _, stmt := range []string{
+	if err := execMigrationBatch(db, cols, "schema fix 2026-04-27", []string{
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country TEXT`,
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS city TEXT`,
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS contact_name TEXT`,
@@ -269,10 +361,8 @@ func runMigrations(db *sql.DB) error {
 		// the pool. CONCURRENTLY uses ShareUpdateExclusiveLock instead, which
 		// doesn't block concurrent writes. Cannot live inside this batch since
 		// CONCURRENTLY is illegal inside a transaction block.
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
-		}
+	}); err != nil {
+		return err
 	}
 
 	// Niche indexes — created CONCURRENTLY outside any tx (CLAUDE.md /
