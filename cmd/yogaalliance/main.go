@@ -654,9 +654,16 @@ func enumerateSchools(c *http.Client, total, limit int) []schoolRec {
 			out = append(out, rec)
 		}
 	}
-	// paginate one location (empty addr = global) up to 120 pages.
+	// paginate one location (empty addr = global) up to 120 pages. Results are
+	// distance-sorted, so a center's NEW schools cluster in the early pages; once
+	// we hit 3 consecutive all-duplicate pages the center is exhausted (its far
+	// rows belong to other centers) — stop early instead of grinding ~80 pages of
+	// dupes. This is the fix for the 2h/plateau stall: dup-heavy overlapping metros
+	// finish in a few pages. The global pass never trips it (every page is new).
 	sweep := func(lat, lng float64, addr, country string) {
+		zeroNew := 0
 		for page := 1; page <= 120; page++ {
+			before := len(out)
 			recs, err := fetchSchoolPage(c, searchParams(lat, lng, addr, country, schoolPageSize, page))
 			if err != nil {
 				log.Printf("  sweep %q page %d: %v — stopping this location (may undercount it)", addr, page, err)
@@ -666,6 +673,13 @@ func enumerateSchools(c *http.Client, total, limit int) []schoolRec {
 				break
 			}
 			add(recs)
+			if len(out) == before {
+				if zeroNew++; zeroNew >= 3 {
+					break
+				}
+			} else {
+				zeroNew = 0
+			}
 			if limit > 0 && len(out) >= limit {
 				return
 			}
