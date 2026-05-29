@@ -39,6 +39,13 @@ type ReenrichStage struct {
 
 	processed atomic.Int64
 	found     atomic.Int64
+
+	// eligFailures counts consecutive eligibility-query failures across all
+	// workers. Reset to 0 on any successful claim (issue #28 — the worker used
+	// to time out on every loop yet report "healthy", silently producing ~0
+	// rows). When this crosses reenrichMaxConsecutiveEligFailures the health
+	// probe reports degraded so the container healthcheck can stop lying.
+	eligFailures atomic.Int64
 }
 
 // NewReenrichStage creates a new ReenrichStage.
@@ -78,7 +85,10 @@ func (r *ReenrichStage) Run(ctx context.Context) error {
 	slog.Info("reenrich: starting workers", "count", numWorkers, "min_score", r.cfg.ReenrichScore)
 
 	// Health file so the container healthcheck doesn't kill us while idle.
-	go touchHealthFile(ctx, "/tmp/worker-healthy")
+	// The probe lets the file go stale once eligibility queries have been
+	// failing in a row (issue #28) — an idle-but-working reenrich stays healthy,
+	// a stalled one (every query timing out) eventually fails its healthcheck.
+	go touchHealthFile(ctx, "/tmp/worker-healthy", r.healthy)
 
 	// Lock-leak reaper — deterministic stale-lock release every 5 minutes.
 	// Operates independently of worker loops; idempotent UPDATE so multiple
@@ -131,7 +141,16 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 			if ctx.Err() != nil {
 				return
 			}
-			slog.Warn("reenrich: eligibility query failed", "worker", workerID, "error", err)
+			fails := r.eligFailures.Add(1)
+			slog.Warn("reenrich: eligibility query failed",
+				"worker", workerID, "error", err, "consecutive_failures", fails)
+			if fails >= reenrichMaxConsecutiveEligFailures {
+				// Surface the stall instead of hiding behind a green healthcheck
+				// (issue #28). touchHealthFile sees healthy()==false and stops
+				// refreshing /tmp/worker-healthy, so autoheal restarts us.
+				slog.Error("reenrich: eligibility query failing repeatedly — reporting degraded health",
+					"worker", workerID, "consecutive_failures", fails)
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -139,6 +158,9 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 			}
 			continue
 		}
+		// Query succeeded (even if it returned zero rows) — the worker is not
+		// stalled, so clear the degraded-health counter.
+		r.recordEligibilitySuccess()
 
 		if len(rows) == 0 {
 			// No eligible rows — sleep and retry.
@@ -179,6 +201,33 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 // Mirrors the enrich reconciler cap (15) from .dev-squad/gotchas.md — same
 // anti-pattern (zero-reset retry) caused the 2026-04-06 pipeline deadlock.
 const reenrichMaxAttempts = 10
+
+// reenrichMaxConsecutiveEligFailures is how many back-to-back eligibility-query
+// failures the worker tolerates before the health probe reports degraded.
+// Each failure is followed by a 15s back-off, so 5 ≈ 75s of total failure
+// before we let the health file go stale — long enough to ride out a transient
+// DB blip, short enough that a genuinely stalled worker (issue #28) surfaces to
+// autoheal instead of hiding behind a green healthcheck (Operational Invariant
+// #7: fail-open paths must signal).
+const reenrichMaxConsecutiveEligFailures = 5
+
+// recordEligibilitySuccess clears the consecutive-failure counter after any
+// successful eligibility query (including one that legitimately returns zero
+// eligible rows — that means the query ran, the worker is not stalled).
+func (r *ReenrichStage) recordEligibilitySuccess() { r.eligFailures.Store(0) }
+
+// recordEligibilityFailure increments the consecutive-failure counter after an
+// eligibility query error (statement timeout, etc.).
+func (r *ReenrichStage) recordEligibilityFailure() { r.eligFailures.Add(1) }
+
+// healthy reports whether the reenrich worker is doing useful work. It returns
+// false once eligibility queries have failed reenrichMaxConsecutiveEligFailures
+// times in a row, so touchHealthFile stops refreshing the health file and the
+// container healthcheck eventually fails — making the silent-degradation in
+// issue #28 visible to autoheal.
+func (r *ReenrichStage) healthy() bool {
+	return r.eligFailures.Load() < reenrichMaxConsecutiveEligFailures
+}
 
 // eligibilityQuery is the exact SQL fetchEligibleBatch runs, lifted to package
 // scope so TestEligibilityQuery_NoOrderByRandom can guard against the ORDER BY
