@@ -490,12 +490,14 @@ type school struct {
 	designation, parentName, yoga     string
 }
 
-// searchParams builds the fetchSchoolRecords/Count param map. Empty location =>
-// global (all published RYS schools); page* only used by the records call.
-func searchParams(pageSize, pageNumber int) map[string]any {
+// searchParams builds the fetchSchoolRecords/Count param map. Empty addr =>
+// global result set (capped ~2000 by the backend); a non-empty addr+lat/lng
+// filters to schools within searchRadius miles (sorted by distance), which is
+// how we sweep past the global cap. page* only used by the records call.
+func searchParams(lat, lng float64, addr, country string, pageSize, pageNumber int) map[string]any {
 	return map[string]any{
-		"schoolId": "", "schoolGoogleAddress": "", "schoolLatitude": 0, "schoolLongitude": 0,
-		"schoolStreet": "", "schoolCity": "", "schoolState": "", "schoolCountry": "",
+		"schoolId": "", "schoolGoogleAddress": addr, "schoolLatitude": lat, "schoolLongitude": lng,
+		"schoolStreet": "", "schoolCity": "", "schoolState": "", "schoolCountry": country,
 		"searchRadius": 50, "name": "", "designation": "",
 		"onlineServices": false, "closedCaptioning": false,
 		"selectedDesignations": []any{}, "selectedTrainingFormats": []any{},
@@ -504,6 +506,85 @@ func searchParams(pageSize, pageNumber int) map[string]any {
 		"ratings": []any{}, "typesOfYoga": []any{}, "language": "",
 		"sortDirection": "ASC", "pageSize": pageSize, "pageNumber": pageNumber, "SearchFlag": true,
 	}
+}
+
+// geoCenter is a sweep search center. The global pass caps at ~2000; sweeping
+// these worldwide centers (radius 50mi, deduped by Id) surfaces the rest.
+type geoCenter struct {
+	lat, lng      float64
+	addr, country string
+}
+
+// schoolCenters: yoga-dense metros worldwide (heavy US — most RYS schools are
+// US). Coords are approximate; radius 50mi tolerates imprecision. The sweep
+// stops early once the deduped unique count reaches the reported total.
+var schoolCenters = []geoCenter{
+	{40.71, -74.01, "New York, NY, USA", "United States"}, {34.05, -118.24, "Los Angeles, CA, USA", "United States"},
+	{41.88, -87.63, "Chicago, IL, USA", "United States"}, {29.76, -95.37, "Houston, TX, USA", "United States"},
+	{33.45, -112.07, "Phoenix, AZ, USA", "United States"}, {39.95, -75.17, "Philadelphia, PA, USA", "United States"},
+	{29.42, -98.49, "San Antonio, TX, USA", "United States"}, {32.72, -117.16, "San Diego, CA, USA", "United States"},
+	{32.78, -96.80, "Dallas, TX, USA", "United States"}, {30.27, -97.74, "Austin, TX, USA", "United States"},
+	{30.33, -81.66, "Jacksonville, FL, USA", "United States"}, {39.96, -82.99, "Columbus, OH, USA", "United States"},
+	{35.23, -80.84, "Charlotte, NC, USA", "United States"}, {37.77, -122.42, "San Francisco, CA, USA", "United States"},
+	{39.77, -86.16, "Indianapolis, IN, USA", "United States"}, {47.61, -122.33, "Seattle, WA, USA", "United States"},
+	{39.74, -104.99, "Denver, CO, USA", "United States"}, {38.91, -77.04, "Washington, DC, USA", "United States"},
+	{42.36, -71.06, "Boston, MA, USA", "United States"}, {36.16, -86.78, "Nashville, TN, USA", "United States"},
+	{45.52, -122.68, "Portland, OR, USA", "United States"}, {36.17, -115.14, "Las Vegas, NV, USA", "United States"},
+	{42.33, -83.05, "Detroit, MI, USA", "United States"}, {35.15, -90.05, "Memphis, TN, USA", "United States"},
+	{38.25, -85.76, "Louisville, KY, USA", "United States"}, {43.04, -87.91, "Milwaukee, WI, USA", "United States"},
+	{35.08, -106.65, "Albuquerque, NM, USA", "United States"}, {32.22, -110.97, "Tucson, AZ, USA", "United States"},
+	{38.58, -121.49, "Sacramento, CA, USA", "United States"}, {39.10, -94.58, "Kansas City, MO, USA", "United States"},
+	{33.75, -84.39, "Atlanta, GA, USA", "United States"}, {25.76, -80.19, "Miami, FL, USA", "United States"},
+	{35.78, -78.64, "Raleigh, NC, USA", "United States"}, {41.26, -95.93, "Omaha, NE, USA", "United States"},
+	{44.98, -93.27, "Minneapolis, MN, USA", "United States"}, {27.95, -82.46, "Tampa, FL, USA", "United States"},
+	{29.95, -90.07, "New Orleans, LA, USA", "United States"}, {41.50, -81.69, "Cleveland, OH, USA", "United States"},
+	{21.31, -157.86, "Honolulu, HI, USA", "United States"}, {40.76, -111.89, "Salt Lake City, UT, USA", "United States"},
+	{43.62, -116.21, "Boise, ID, USA", "United States"}, {37.54, -77.44, "Richmond, VA, USA", "United States"},
+	{35.60, -82.55, "Asheville, NC, USA", "United States"}, {40.01, -105.27, "Boulder, CO, USA", "United States"},
+	{35.69, -105.94, "Santa Fe, NM, USA", "United States"}, {43.66, -70.26, "Portland, ME, USA", "United States"},
+	{44.48, -73.21, "Burlington, VT, USA", "United States"}, {28.54, -81.38, "Orlando, FL, USA", "United States"},
+	{26.12, -80.14, "Fort Lauderdale, FL, USA", "United States"}, {32.08, -81.09, "Savannah, GA, USA", "United States"},
+	{36.85, -76.29, "Norfolk, VA, USA", "United States"}, {39.29, -76.61, "Baltimore, MD, USA", "United States"},
+	{40.44, -79.99, "Pittsburgh, PA, USA", "United States"}, {42.89, -78.88, "Buffalo, NY, USA", "United States"},
+	{43.16, -77.61, "Rochester, NY, USA", "United States"}, {42.65, -73.76, "Albany, NY, USA", "United States"},
+	{41.76, -72.69, "Hartford, CT, USA", "United States"}, {40.74, -74.17, "Newark, NJ, USA", "United States"},
+	{34.00, -81.03, "Columbia, SC, USA", "United States"}, {30.44, -84.28, "Tallahassee, FL, USA", "United States"},
+	{32.30, -90.18, "Jackson, MS, USA", "United States"}, {34.75, -92.29, "Little Rock, AR, USA", "United States"},
+	{35.47, -97.52, "Oklahoma City, OK, USA", "United States"}, {41.59, -93.62, "Des Moines, IA, USA", "United States"},
+	{43.07, -89.40, "Madison, WI, USA", "United States"}, {46.59, -112.04, "Helena, MT, USA", "United States"},
+	{33.45, -94.04, "Texarkana, USA", "United States"}, {31.76, -106.49, "El Paso, TX, USA", "United States"},
+	{36.75, -119.77, "Fresno, CA, USA", "United States"}, {34.42, -119.70, "Santa Barbara, CA, USA", "United States"},
+	{37.34, -121.89, "San Jose, CA, USA", "United States"}, {38.44, -122.71, "Santa Rosa, CA, USA", "United States"},
+	{51.51, -0.13, "London, UK", "United Kingdom"}, {53.48, -2.24, "Manchester, UK", "United Kingdom"},
+	{55.95, -3.19, "Edinburgh, UK", "United Kingdom"}, {53.41, -2.98, "Liverpool, UK", "United Kingdom"},
+	{52.49, -1.89, "Birmingham, UK", "United Kingdom"}, {53.35, -6.26, "Dublin, Ireland", "Ireland"},
+	{48.86, 2.35, "Paris, France", "France"}, {52.52, 13.40, "Berlin, Germany", "Germany"},
+	{48.14, 11.58, "Munich, Germany", "Germany"}, {50.94, 6.96, "Cologne, Germany", "Germany"},
+	{52.37, 4.90, "Amsterdam, Netherlands", "Netherlands"}, {41.39, 2.17, "Barcelona, Spain", "Spain"},
+	{40.42, -3.70, "Madrid, Spain", "Spain"}, {41.90, 12.50, "Rome, Italy", "Italy"},
+	{45.46, 9.19, "Milan, Italy", "Italy"}, {47.37, 8.54, "Zurich, Switzerland", "Switzerland"},
+	{48.21, 16.37, "Vienna, Austria", "Austria"}, {55.68, 12.57, "Copenhagen, Denmark", "Denmark"},
+	{59.33, 18.07, "Stockholm, Sweden", "Sweden"}, {59.91, 10.75, "Oslo, Norway", "Norway"},
+	{38.72, -9.14, "Lisbon, Portugal", "Portugal"}, {37.98, 23.73, "Athens, Greece", "Greece"},
+	{50.08, 14.44, "Prague, Czech Republic", "Czechia"}, {52.23, 21.01, "Warsaw, Poland", "Poland"},
+	{43.65, -79.38, "Toronto, ON, Canada", "Canada"}, {49.28, -123.12, "Vancouver, BC, Canada", "Canada"},
+	{45.50, -73.57, "Montreal, QC, Canada", "Canada"}, {51.05, -114.07, "Calgary, AB, Canada", "Canada"},
+	{-33.87, 151.21, "Sydney, Australia", "Australia"}, {-37.81, 144.96, "Melbourne, Australia", "Australia"},
+	{-27.47, 153.03, "Brisbane, Australia", "Australia"}, {-31.95, 115.86, "Perth, Australia", "Australia"},
+	{-36.85, 174.76, "Auckland, New Zealand", "New Zealand"}, {19.08, 72.88, "Mumbai, India", "India"},
+	{28.61, 77.21, "Delhi, India", "India"}, {12.97, 77.59, "Bangalore, India", "India"},
+	{18.52, 73.86, "Pune, India", "India"}, {30.09, 78.27, "Rishikesh, India", "India"},
+	{15.30, 74.12, "Goa, India", "India"}, {13.08, 80.27, "Chennai, India", "India"},
+	{-8.65, 115.22, "Bali, Indonesia", "Indonesia"}, {13.76, 100.50, "Bangkok, Thailand", "Thailand"},
+	{1.35, 103.82, "Singapore", "Singapore"}, {3.14, 101.69, "Kuala Lumpur, Malaysia", "Malaysia"},
+	{22.32, 114.17, "Hong Kong", "Hong Kong"}, {35.68, 139.69, "Tokyo, Japan", "Japan"},
+	{37.57, 126.98, "Seoul, South Korea", "South Korea"}, {25.20, 55.27, "Dubai, UAE", "United Arab Emirates"},
+	{32.08, 34.78, "Tel Aviv, Israel", "Israel"}, {-33.92, 18.42, "Cape Town, South Africa", "South Africa"},
+	{-26.20, 28.05, "Johannesburg, South Africa", "South Africa"}, {19.43, -99.13, "Mexico City, Mexico", "Mexico"},
+	{20.21, -87.47, "Tulum, Mexico", "Mexico"}, {-23.55, -46.63, "Sao Paulo, Brazil", "Brazil"},
+	{-22.91, -43.17, "Rio de Janeiro, Brazil", "Brazil"}, {-34.60, -58.38, "Buenos Aires, Argentina", "Argentina"},
+	{4.71, -74.07, "Bogota, Colombia", "Colombia"}, {-12.05, -77.04, "Lima, Peru", "Peru"},
+	{-33.45, -70.67, "Santiago, Chile", "Chile"}, {9.93, -84.08, "San Jose, Costa Rica", "Costa Rica"},
 }
 
 func apexPOST(c *http.Client, class, method string, params map[string]any) ([]byte, error) {
@@ -532,7 +613,7 @@ func apexPOST(c *http.Client, class, method string, params map[string]any) ([]by
 }
 
 func fetchSchoolCount(c *http.Client) int {
-	body, err := apexPOST(c, classSchoolSearch, methodSchoolCount, searchParams(schoolPageSize, 1))
+	body, err := apexPOST(c, classSchoolSearch, methodSchoolCount, searchParams(0, 0, "", "", schoolPageSize, 1))
 	if err != nil {
 		return 0
 	}
@@ -543,35 +624,65 @@ func fetchSchoolCount(c *http.Client) int {
 	return r.ReturnValue
 }
 
-// fetchSchoolList paginates the global RYS directory and returns unique school
-// records (deduped by Id). limit caps the count (0 = all).
-func fetchSchoolList(c *http.Client, limit int) []schoolRec {
+// fetchSchoolPage returns one page of school records for the given search params.
+func fetchSchoolPage(c *http.Client, params map[string]any) ([]schoolRec, error) {
+	body, err := apexPOST(c, classSchoolSearch, methodSchoolRecords, params)
+	if err != nil {
+		return nil, err
+	}
+	var r schoolListResp
+	if json.Unmarshal(body, &r) != nil {
+		return nil, fmt.Errorf("parse school records")
+	}
+	return r.ReturnValue, nil
+}
+
+// enumerateSchools returns unique RYS school records (deduped by Id). The global
+// pass (empty location) caps at ~2000, so we then sweep schoolCenters worldwide
+// (radius 50mi each) until the deduped count reaches the reported total. limit
+// caps the result (0 = all).
+func enumerateSchools(c *http.Client, limit int) []schoolRec {
 	seen := map[string]bool{}
 	var out []schoolRec
-	for page := 1; ; page++ {
-		body, err := apexPOST(c, classSchoolSearch, methodSchoolRecords, searchParams(schoolPageSize, page))
-		if err != nil {
-			log.Printf("  school list page %d: %v", page, err)
-			break
-		}
-		var r schoolListResp
-		if json.Unmarshal(body, &r) != nil || len(r.ReturnValue) == 0 {
-			break
-		}
-		for _, rec := range r.ReturnValue {
+	total := fetchSchoolCount(c)
+
+	add := func(recs []schoolRec) {
+		for _, rec := range recs {
 			if rec.Id == "" || seen[rec.Id] {
 				continue
 			}
 			seen[rec.Id] = true
 			out = append(out, rec)
 		}
-		if page%20 == 0 {
-			log.Printf("  enumerated %d unique schools (page %d)", len(out), page)
+	}
+	// paginate one location (empty addr = global) up to 120 pages.
+	sweep := func(lat, lng float64, addr, country string) {
+		for page := 1; page <= 120; page++ {
+			recs, err := fetchSchoolPage(c, searchParams(lat, lng, addr, country, schoolPageSize, page))
+			if err != nil || len(recs) == 0 {
+				break
+			}
+			add(recs)
+			if limit > 0 && len(out) >= limit {
+				return
+			}
 		}
-		if limit > 0 && len(out) >= limit {
-			out = out[:limit]
+	}
+
+	sweep(0, 0, "", "") // global pass
+	log.Printf("  global pass: %d unique (of %d total)", len(out), total)
+
+	for i, ctr := range schoolCenters {
+		if (limit > 0 && len(out) >= limit) || (total > 0 && len(out) >= total) {
 			break
 		}
+		sweep(ctr.lat, ctr.lng, ctr.addr, ctr.country)
+		if (i+1)%15 == 0 || len(out) >= total {
+			log.Printf("  swept %d/%d centers: %d/%d unique schools", i+1, len(schoolCenters), len(out), total)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }
@@ -615,7 +726,7 @@ func (s *school) row() []string {
 func runSchools(c *http.Client, db *sql.DB, conc, limit int, outPath string) {
 	total := fetchSchoolCount(c)
 	log.Printf("yogaalliance: school — directory reports %d published RYS schools globally", total)
-	recs := fetchSchoolList(c, limit)
+	recs := enumerateSchools(c, limit)
 	log.Printf("yogaalliance: school — %d unique schools to fetch (concurrency=%d, insert=%v, csv=%q)", len(recs), conc, db != nil, outPath)
 
 	var w *csv.Writer
