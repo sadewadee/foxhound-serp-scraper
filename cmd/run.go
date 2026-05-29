@@ -15,6 +15,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
+	"github.com/sadewadee/serp-scraper/internal/health"
 	"github.com/sadewadee/serp-scraper/internal/monitor"
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
 	"github.com/sadewadee/serp-scraper/internal/reconciler"
@@ -65,6 +66,10 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		slog.Info("received signal, shutting down", "signal", sig)
 		cancel()
 	}()
+
+	// Startup diagnostics: check that Camoufox's embedded Firefox base is not
+	// too far behind upstream.  Best-effort — does not block startup.
+	go health.CheckCamoufoxStaleness(ctx, dd.Client())
 
 	// Start Prometheus metrics server.
 	if cfg.Monitor.Enabled {

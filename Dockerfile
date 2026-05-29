@@ -9,6 +9,15 @@
 #     -e POSTGRES_DSN="postgres://..." \
 #     -e REDIS_ADDR="100.x.x.1:6379" \
 #     ghcr.io/sadewadee/foxhound-serp-scraper run -stage enrich -workers 20
+#
+# Pinned dependency versions (bump deliberately, not on every build):
+#   CAMOUFOX_VERSION — pip package; `python3 -m camoufox fetch` pulls the matching
+#                      browser binary from GitHub releases.  Verify the Firefox base
+#                      shipped by a new version before bumping (see internal/health/startup.go).
+#   NOPECHA_TAG      — NopeCHA Firefox extension GitHub release tag.
+#   PWGO_VER         — read from go.mod at build time (no separate ARG needed).
+ARG CAMOUFOX_VERSION=0.4.11
+ARG NOPECHA_TAG=0.5.6
 
 # ---------------------------------------------------------------------------
 # Stage 1: builder
@@ -50,8 +59,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcomposite1 libxdamage1 libxrandr2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Camoufox browser binary.
-RUN pip3 install --break-system-packages camoufox \
+# Camoufox browser binary (pinned — see ARG at top of file).
+ARG CAMOUFOX_VERSION
+RUN pip3 install --break-system-packages camoufox==${CAMOUFOX_VERSION} \
     && python3 -m camoufox fetch
 
 # Playwright Firefox driver (version from go.mod).
@@ -64,12 +74,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends golang unzip \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /root/go/pkg /tmp/go.mod
 
-# Pre-cache NopeCHA extension (auto-solve captcha).
+# Pre-cache NopeCHA extension (pinned release — see ARG at top of file).
+# Using a pinned tag instead of /releases/latest avoids surprise breakage when
+# NopeCHA ships a release that changes extension manifest structure.
+ARG NOPECHA_TAG
 RUN mkdir -p /root/.cache/foxhound/extensions/nopecha \
-    && RELEASE_URL=$(curl -fsSL https://api.github.com/repos/NopeCHALLC/nopecha-extension/releases/latest \
-       | grep -o '"browser_download_url": *"[^"]*firefox\.zip"' \
-       | head -1 | cut -d'"' -f4) \
-    && curl -fsSL "$RELEASE_URL" -o /tmp/nopecha.zip \
+    && curl -fsSL \
+       "https://github.com/NopeCHALLC/nopecha-extension/releases/download/${NOPECHA_TAG}/firefox.zip" \
+       -o /tmp/nopecha.zip \
     && unzip -q /tmp/nopecha.zip -d /root/.cache/foxhound/extensions/nopecha \
     && rm /tmp/nopecha.zip
 
