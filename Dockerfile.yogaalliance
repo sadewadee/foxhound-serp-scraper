@@ -1,0 +1,24 @@
+# Dedicated image for the Yoga Alliance directory crawler (cmd/yogaalliance).
+# Pure-Go HTTP crawler — NO Camoufox/playwright, so it builds in seconds and
+# the image is tiny (~20MB). Runs on the server where it has Postgres access
+# and inserts in-niche yoga teacher/school records straight into the existing
+# tables (business_listings + emails + business_emails, source='yogaalliance').
+#
+# Build:  docker build -f Dockerfile.yogaalliance -t ghcr.mcpke.dev/yogaalliance-crawler:v1 .
+# Run:    docker run --rm -e POSTGRES_DSN=... ghcr.mcpke.dev/yogaalliance-crawler:v1 \
+#           -mode teacher -insert -concurrency 8
+
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-w -s" -o /yoga ./cmd/yogaalliance
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 yoga
+USER yoga
+COPY --from=build /yoga /usr/local/bin/yoga
+ENTRYPOINT ["yoga"]
+# Default: crawl all teachers and insert into the DB. Override args at runtime.
+CMD ["-mode", "teacher", "-insert", "-concurrency", "8"]

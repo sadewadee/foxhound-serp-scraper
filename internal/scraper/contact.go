@@ -5,6 +5,8 @@ package scraper
 import (
 	"fmt"
 	"net"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
@@ -151,6 +153,19 @@ func ExtractContacts(body []byte) *ContactData {
 	// ── HTML address fallback (if JSON-LD didn't provide one) ──
 	if cd.Address == "" {
 		extractHTMLAddress(resp, cd)
+	}
+
+	// ── Address tail-parse fallback for City + Country ──
+	// Catches the common case where JSON-LD had no addressCountry/addressLocality
+	// and we have a raw address blob like "...Flat Rock, NC, United States" with
+	// the country (and a US-style city) embedded as trailing tokens.
+	if cd.Address != "" {
+		if cd.Country == "" {
+			cd.Country = tailParseCountry(cd.Address)
+		}
+		if cd.City == "" {
+			cd.City = tailParseCity(cd.Address)
+		}
 	}
 
 	// ── Page title fallback ──
@@ -459,6 +474,337 @@ func extractLDCityCountry(ld map[string]any) (string, string) {
 		}
 	}
 	return city, normalizeCountry(rawCountry)
+}
+
+// usStateCodes is the set of US state 2-letter codes used by tailParseCity to
+// recognize the canonical US-style "..., <city>, <ST>[ <zip>][, <country>]"
+// pattern. Mirrors the stateBlocklist in normalizeCountry — kept here as a
+// dedicated set so the city parser does not silently broaden to non-US
+// state-like tokens.
+var usStateCodes = map[string]bool{
+	"CA": true, "NY": true, "TX": true, "WA": true, "OR": true,
+	"FL": true, "IL": true, "MA": true, "PA": true, "AZ": true,
+	"CO": true, "NV": true, "NJ": true, "GA": true, "NC": true,
+	"VA": true, "MI": true, "OH": true, "IN": true, "MN": true,
+	"WI": true, "MO": true, "MD": true, "TN": true, "SC": true,
+	"AL": true, "KY": true, "LA": true, "OK": true, "CT": true,
+	"UT": true, "NM": true, "NH": true, "VT": true, "ME": true,
+	"RI": true, "DE": true, "HI": true, "AK": true, "ID": true,
+	"MT": true, "ND": true, "SD": true, "NE": true, "KS": true,
+	"WV": true, "AR": true, "MS": true, "IA": true, "DC": true,
+}
+
+// usCityRe matches a US-style trailing "<city>, <STATE>[<sep><zip>][, <country>]"
+// segment. Group 1 = city candidate, Group 2 = state code. The separator
+// between state and zip can be either a space ("TX 75244") or a comma
+// (", TX, 75244, USA") — both forms are common in scraped data. Anchored
+// to end of string so we extract the LAST city in the address (the
+// business location, not a street-level token).
+var usCityRe = regexp.MustCompile(`(?:^|,)\s*([^,]+?)\s*,\s*([A-Z]{2})\b(?:[\s,]+\d{5}(?:-\d{4})?)?(?:[\s,].*)?$`)
+
+// ccTLDToISO maps reliable ccTLDs to their ISO 3166-1 alpha-2 country code.
+// Curated allowlist — generic-looking ccTLDs (.io, .co, .me, .tv, .cc) are
+// deliberately excluded because they are dominated by global startups and
+// would mis-flag US/EU companies as British-Indian-Ocean-Territory etc.
+// Compound entries (".co.uk") must precede their single-component form.
+var ccTLDToISO = map[string]string{
+	// Compound (longest match first via lookup order below).
+	"co.uk": "GB", "org.uk": "GB", "ac.uk": "GB", "gov.uk": "GB",
+	"com.au": "AU", "net.au": "AU", "org.au": "AU",
+	"co.jp": "JP", "or.jp": "JP", "ne.jp": "JP",
+	"co.kr": "KR",
+	"co.id": "ID", "or.id": "ID", "ac.id": "ID",
+	"co.in":  "IN",
+	"co.nz":  "NZ",
+	"co.za":  "ZA",
+	"com.br": "BR", "com.mx": "MX", "com.sg": "SG", "com.my": "MY",
+	"com.tr": "TR", "com.tw": "TW", "com.hk": "HK", "com.ph": "PH",
+	// Single-component ccTLDs (high-signal: dominantly used by local entities).
+	"nl": "NL", "de": "DE", "fr": "FR", "it": "IT", "es": "ES",
+	"be": "BE", "at": "AT", "ch": "CH", "se": "SE", "no": "NO",
+	"dk": "DK", "fi": "FI", "pl": "PL", "pt": "PT", "ie": "IE",
+	"gr": "GR", "hu": "HU", "cz": "CZ", "ro": "RO", "ru": "RU",
+	"au": "AU", "nz": "NZ", "ca": "CA", "br": "BR", "mx": "MX",
+	"id": "ID", "jp": "JP", "kr": "KR", "in": "IN", "my": "MY",
+	"th": "TH", "vn": "VN", "ph": "PH", "sg": "SG", "tw": "TW",
+	"hk": "HK", "ae": "AE", "sa": "SA", "il": "IL", "tr": "TR",
+	"za": "ZA",
+}
+
+// collisionCountryCodes are 2-letter codes that are BOTH legitimate ISO 3166-1
+// alpha-2 country codes AND US state codes (in usStateCodes). normalizeCountry
+// rejects them unconditionally because the false-positive cost of treating a
+// US row as Indonesia/Israel/India outweighs the benefit. The collision
+// heuristic in tailParseCountry rescues them only when surrounding tokens
+// indicate a non-US address shape.
+var collisionCountryCodes = map[string]bool{
+	"ID": true, // Indonesia vs Idaho
+	"IL": true, // Israel vs Illinois
+	"IN": true, // India vs Indiana
+}
+
+// usStateFullNames lists single-word US state names used by the collision
+// heuristic. Multi-word names ("New York", "North Carolina") are NOT here —
+// matching them needs span-aware logic and is out of scope; the 2-letter
+// codes (NY, NC) in usStateCodes catch the same cases anyway. Lowercase.
+var usStateFullNames = map[string]bool{
+	"alabama": true, "alaska": true, "arizona": true, "arkansas": true,
+	"california": true, "colorado": true, "connecticut": true,
+	"delaware": true, "florida": true, "georgia": true,
+	"hawaii": true, "idaho": true, "illinois": true, "indiana": true,
+	"iowa": true, "kansas": true, "kentucky": true, "louisiana": true,
+	"maine": true, "maryland": true, "massachusetts": true, "michigan": true,
+	"minnesota": true, "mississippi": true, "missouri": true, "montana": true,
+	"nebraska": true, "nevada": true, "ohio": true, "oklahoma": true,
+	"oregon": true, "pennsylvania": true, "tennessee": true, "texas": true,
+	"utah": true, "vermont": true, "virginia": true, "washington": true,
+	"wisconsin": true, "wyoming": true,
+}
+
+// usStateZipRe finds a US "<2-letter token> <ZIP5>" / "<2-letter>, <ZIP5>"
+// marker anywhere in an address. Group 1 (the 2-letter token) is validated
+// against usStateCodes by the caller — the regex alone is intentionally loose
+// so the state-set is the single source of truth. ZIP is exactly 5 digits
+// (US format), optional +4. Non-US postal formats put the postal code FIRST
+// ("01067 Dresden") or use 3-letter/alphanumeric region codes ("NSW 2000",
+// "ON M5J 1V6"), so this shape is dominated by real US addresses.
+var usStateZipRe = regexp.MustCompile(`(?:^|[\s,])([A-Za-z]{2})[\s,]+(\d{5})(?:-\d{4})?(?:[\s,]|$)`)
+
+// usFullStateZipRe finds "<single-word state name> <ZIP5>" (e.g. "Texas 77056",
+// "Texas, 77056") — the full-name analogue of usStateZipRe. Built from
+// usStateFullNames so the name-set stays the single source of truth.
+var usFullStateZipRe = func() *regexp.Regexp {
+	names := make([]string, 0, len(usStateFullNames))
+	for n := range usStateFullNames {
+		names = append(names, n)
+	}
+	return regexp.MustCompile(`(?i)\b(` + strings.Join(names, "|") + `)\b[\s,]+\d{5}(?:-\d{4})?\b`)
+}()
+
+// inferUSFromStateZip returns true when the address carries a US state+ZIP
+// marker — a 2-letter US state code OR a single-word US state name immediately
+// followed by a 5-digit ZIP. This is a high-precision US signal that recovers
+// the large class of scraped US addresses omitting an explicit "USA"/"United
+// States" token (issue #26: e.g. "Houston, Texas, 77056", "Erie, PA 16504").
+// Output is always the validated ISO code "US", so it never pollutes the
+// country column. Used as a last-resort fallback in tailParseCountry, AFTER
+// the explicit-country tail walk and the ID/IL/IN collision rescue, so a
+// genuine trailing country name (incl. India/Israel/Indonesia) still wins.
+func inferUSFromStateZip(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	for _, m := range usStateZipRe.FindAllStringSubmatch(addr, -1) {
+		if usStateCodes[strings.ToUpper(m[1])] {
+			return true
+		}
+	}
+	return usFullStateZipRe.MatchString(addr)
+}
+
+// tailParseCountry walks the comma-separated tokens of an address from the
+// tail backward and returns the first token that resolves via normalizeCountry
+// to a non-empty ISO alpha-2 code. Used as a fallback when JSON-LD did not
+// provide an addressCountry — e.g. raw HTML addresses like
+// "521 Oak Grove Rd, Flat Rock, NC, United States" where the country is
+// embedded as the trailing free-form token.
+//
+// Within each candidate segment we also try right-anchored word slices (last
+// 1..3 whitespace-separated words) so embedded forms like "239222\nSingapore"
+// or "6011\nNew Zealand" — common when a postal code and country share the
+// final comma segment — still resolve to SG / NZ.
+//
+// Collision heuristic: 2-letter codes that are both ISO country codes AND
+// US state codes (ID/IL/IN) are accepted as country codes when the rest of
+// the address contains no US state markers (codes or full state names) and
+// the preceding token is postal-shape numeric. Conservative — biases toward
+// "" over wrong tagging when the signal is ambiguous.
+func tailParseCountry(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	parts := strings.Split(addr, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		candidate := strings.TrimRight(strings.TrimSpace(parts[i]), ".,;: ")
+		if candidate == "" {
+			continue
+		}
+		if iso := normalizeCountry(candidate); iso != "" {
+			return iso
+		}
+		// Collision rescue for ID/IL/IN (Indonesia/Israel/India vs
+		// Idaho/Illinois/Indiana) — only when the address shape signals
+		// non-US format. See acceptCollisionCountryCode for the gate.
+		upper := strings.ToUpper(candidate)
+		if collisionCountryCodes[upper] && acceptCollisionCountryCode(parts, i) {
+			return upper
+		}
+		// Collapse internal whitespace (incl. \n, \t) and try right-anchored
+		// word slices. Right-anchored only: avoids "USA Drive, ..." style
+		// false positives where the country-looking token is at the START
+		// of a street-name segment.
+		words := strings.Fields(candidate)
+		maxSlice := 3
+		if maxSlice > len(words) {
+			maxSlice = len(words)
+		}
+		for w := 1; w <= maxSlice; w++ {
+			slice := strings.Join(words[len(words)-w:], " ")
+			// Skip single-word 2-letter slices — the full-candidate
+			// normalizeCountry call above already handled the 2-letter
+			// path with its state-code blocklist; a 2-letter slice
+			// matching here is almost always a coincidental street
+			// abbreviation (e.g. "St" → "ST" = São Tomé) rather than
+			// an actual country mention.
+			if w == 1 && len(slice) == 2 {
+				continue
+			}
+			if iso := normalizeCountry(slice); iso != "" {
+				return iso
+			}
+		}
+	}
+	// Last resort: no explicit country token anywhere, but a US state+ZIP
+	// marker ("city, ST 12345" / "city, Texas, 12345") is an unambiguous US
+	// signal. Recovers the dominant empty-country class (issue #26).
+	if inferUSFromStateZip(addr) {
+		return "US"
+	}
+	return ""
+}
+
+// acceptCollisionCountryCode returns true when a 2-letter collision code at
+// parts[idx] (e.g. "ID" / "IL" / "IN") should be treated as a country code
+// rather than a US state code. ACCEPT only when both conditions hold:
+//
+//   - No US state code (2-letter from usStateCodes) AND no single-word US
+//     state name (from usStateFullNames) appears in the preceding tokens.
+//     Either presence indicates US-format address.
+//   - The immediately preceding token (parts[idx-1]) is postal-shape — at
+//     least 4 digits. Indonesian postal codes are 5 digits, Indian PINs are
+//     6 digits, Israeli ZIPs are 5-7 digits, so the floor of 4 stays
+//     conservative without missing the target geographies.
+//
+// Conservative — prefers false negatives (missed Indonesia/Israel/India)
+// over false positives (US row mis-tagged), matching the project-wide
+// "prefer empty over wrong" policy.
+func acceptCollisionCountryCode(parts []string, idx int) bool {
+	if idx == 0 {
+		return false // need a preceding postal token to anchor non-US shape
+	}
+	// Scan preceding tokens for any US state marker.
+	for _, p := range parts[:idx] {
+		for _, raw := range strings.Fields(p) {
+			word := strings.TrimRight(raw, ".,;:")
+			if len(word) == 2 && usStateCodes[strings.ToUpper(word)] {
+				return false
+			}
+			if usStateFullNames[strings.ToLower(word)] {
+				return false
+			}
+		}
+	}
+	// Verify the immediately preceding token is postal-shape (mostly digits).
+	prev := strings.TrimSpace(parts[idx-1])
+	if prev == "" {
+		return false
+	}
+	digits := 0
+	for _, r := range prev {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	return digits >= 4
+}
+
+// tailParseCity returns the city from a US-style trailing address segment of
+// the form "..., <city>, <STATE>[ <zip>][, <country>]". Returns "" for any
+// address that does not match this canonical US shape — non-US addresses
+// have too many regional formats to parse reliably, and a wrong city is
+// worse than an empty one (per the "prefer empty over wrong" policy that
+// normalizeCountry also follows).
+func tailParseCity(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	m := usCityRe.FindStringSubmatch(addr)
+	if len(m) < 3 {
+		return ""
+	}
+	if !usStateCodes[strings.ToUpper(m[2])] {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// ParseAddressFallback runs tail-based country and city derivation on a raw
+// address string. Returns ISO alpha-2 country (or "") and US-style city
+// (or "") — the same logic that ExtractContacts applies internally after
+// HTML address fallback. Pure offline transform — no network. Exposed so
+// the reenrich worker can pre-pass existing DB rows before paying for a
+// network refetch, and the backfill CLI can sweep historical NULL rows.
+func ParseAddressFallback(address string) (country, city string) {
+	if address == "" {
+		return "", ""
+	}
+	return tailParseCountry(address), tailParseCity(address)
+}
+
+// tldCountryHint returns the ISO 3166-1 alpha-2 code suggested by the host's
+// ccTLD, or "" if the TLD is not in the curated allowlist. Tries the
+// two-segment compound form first (.co.uk, .com.au) before falling back to
+// the single-segment ccTLD. Generic TLDs (.com, .io, .co, .me) deliberately
+// return "" to avoid false positives.
+func tldCountryHint(host string) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || !strings.Contains(host, ".") {
+		return ""
+	}
+	segs := strings.Split(host, ".")
+	if len(segs) >= 2 {
+		compound := segs[len(segs)-2] + "." + segs[len(segs)-1]
+		if iso, ok := ccTLDToISO[compound]; ok {
+			return iso
+		}
+	}
+	if iso, ok := ccTLDToISO[segs[len(segs)-1]]; ok {
+		return iso
+	}
+	return ""
+}
+
+// ApplyTLDCountryFallback fills cd.Country from the page URL's ccTLD when
+// it is still empty after all other extraction paths. Gated behind the
+// COUNTRY_TLD_FALLBACK_ENABLED env flag because ccTLD is a soft signal —
+// global companies on .com mask their origin and local sites occasionally
+// host on .io/.co. Off by default; callers opt in per-deployment.
+func ApplyTLDCountryFallback(cd *ContactData, pageURL string) {
+	if cd == nil || cd.Country != "" || pageURL == "" {
+		return
+	}
+	if !envFlagEnabled("COUNTRY_TLD_FALLBACK_ENABLED") {
+		return
+	}
+	u, err := url.Parse(pageURL)
+	if err != nil || u.Host == "" {
+		return
+	}
+	if iso := tldCountryHint(u.Host); iso != "" {
+		cd.Country = iso
+	}
+}
+
+// envFlagEnabled returns true when the named env var is set to a truthy
+// value ("1", "true", "yes", "on" — case-insensitive). All other values
+// (including unset / empty) return false.
+func envFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // whichYouTubePath reconstructs a canonical YouTube URL from the matched

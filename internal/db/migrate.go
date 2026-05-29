@@ -1,9 +1,17 @@
 package db
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/lib/pq"
 )
 
 const schema = `
@@ -161,10 +169,104 @@ CREATE TABLE IF NOT EXISTS workers (
 `
 
 // runMigrations applies incremental schema changes that are safe to re-run.
+// addColumnRe matches `ALTER TABLE <t> ADD COLUMN IF NOT EXISTS <c> ...` so we can
+// skip the statement when <c> already exists on <t>.
+var addColumnRe = regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)`)
+
+// existingColumns returns the set of "table.column" (lowercased) present in the
+// public schema. Used to skip ADD COLUMN IF NOT EXISTS migrations that would
+// otherwise take an ACCESS EXCLUSIVE lock on hot tables (enrichment_jobs/serp_jobs)
+// even as a no-op. Incident 2026-05-29: a reenrich boot ran the idempotent
+// ALTER batch, its no-op ALTER on enrichment_jobs queued for ACCESS EXCLUSIVE
+// behind the enrich hot path, and once queued it blocked all 21 enrich workers
+// behind it — boot exceeded the 120s healthcheck window, autoheal killed the
+// container, and it restart-looped, never finishing migrations. On a fully
+// migrated DB (production) every ADD COLUMN is a no-op, so skipping them means
+// boot takes ZERO hot-table DDL locks.
+func existingColumns(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	set := make(map[string]bool)
+	for rows.Next() {
+		var t, c string
+		if err := rows.Scan(&t, &c); err != nil {
+			return nil, err
+		}
+		set[strings.ToLower(t)+"."+strings.ToLower(c)] = true
+	}
+	return set, rows.Err()
+}
+
+// execMigrationBatch runs a mixed DDL batch (ALTER ... ADD COLUMN + CREATE INDEX),
+// skipping ADD COLUMN statements whose column already exists (cols) so production
+// boots take no lock on hot tables. Surviving statements run on a dedicated
+// connection with a bounded lock_timeout: a genuinely-new column on a busy table
+// fails fast and is retried with backoff rather than wedging the hot path (and
+// cascading into an autoheal restart loop, incident 2026-05-29). errCtx labels
+// failures for the original call site.
+func execMigrationBatch(db *sql.DB, cols map[string]bool, errCtx string, stmts []string) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("db: %s: acquire conn: %w", errCtx, err)
+	}
+	defer conn.Close()
+	// Bound DDL lock waits. A no-op is instant; a real ALTER on a busy table must
+	// not block enrich/serp indefinitely. lock_timeout only bounds the lock
+	// acquisition, not the (metadata-only) ALTER itself.
+	if _, err := conn.ExecContext(ctx, `SET lock_timeout = '5s'`); err != nil {
+		return fmt.Errorf("db: %s: set lock_timeout: %w", errCtx, err)
+	}
+	// Reset before the pinned connection returns to the pool. lib/pq does NOT
+	// issue RESET on pool return, so a session-level lock_timeout would leak onto
+	// pooled connections for the container's lifetime and make reconciler/persist
+	// queries that legitimately wait >5s fail with 55P03. defer runs LIFO, so this
+	// fires before conn.Close().
+	defer conn.ExecContext(ctx, `SET lock_timeout = DEFAULT`)
+	for _, stmt := range stmts {
+		if m := addColumnRe.FindStringSubmatch(stmt); m != nil {
+			if cols[strings.ToLower(m[1])+"."+strings.ToLower(m[2])] {
+				continue // column present — skip the lock-taking no-op ALTER
+			}
+		}
+		var lastErr error
+		for attempt := 0; attempt < 6; attempt++ {
+			if _, lastErr = conn.ExecContext(ctx, stmt); lastErr == nil {
+				break
+			}
+			// 55P03 = lock_not_available (lock_timeout fired). Back off and retry;
+			// the hot path will eventually yield a lock window. Any other error is
+			// real — stop and surface it so boot fails loudly.
+			var pqErr *pq.Error
+			if !errors.As(lastErr, &pqErr) || pqErr.Code != "55P03" {
+				break
+			}
+			slog.Warn("db: migration DDL waiting on lock, retrying", "ctx", errCtx, "attempt", attempt+1, "stmt", stmt)
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		}
+		if lastErr != nil {
+			return fmt.Errorf("db: %s: %w (stmt: %s)", errCtx, lastErr, stmt)
+		}
+	}
+	return nil
+}
+
 func runMigrations(db *sql.DB) error {
 	// Enable pgcrypto for SHA-256 hashing in triggers.
 	if _, err := db.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
 		return fmt.Errorf("db: create extension pgcrypto: %w", err)
+	}
+
+	// Snapshot existing columns so we skip idempotent ADD COLUMN no-ops that would
+	// otherwise take an ACCESS EXCLUSIVE lock on hot tables during worker boot
+	// (incident 2026-05-29 — see existingColumns doc). On a fresh DB this is empty
+	// and every ALTER runs; on a migrated DB it skips them all → zero-lock boot.
+	cols, err := existingColumns(db)
+	if err != nil {
+		return fmt.Errorf("db: snapshot existing columns: %w", err)
 	}
 
 	// GUARDRAIL: Legacy tables renamed to _backup, NEVER dropped.
@@ -172,9 +274,13 @@ func runMigrations(db *sql.DB) error {
 	db.Exec(`ALTER TABLE IF EXISTS enrich_jobs RENAME TO enrich_jobs_backup`)
 	db.Exec(`ALTER TABLE IF EXISTS websites RENAME TO websites_backup`)
 
-	// Add picked_at column to serp_jobs if missing (from redesign).
-	if _, err := db.Exec(`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`); err != nil {
-		return fmt.Errorf("db: add picked_at column: %w", err)
+	// Add picked_at column to serp_jobs if missing (from redesign). Routed through
+	// execMigrationBatch so a no-op skips the ACCESS EXCLUSIVE lock on the hot
+	// serp_jobs table (incident 2026-05-29).
+	if err := execMigrationBatch(db, cols, "add picked_at column", []string{
+		`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`,
+	}); err != nil {
+		return err
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_feed ON serp_jobs(created_at) WHERE status = 'new' AND picked_at IS NULL`); err != nil {
 		return fmt.Errorf("db: create idx_serp_feed: %w", err)
@@ -212,16 +318,14 @@ func runMigrations(db *sql.DB) error {
 	}
 
 	// Add delta tracking columns to workers for per-heartbeat rate calculation.
-	for _, stmt := range []string{
+	if err := execMigrationBatch(db, cols, "worker delta columns", []string{
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_prev BIGINT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_prev BIGINT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_delta INT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_delta INT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS delta_at TIMESTAMPTZ`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("db: worker delta columns: %w", err)
-		}
+	}); err != nil {
+		return err
 	}
 
 	// Schema fix 2026-04-27: extraction layer captured fields that the trigger
@@ -230,7 +334,7 @@ func runMigrations(db *sql.DB) error {
 	// Add missing columns + raw_* counterparts; the trigger update later in
 	// this file forwards them. opening_hours/rating remain optional — they
 	// stay null when extraction misses them.
-	for _, stmt := range []string{
+	if err := execMigrationBatch(db, cols, "schema fix 2026-04-27", []string{
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country TEXT`,
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS city TEXT`,
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS contact_name TEXT`,
@@ -250,9 +354,51 @@ func runMigrations(db *sql.DB) error {
 		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_telegram TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_bl_country ON business_listings(country) WHERE country IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_bl_city ON business_listings(city) WHERE city IS NOT NULL`,
+		// Niche infrastructure (2026-05-22). The category column is contaminated:
+		// ~6K rows are explicit off-niche schema.org types (Hotel, AutoDealer,
+		// Dentist, Restaurant, ...) and ~41K are meta-keyword soup (>100 chars).
+		// off_niche flag lets the API default-filter to wellness/yoga/fitness
+		// results without DELETing data (memory feedback_never_drop_data.md).
+		// niche_category is the trigger-classified bucket (yoga, pilates,
+		// fitness, wellness, healing, ayurveda, spa, meditation) for the
+		// upcoming ?niche= filter. Both columns also wired into the upsert
+		// trigger below so new rows get tagged at insert time.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS off_niche BOOLEAN DEFAULT FALSE`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_category TEXT`,
+		// idx_bl_niche_active + idx_bl_off_niche_false are created BELOW with
+		// CONCURRENTLY (auditor P1 fix): plain CREATE INDEX takes ShareLock on
+		// business_listings (779K rows), and with 7 deploy containers racing
+		// db.Migrate() against PG_MAX_OPEN_CONNS=2 the lock contention saturates
+		// the pool. CONCURRENTLY uses ShareUpdateExclusiveLock instead, which
+		// doesn't block concurrent writes. Cannot live inside this batch since
+		// CONCURRENTLY is illegal inside a transaction block.
+	}); err != nil {
+		return err
+	}
+
+	// Niche indexes — created CONCURRENTLY outside any tx (CLAUDE.md /
+	// CONCURRENTLY is illegal inside a tx block).
+	//
+	//   idx_bl_niche_active   — serves ?include_off_niche=false + ?niche=X.
+	//                            Skips NULL niche_category to keep idx small
+	//                            on the long tail of unclassified rows.
+	//   idx_bl_off_niche_false — serves the default-listing path (no niche
+	//                            filter, just off_niche=false). PK already
+	//                            covers ORDER BY bl.id, this partial idx
+	//                            backs the WHERE predicate.
+	//
+	// Failure handling: CONCURRENTLY can race with parallel deploys; one of
+	// the 7 containers will succeed, the rest will see IF NOT EXISTS and skip.
+	// We log+continue on error rather than failing the entire migration, since
+	// the partial idx is an optimization, not a correctness requirement (the
+	// planner falls back to PK scan + filter, slower but correct).
+	for _, stmt := range []string{
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_niche_active ON business_listings(niche_category) WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_off_niche_false ON business_listings(id) WHERE off_niche IS NOT TRUE`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
+			slog.Warn("db: niche index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
+				"stmt", stmt, "error", err)
 		}
 	}
 
@@ -296,15 +442,70 @@ func runMigrations(db *sql.DB) error {
 		    --    description and location were hardcoded NULL here, and
 		    --    country/city/contact_name/opening_hours/rating/multi-phone
 		    --    had no path at all — extracted then dropped on the floor.
+		    --
+		    -- Niche classifier inlined here (no Go code, per design):
+		    --   • off_niche = TRUE for known off-niche schema.org @type values
+		    --     (AutoDealer, Hotel, Restaurant, Dentist, ...) OR meta-keyword
+		    --     soup (raw_category length > 100). These are the patterns
+		    --     observed polluting business_listings.category — see plan.
+		    --   • niche_category bucketed from the union of raw_business_name +
+		    --     raw_page_title + raw_description against the same niche keyword
+		    --     whitelist used to generate queries in internal/query/wellness.go.
+		    --     \m...\M = word boundaries; LOWER() makes the match case-insensitive.
 		    INSERT INTO business_listings (domain, url, business_name, category, description,
 		        address, location, country, city, contact_name,
 		        phone, phones, website, page_title, social_links,
-		        opening_hours, rating, tiktok, youtube, telegram, source_query_id)
+		        opening_hours, rating, tiktok, youtube, telegram, source_query_id,
+		        off_niche, niche_category)
 		    VALUES (NEW.domain, NEW.url, NEW.raw_business_name, NEW.raw_category, NEW.raw_description,
 		        NEW.raw_address, NEW.raw_location, NEW.raw_country, NEW.raw_city, NEW.raw_contact_name,
 		        NEW.raw_phones[1], COALESCE(NEW.raw_phones, '{}'), NEW.url, NEW.raw_page_title, NEW.raw_social,
 		        NEW.raw_opening_hours, NEW.raw_rating, NEW.raw_tiktok, NEW.raw_youtube, NEW.raw_telegram,
-		        NEW.parent_query_id)
+		        NEW.parent_query_id,
+		        -- off_niche
+		        CASE
+		          WHEN NEW.raw_category IS NOT NULL AND LENGTH(NEW.raw_category) > 100 THEN TRUE
+		          WHEN NEW.raw_category IN (
+		            'AutoDealer','Hotel','Restaurant','Dentist','Physician',
+		            'RealEstateAgent','LegalService','HairSalon','BeautySalon',
+		            'TravelAgency','LodgingBusiness','GeneralContractor',
+		            'RoofingContractor','HomeAndConstructionBusiness',
+		            'MedicalClinic','MedicalBusiness','HealthAndBeautyBusiness'
+		          ) THEN TRUE
+		          ELSE FALSE
+		        END,
+		        -- niche_category
+		        CASE
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\myoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti\M' THEN 'yoga'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\mpilates|reformer\M' THEN 'pilates'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\mcrossfit|bootcamp|hiit|barre|spin\M' THEN 'fitness'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\m(gym|fitness)\M' THEN 'fitness'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\mmeditation|mindfulness|breathwork\M' THEN 'meditation'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\mreiki|sound healing|energy healing|healing\M' THEN 'healing'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\mayurved\M' THEN 'ayurveda'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\m(spa|massage|thermal)\M' THEN 'spa'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                     COALESCE(NEW.raw_description,'')) ~ '\m(wellness|holistic)\M' THEN 'wellness'
+		          ELSE NULL
+		        END
+		    )
 		    ON CONFLICT (domain) DO UPDATE SET
 		        business_name = COALESCE(EXCLUDED.business_name, business_listings.business_name),
 		        category      = COALESCE(EXCLUDED.category, business_listings.category),
@@ -328,6 +529,12 @@ func runMigrations(db *sql.DB) error {
 		        tiktok        = COALESCE(EXCLUDED.tiktok, business_listings.tiktok),
 		        youtube       = COALESCE(EXCLUDED.youtube, business_listings.youtube),
 		        telegram      = COALESCE(EXCLUDED.telegram, business_listings.telegram),
+		        -- Niche fields: only promote a TRUE off_niche so a re-enrichment
+		        -- of a previously-tagged off-niche row never silently flips back
+		        -- to in-niche. niche_category COALESCEs in case re-enrich misses
+		        -- the keyword on a shorter page_title.
+		        off_niche      = (business_listings.off_niche OR EXCLUDED.off_niche),
+		        niche_category = COALESCE(business_listings.niche_category, EXCLUDED.niche_category),
 		        updated_at    = NOW();
 		    -- 2-step biz_id resolution. RETURNING id INTO biz_id was unreliable
 		    -- on the DO UPDATE path when all incoming values were NULL — the
@@ -608,6 +815,683 @@ func runMigrations(db *sql.DB) error {
 			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
 				reenrichLockVersion, "add re_enrich_locked_at for multi-worker FOR UPDATE SKIP LOCKED claim")
 			slog.Info("db: reenrich lock migration applied")
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-05-12: Country regex hardening (Deliverable 1).
+	//
+	// Background: the original phase2Version recover_country step used
+	// `[A-Z]{2,3}` as the first alternative in the regex, which captured the
+	// last 2-3 uppercase characters of ANY string (e.g. "LS7 1AB" → "AB",
+	// "Den Haag" → "AAG", "Schönebach" → "ACH"). The stateCodeBlocklist only
+	// filtered US/AU/CA/BR state codes, so random suffixes like "AAG", "ACH",
+	// "ADO", "ADS" passed through.
+	//
+	// Fix: remove [A-Z]{2,3} entirely. Match only known full country names
+	// (same whitelist as before), then map them to ISO alpha-2 via CASE.
+	// The WHERE guard `(bl.country IS NULL OR bl.country = '')` is retained so
+	// this step only fills blanks — it will not overwrite any existing value.
+	//
+	// This step is intentionally idempotent: running it again on rows that
+	// already have a correct country is a no-op due to the WHERE guard.
+	// -------------------------------------------------------------------------
+	const countryRegexHardenVersion = "2026_05_12_country_regex_hardening"
+	var countryRegexHardenDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, countryRegexHardenVersion,
+	).Scan(&countryRegexHardenDone); err != nil {
+		return fmt.Errorf("db: country regex harden version check: %w", err)
+	}
+	if !countryRegexHardenDone {
+		// Match only spelled-out country names at end of address string.
+		// [A-Z]{2,3} removed entirely — it was too greedy and caused 8,177
+		// garbage rows (COM, AND, ACH, AAG, etc.) in production.
+		// The CASE below maps each matched name to its ISO 3166-1 alpha-2 code.
+		countryRegexHardenSQL := `
+		WITH parsed AS (
+		  SELECT ej.domain,
+		         (regexp_match(ej.raw_address,
+		           '(?i)(United States|United Kingdom|Indonesia|Australia|Canada|Germany|France|Singapore|Malaysia|Thailand|Japan|Brazil|Mexico|Spain|Italy|Netherlands|Belgium|Sweden|Norway|Denmark|Finland|Poland|Turkey|India|China|Korea|Vietnam|Philippines|New Zealand|Portugal|Ireland|Croatia|Austria|Chile|Colombia|Hungary|Romania|Greece|Taiwan|Morocco|Argentina|Egypt|Myanmar|Costa Rica|Panama|Kenya|Bahrain|Qatar|Nepal|Nigeria|Sri Lanka|Cambodia|Switzerland|South Africa|United Arab Emirates|Saudi Arabia|South Korea|New Zealand|Czech Republic|Hong Kong)\s*$'))[1]
+		         AS matched_name
+		  FROM enrichment_jobs ej
+		  WHERE ej.status = 'completed' AND ej.raw_address IS NOT NULL
+		)
+		UPDATE business_listings bl
+		SET country = CASE LOWER(parsed.matched_name)
+		  WHEN 'united states'           THEN 'US'
+		  WHEN 'united kingdom'          THEN 'GB'
+		  WHEN 'indonesia'               THEN 'ID'
+		  WHEN 'australia'               THEN 'AU'
+		  WHEN 'canada'                  THEN 'CA'
+		  WHEN 'germany'                 THEN 'DE'
+		  WHEN 'france'                  THEN 'FR'
+		  WHEN 'singapore'               THEN 'SG'
+		  WHEN 'malaysia'                THEN 'MY'
+		  WHEN 'thailand'                THEN 'TH'
+		  WHEN 'japan'                   THEN 'JP'
+		  WHEN 'brazil'                  THEN 'BR'
+		  WHEN 'mexico'                  THEN 'MX'
+		  WHEN 'spain'                   THEN 'ES'
+		  WHEN 'italy'                   THEN 'IT'
+		  WHEN 'netherlands'             THEN 'NL'
+		  WHEN 'belgium'                 THEN 'BE'
+		  WHEN 'sweden'                  THEN 'SE'
+		  WHEN 'norway'                  THEN 'NO'
+		  WHEN 'denmark'                 THEN 'DK'
+		  WHEN 'finland'                 THEN 'FI'
+		  WHEN 'poland'                  THEN 'PL'
+		  WHEN 'turkey'                  THEN 'TR'
+		  WHEN 'india'                   THEN 'IN'
+		  WHEN 'china'                   THEN 'CN'
+		  WHEN 'korea'                   THEN 'KR'
+		  WHEN 'south korea'             THEN 'KR'
+		  WHEN 'vietnam'                 THEN 'VN'
+		  WHEN 'philippines'             THEN 'PH'
+		  WHEN 'new zealand'             THEN 'NZ'
+		  WHEN 'portugal'                THEN 'PT'
+		  WHEN 'ireland'                 THEN 'IE'
+		  WHEN 'croatia'                 THEN 'HR'
+		  WHEN 'austria'                 THEN 'AT'
+		  WHEN 'chile'                   THEN 'CL'
+		  WHEN 'colombia'                THEN 'CO'
+		  WHEN 'hungary'                 THEN 'HU'
+		  WHEN 'romania'                 THEN 'RO'
+		  WHEN 'greece'                  THEN 'GR'
+		  WHEN 'taiwan'                  THEN 'TW'
+		  WHEN 'morocco'                 THEN 'MA'
+		  WHEN 'argentina'               THEN 'AR'
+		  WHEN 'egypt'                   THEN 'EG'
+		  WHEN 'myanmar'                 THEN 'MM'
+		  WHEN 'costa rica'              THEN 'CR'
+		  WHEN 'panama'                  THEN 'PA'
+		  WHEN 'kenya'                   THEN 'KE'
+		  WHEN 'bahrain'                 THEN 'BH'
+		  WHEN 'qatar'                   THEN 'QA'
+		  WHEN 'nepal'                   THEN 'NP'
+		  WHEN 'nigeria'                 THEN 'NG'
+		  WHEN 'sri lanka'               THEN 'LK'
+		  WHEN 'cambodia'                THEN 'KH'
+		  WHEN 'switzerland'             THEN 'CH'
+		  WHEN 'south africa'            THEN 'ZA'
+		  WHEN 'united arab emirates'    THEN 'AE'
+		  WHEN 'saudi arabia'            THEN 'SA'
+		  WHEN 'czech republic'          THEN 'CZ'
+		  WHEN 'hong kong'               THEN 'HK'
+		  ELSE NULL
+		END
+		FROM parsed
+		WHERE parsed.domain = bl.domain
+		  AND parsed.matched_name IS NOT NULL
+		  AND (bl.country IS NULL OR bl.country = '')`
+
+		res, err := db.Exec(countryRegexHardenSQL)
+		if err != nil {
+			slog.Warn("db: country regex hardening failed", "error", err)
+		} else {
+			n, _ := res.RowsAffected()
+			slog.Info("db: country regex hardening applied", "rows_updated", n)
+		}
+
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			countryRegexHardenVersion,
+			"fix recover_country regex: remove [A-Z]{2,3} greedy alternative, match known country names only",
+		); err != nil {
+			slog.Warn("db: country regex harden version record failed", "error", err)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-05-12: Country garbage purge (Deliverable 2).
+	//
+	// Pre-condition: ~8,177 rows in business_listings have garbage country
+	// values (COM, AND, ACH, AAG, ONS, etc.) from the buggy [A-Z]{2,3}
+	// regex in the original phase2Version recover_country step.
+	// Additionally ~2,624 rows have spelled-out country names (Portugal,
+	// Ireland, etc.) that the tier1 normalize step missed.
+	//
+	// Steps:
+	//   A. BACKUP: CREATE TABLE ... AS SELECT — persists garbage values
+	//              before any mutation. Rollback: UPDATE bl SET country =
+	//              b.country FROM backup b WHERE bl.id = b.id.
+	//   B. CONVERT: salvage the spelled-out country names (Portugal → 'PT',
+	//               Ireland → 'IE', etc.) — these are real data, not garbage.
+	//   C. PURGE:   set country = NULL for remaining non-ISO-alpha2 values
+	//               (the 3-4 char uppercase garbage: COM, AND, ACH, etc.).
+	//   D. VERIFY:  log post-cleanup counts.
+	//
+	// Dry-run gate: set COUNTRY_CLEANUP_DRY_RUN=true to log affected counts
+	// without applying any UPDATE/CREATE. Default is OFF (cleanup runs).
+	// Per memory rule feedback_gated_flag_for_risky_changes.md — gate risky
+	// changes behind an off-by-default flag for first production run.
+	//
+	// Statement timeout: 30s per batch. The UPDATE touches at most ~8,177
+	// rows on a 483K-row table; with an index on country this is fast, but
+	// we cap it to avoid unexpected lock escalation.
+	// -------------------------------------------------------------------------
+	const countryGarbagePurgeVersion = "2026_05_12_country_garbage_purge"
+	var countryGarbagePurgeDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, countryGarbagePurgeVersion,
+	).Scan(&countryGarbagePurgeDone); err != nil {
+		return fmt.Errorf("db: country garbage purge version check: %w", err)
+	}
+	if !countryGarbagePurgeDone {
+		// plausibleAlpha2 is the inline SQL literal of the canonical ISO
+		// 3166-1 alpha-2 set. Kept as a SQL constant here because the
+		// iso3166Alpha2 Go map lives in internal/scraper (different package)
+		// and cannot be imported from internal/db without a circular dep.
+		// Generated from internal/scraper/contact.go:iso3166Alpha2.
+		// Rollback SQL (documented for ops):
+		//   UPDATE business_listings bl
+		//   SET country = b.country, updated_at = b.updated_at
+		//   FROM business_listings_country_backup_20260512 b
+		//   WHERE bl.id = b.id;
+		const plausibleAlpha2 = `'AD','AE','AF','AG','AI','AL','AM','AO',
+		'AQ','AR','AS','AT','AU','AW','AX','AZ',
+		'BA','BB','BD','BE','BF','BG','BH','BI',
+		'BJ','BL','BM','BN','BO','BQ','BR','BS',
+		'BT','BV','BW','BY','BZ','CA','CC','CD',
+		'CF','CG','CH','CI','CK','CL','CM','CN',
+		'CO','CR','CU','CV','CW','CX','CY','CZ',
+		'DE','DJ','DK','DM','DO','DZ','EC','EE',
+		'EG','EH','ER','ES','ET','FI','FJ','FK',
+		'FM','FO','FR','GA','GB','GD','GE','GF',
+		'GG','GH','GI','GL','GM','GN','GP','GQ',
+		'GR','GS','GT','GU','GW','GY','HK','HM',
+		'HN','HR','HT','HU','ID','IE','IL','IM',
+		'IN','IO','IQ','IR','IS','IT','JE','JM',
+		'JO','JP','KE','KG','KH','KI','KM','KN',
+		'KP','KR','KW','KY','KZ','LA','LB','LC',
+		'LI','LK','LR','LS','LT','LU','LV','LY',
+		'MA','MC','MD','ME','MF','MG','MH','MK',
+		'ML','MM','MN','MO','MP','MQ','MR','MS',
+		'MT','MU','MV','MW','MX','MY','MZ','NA',
+		'NC','NE','NF','NG','NI','NL','NO','NP',
+		'NR','NU','NZ','OM','PA','PE','PF','PG',
+		'PH','PK','PL','PM','PN','PR','PS','PT',
+		'PW','PY','QA','RE','RO','RS','RU','RW',
+		'SA','SB','SC','SD','SE','SG','SH','SI',
+		'SJ','SK','SL','SM','SN','SO','SR','SS',
+		'ST','SV','SX','SY','SZ','TC','TD','TF',
+		'TG','TH','TJ','TK','TL','TM','TN','TO',
+		'TR','TT','TV','TW','TZ','UA','UG','UM',
+		'US','UY','UZ','VA','VC','VE','VG','VI',
+		'VN','VU','WF','WS','YE','YT','ZA','ZM',
+		'ZW'`
+
+		dryRun := os.Getenv("COUNTRY_CLEANUP_DRY_RUN") == "true"
+		if dryRun {
+			slog.Info("db: country garbage purge DRY-RUN mode — counting affected rows, no mutation applied")
+
+			var garbageCount int
+			_ = db.QueryRow(`
+				SELECT COUNT(*) FROM business_listings
+				WHERE country IS NOT NULL
+				  AND country != ''
+				  AND country NOT IN (` + plausibleAlpha2 + `)`,
+			).Scan(&garbageCount)
+
+			var nameCount int
+			_ = db.QueryRow(`
+				SELECT COUNT(*) FROM business_listings
+				WHERE country IS NOT NULL AND length(country) > 4`,
+			).Scan(&nameCount)
+
+			slog.Info("db: country garbage purge dry-run counts",
+				"garbage_to_null", garbageCount-nameCount,
+				"names_to_convert", nameCount,
+				"total_affected", garbageCount,
+			)
+			// Do NOT record version — dry-run should re-run on next deploy
+			// when operator removes COUNTRY_CLEANUP_DRY_RUN=true.
+			return nil
+		}
+
+		// STEP A — BACKUP: capture all non-plausible country values before
+		// any mutation. Backup table is append-safe; IF NOT EXISTS prevents
+		// failure on re-run if backup already exists from a prior attempt.
+		//
+		// Integrity gate: count live garbage rows BEFORE creating the backup,
+		// then verify backup row count matches. If backup is empty or the count
+		// diverges by more than 10%, abort STEPS B and C to prevent data loss
+		// on a silent CREATE failure (e.g. table already existed with old data).
+		var liveGarbageCount int
+		if err := db.QueryRow(`
+			SELECT COUNT(*) FROM business_listings
+			WHERE country IS NOT NULL
+			  AND country != ''
+			  AND country NOT IN (` + plausibleAlpha2 + `)`).Scan(&liveGarbageCount); err != nil {
+			slog.Warn("db: country garbage purge pre-backup count failed — aborting", "error", err)
+			return nil
+		}
+		slog.Info("db: country garbage purge pre-backup count", "live_garbage_rows", liveGarbageCount)
+
+		_, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS business_listings_country_backup_20260512 AS
+			SELECT id, country, updated_at
+			FROM business_listings
+			WHERE country IS NOT NULL
+			  AND country != ''
+			  AND country NOT IN (` + plausibleAlpha2 + `)`)
+		if err != nil {
+			slog.Warn("db: country garbage purge backup failed — aborting purge for safety", "error", err)
+			return nil // abort this step; do not purge without backup
+		}
+		var backupCount int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings_country_backup_20260512`).Scan(&backupCount)
+		slog.Info("db: country garbage purge backup created", "backup_rows", backupCount, "expected_rows", liveGarbageCount)
+
+		// Integrity gate: abort if backup is empty (total failure) or count
+		// diverges more than 10% from live count (partial failure / stale table).
+		// A 10% tolerance covers rows legitimately converted between the pre-count
+		// query and the CREATE TABLE AS SELECT (concurrent pipeline activity).
+		if backupCount == 0 && liveGarbageCount > 0 {
+			slog.Warn("db: country garbage purge backup integrity FAILED — backup is empty, aborting purge",
+				"live_garbage_rows", liveGarbageCount)
+			return nil
+		}
+		if liveGarbageCount > 0 {
+			divergePct := float64(liveGarbageCount-backupCount) / float64(liveGarbageCount) * 100
+			if divergePct < 0 {
+				divergePct = -divergePct
+			}
+			if divergePct > 10 {
+				slog.Warn("db: country garbage purge backup integrity FAILED — count diverges, aborting purge",
+					"live_garbage_rows", liveGarbageCount,
+					"backup_rows", backupCount,
+					"diverge_pct", divergePct)
+				return nil
+			}
+		}
+		slog.Info("db: country garbage purge backup integrity verified — proceeding with STEPS B and C")
+
+		// STEP B — CONVERT: salvage all recognizable country names and common
+		// aliases not in the ISO alpha-2 set. Covers:
+		//   • Spelled-out names (>4 chars): Portugal, Ireland, Croatia, etc.
+		//   • Short country names (3-4 chars): Peru, Cuba, Oman, Laos
+		//   • Common aliases (2 chars): UK → GB
+		// The CASE uses ELSE country (not NULL) so unrecognized values pass
+		// through unchanged — they are caught by STEP C.
+		// Uses an explicit transaction so SET LOCAL statement_timeout applies
+		// only to this UPDATE (~2,812 rows after adding UK+Peru).
+		if txB, txErr := db.Begin(); txErr != nil {
+			slog.Warn("db: country garbage purge convert tx begin failed", "error", txErr)
+		} else {
+			txB.Exec(`SET LOCAL statement_timeout = '30000'`) //nolint:errcheck — advisory
+			_, convErr := txB.Exec(`
+				UPDATE business_listings SET
+				  country = CASE LOWER(TRIM(country))
+				    -- 2-char aliases not in ISO alpha-2
+				    WHEN 'uk'              THEN 'GB'
+				    -- Short country names (3-4 chars)
+				    WHEN 'peru'            THEN 'PE'
+				    WHEN 'cuba'            THEN 'CU'
+				    WHEN 'iran'            THEN 'IR'
+				    WHEN 'iraq'            THEN 'IQ'
+				    WHEN 'oman'            THEN 'OM'
+				    WHEN 'laos'            THEN 'LA'
+				    WHEN 'fiji'            THEN 'FJ'
+				    WHEN 'mali'            THEN 'ML'
+				    WHEN 'chad'            THEN 'TD'
+				    WHEN 'togo'            THEN 'TG'
+				    WHEN 'guam'            THEN 'GU'
+				    -- Spelled-out country names (>4 chars)
+				    WHEN 'portugal'        THEN 'PT'
+				    WHEN 'ireland'         THEN 'IE'
+				    WHEN 'croatia'         THEN 'HR'
+				    WHEN 'austria'         THEN 'AT'
+				    WHEN 'chile'           THEN 'CL'
+				    WHEN 'colombia'        THEN 'CO'
+				    WHEN 'hungary'         THEN 'HU'
+				    WHEN 'romania'         THEN 'RO'
+				    WHEN 'greece'          THEN 'GR'
+				    WHEN 'taiwan'          THEN 'TW'
+				    WHEN 'morocco'         THEN 'MA'
+				    WHEN 'argentina'       THEN 'AR'
+				    WHEN 'egypt'           THEN 'EG'
+				    WHEN 'czech republic'  THEN 'CZ'
+				    WHEN 'myanmar'         THEN 'MM'
+				    WHEN 'costa rica'      THEN 'CR'
+				    WHEN 'panama'          THEN 'PA'
+				    WHEN 'kenya'           THEN 'KE'
+				    WHEN 'bahrain'         THEN 'BH'
+				    WHEN 'qatar'           THEN 'QA'
+				    WHEN 'nepal'           THEN 'NP'
+				    WHEN 'nigeria'         THEN 'NG'
+				    WHEN 'sri lanka'       THEN 'LK'
+				    WHEN 'cambodia'        THEN 'KH'
+				    WHEN 'hong kong'       THEN 'HK'
+				    WHEN 'switzerland'     THEN 'CH'
+				    WHEN 'south africa'    THEN 'ZA'
+				    WHEN 'united arab emirates' THEN 'AE'
+				    WHEN 'saudi arabia'    THEN 'SA'
+				    WHEN 'united states'   THEN 'US'
+				    WHEN 'united kingdom'  THEN 'GB'
+				    WHEN 'indonesia'       THEN 'ID'
+				    WHEN 'australia'       THEN 'AU'
+				    WHEN 'canada'          THEN 'CA'
+				    WHEN 'germany'         THEN 'DE'
+				    WHEN 'france'          THEN 'FR'
+				    WHEN 'singapore'       THEN 'SG'
+				    WHEN 'malaysia'        THEN 'MY'
+				    WHEN 'thailand'        THEN 'TH'
+				    WHEN 'brazil'          THEN 'BR'
+				    WHEN 'mexico'          THEN 'MX'
+				    WHEN 'spain'           THEN 'ES'
+				    WHEN 'italy'           THEN 'IT'
+				    WHEN 'netherlands'     THEN 'NL'
+				    WHEN 'belgium'         THEN 'BE'
+				    WHEN 'sweden'          THEN 'SE'
+				    WHEN 'norway'          THEN 'NO'
+				    WHEN 'denmark'         THEN 'DK'
+				    WHEN 'finland'         THEN 'FI'
+				    WHEN 'poland'          THEN 'PL'
+				    WHEN 'turkey'          THEN 'TR'
+				    WHEN 'india'           THEN 'IN'
+				    WHEN 'china'           THEN 'CN'
+				    WHEN 'korea'           THEN 'KR'
+				    WHEN 'south korea'     THEN 'KR'
+				    WHEN 'vietnam'         THEN 'VN'
+				    WHEN 'philippines'     THEN 'PH'
+				    WHEN 'new zealand'     THEN 'NZ'
+				    WHEN 'japan'           THEN 'JP'
+				    ELSE country
+				  END,
+				  updated_at = NOW()
+				WHERE country IS NOT NULL
+				  AND country != ''
+				  AND country NOT IN (` + plausibleAlpha2 + `)`)
+			if convErr != nil {
+				txB.Rollback() //nolint:errcheck
+				slog.Warn("db: country garbage purge convert step failed", "error", convErr)
+				// Non-fatal: purge step C still handles remaining garbage.
+			} else {
+				txB.Commit() //nolint:errcheck
+				slog.Info("db: country garbage purge convert step applied (names → ISO codes)")
+			}
+		}
+
+		// STEP C — PURGE: set country = NULL for all remaining non-ISO-alpha2
+		// values (garbage: COM, AND, ACH, AAG, ONS, etc.).
+		// Uses explicit transaction so SET LOCAL statement_timeout is scoped.
+		// Lock class: ROW EXCLUSIVE — not ACCESS EXCLUSIVE; concurrent SELECTs
+		// are unaffected. At most ~5,553 rows (3-4 char uppercase garbage).
+		var purgedRows int64
+		if txC, txErr := db.Begin(); txErr != nil {
+			slog.Warn("db: country garbage purge step C tx begin failed", "error", txErr)
+		} else {
+			txC.Exec(`SET LOCAL statement_timeout = '30000'`) //nolint:errcheck — advisory
+			res, purgeErr := txC.Exec(`
+				UPDATE business_listings
+				SET country = NULL, updated_at = NOW()
+				WHERE country IS NOT NULL
+				  AND country != ''
+				  AND country NOT IN (` + plausibleAlpha2 + `)`)
+			if purgeErr != nil {
+				txC.Rollback() //nolint:errcheck
+				slog.Warn("db: country garbage purge step C failed", "error", purgeErr)
+			} else {
+				txC.Commit() //nolint:errcheck
+				purgedRows, _ = res.RowsAffected()
+				slog.Info("db: country garbage purge applied", "rows_nulled", purgedRows)
+			}
+		}
+
+		// STEP D — VERIFY: post-cleanup count of remaining garbage.
+		var remainingGarbage int
+		_ = db.QueryRow(`
+			SELECT COUNT(*) FROM business_listings
+			WHERE country IS NOT NULL
+			  AND country != ''
+			  AND country NOT IN (` + plausibleAlpha2 + `)`,
+		).Scan(&remainingGarbage)
+		if remainingGarbage > 0 {
+			slog.Warn("db: country garbage purge: residual garbage detected after purge",
+				"remaining_garbage_rows", remainingGarbage)
+		} else {
+			slog.Info("db: country garbage purge: verified clean — zero garbage rows remain")
+		}
+
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			countryGarbagePurgeVersion,
+			"backup garbage country rows, convert country names to ISO, purge remaining garbage",
+		); err != nil {
+			slog.Warn("db: country garbage purge version record failed", "error", err)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// One-shot migration 2026-05-22: Off-niche backfill cleanup.
+	//
+	// The trigger above started tagging NEW rows with off_niche + niche_category
+	// at insert time. Existing 779K rows in business_listings still carry the
+	// pollution from before the trigger landed: ~6K rows with explicit off-niche
+	// schema.org @type values (Hotel=1838, MedicalBusiness=787, MedicalClinic=730,
+	// Restaurant=666, Store=489, AutoDealer=332, Physician=321, BeautySalon=310,
+	// LegalService=269, TravelAgency=240, HairSalon=239, LodgingBusiness=236,
+	// Dentist=193, RealEstateAgent=174, HomeAndConstructionBusiness=118,
+	// GeneralContractor=26, RoofingContractor=12, HealthAndBeautyBusiness=804)
+	// plus ~41K rows where category is >100 chars (meta-keyword soup from
+	// <meta name="keywords"> instead of schema.org @type).
+	//
+	// Steps mirror the country garbage purge (versioned, backup-first), but
+	// without an env-var dry-run flag — the backup + integrity gate below
+	// (count-divergence check + abort-on-empty-backup) provides equivalent
+	// safety without operational toggles. Counts are logged BEFORE mutation
+	// so the operator can verify in the deploy log without code changes.
+	//   A. PRE-COUNT — log live affected row count (visible in deploy log).
+	//   B. BACKUP — copy id+category+off_niche of all rows about to mutate.
+	//      Integrity gate: backup must be non-empty AND within 10% of live count.
+	//   C. FLAG — UPDATE off_niche=TRUE for rows matching either rule.
+	//   D. CLASSIFY — forward-fill niche_category for off_niche=FALSE rows
+	//                 whose category text matches the niche regex used by the
+	//                 trigger. No mutation for rows the regex doesn't match.
+	//   E. VERIFY — log post-cleanup counts.
+	//
+	// Rollback (documented for ops):
+	//   UPDATE business_listings bl
+	//   SET off_niche = b.off_niche,
+	//       niche_category = b.niche_category,
+	//       updated_at = b.updated_at
+	//   FROM business_listings_offniche_backup_20260522 b
+	//   WHERE bl.id = b.id;
+	//   DELETE FROM schema_migrations WHERE version = '2026_05_22_off_niche_backfill';
+	// -------------------------------------------------------------------------
+	const offNicheCleanupVersion = "2026_05_22_off_niche_backfill"
+	var offNicheCleanupDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, offNicheCleanupVersion,
+	).Scan(&offNicheCleanupDone); err != nil {
+		return fmt.Errorf("db: off-niche cleanup version check: %w", err)
+	}
+	if !offNicheCleanupDone {
+		// Off-niche schema.org @type list — kept in sync with the trigger above.
+		const offNicheTypes = `'AutoDealer','Hotel','Restaurant','Dentist','Physician',
+		'RealEstateAgent','LegalService','HairSalon','BeautySalon',
+		'TravelAgency','LodgingBusiness','GeneralContractor',
+		'RoofingContractor','HomeAndConstructionBusiness',
+		'MedicalClinic','MedicalBusiness','HealthAndBeautyBusiness'`
+
+		// STEP A — PRE-COUNT: log counts so the operator sees in the deploy
+		// log how many rows the migration is about to flag, broken down by
+		// reason. No mutation yet — if the numbers look wrong, the operator
+		// can stop the container before STEPS B-D run.
+		// Wrapped in tx + statement_timeout per CLAUDE.md Invariant #2 —
+		// business_listings is 779K rows; a slow COUNT during deploy-restart
+		// autovacuum can stall both pool conns and starve the API.
+		var explicitOff, metaSoup int
+		if preTx, ptxErr := db.Begin(); ptxErr != nil {
+			slog.Warn("db: off-niche cleanup PRE-COUNT tx begin failed", "error", ptxErr)
+		} else {
+			preTx.Exec(`SET LOCAL statement_timeout = '5000'`) //nolint:errcheck — advisory
+			_ = preTx.QueryRow(
+				`SELECT COUNT(*) FROM business_listings WHERE category IN (` + offNicheTypes + `) AND off_niche IS NOT TRUE`,
+			).Scan(&explicitOff)
+			_ = preTx.QueryRow(
+				`SELECT COUNT(*) FROM business_listings WHERE LENGTH(category) > 100 AND off_niche IS NOT TRUE`,
+			).Scan(&metaSoup)
+			preTx.Rollback() //nolint:errcheck — read-only, nothing to commit
+		}
+		slog.Info("db: off-niche cleanup pre-count",
+			"explicit_off_niche_to_flag", explicitOff,
+			"meta_keyword_soup_to_flag", metaSoup,
+			"total_affected", explicitOff+metaSoup,
+		)
+
+		// STEP B — BACKUP: capture pre-mutation state for everything we're
+		// about to flag. Append-safe via IF NOT EXISTS. Following the country
+		// purge integrity gate pattern: count live rows, create backup, verify
+		// backup count matches within 10% before mutating.
+		var liveAffected int
+		if err := db.QueryRow(`
+			SELECT COUNT(*) FROM business_listings
+			WHERE off_niche IS NOT TRUE
+			  AND (category IN (` + offNicheTypes + `) OR LENGTH(category) > 100)
+		`).Scan(&liveAffected); err != nil {
+			slog.Warn("db: off-niche cleanup pre-backup count failed — aborting", "error", err)
+			return nil
+		}
+		slog.Info("db: off-niche cleanup pre-backup count", "live_rows_to_flag", liveAffected)
+
+		if _, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS business_listings_offniche_backup_20260522 AS
+			SELECT id, category, off_niche, niche_category, updated_at
+			FROM business_listings
+			WHERE off_niche IS NOT TRUE
+			  AND (category IN (` + offNicheTypes + `) OR LENGTH(category) > 100)
+		`); err != nil {
+			slog.Warn("db: off-niche cleanup backup failed — aborting for safety", "error", err)
+			return nil
+		}
+		var backupCount int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings_offniche_backup_20260522`).Scan(&backupCount)
+		slog.Info("db: off-niche cleanup backup created", "backup_rows", backupCount, "expected_rows", liveAffected)
+
+		if backupCount == 0 && liveAffected > 0 {
+			slog.Warn("db: off-niche cleanup backup integrity FAILED — backup empty, aborting")
+			return nil
+		}
+		if liveAffected > 0 {
+			divergePct := float64(liveAffected-backupCount) / float64(liveAffected) * 100
+			if divergePct < 0 {
+				divergePct = -divergePct
+			}
+			if divergePct > 10 {
+				slog.Warn("db: off-niche cleanup backup integrity FAILED — count diverges, aborting",
+					"live_rows", liveAffected, "backup_rows", backupCount, "diverge_pct", divergePct)
+				return nil
+			}
+		}
+		slog.Info("db: off-niche cleanup backup integrity verified — proceeding with FLAG + CLASSIFY")
+
+		// STEP C — FLAG: set off_niche=TRUE for the two patterns. Wrapped in
+		// tx with statement_timeout (30s — partial idx_bl_niche_active helps,
+		// but the UPDATE touches both indexed and unindexed rows).
+		var flaggedRows int64
+		if txB, txErr := db.Begin(); txErr != nil {
+			slog.Warn("db: off-niche cleanup FLAG tx begin failed", "error", txErr)
+		} else {
+			txB.Exec(`SET LOCAL statement_timeout = '30000'`) //nolint:errcheck — advisory
+			res, flagErr := txB.Exec(`
+				UPDATE business_listings
+				SET off_niche = TRUE, updated_at = NOW()
+				WHERE off_niche IS NOT TRUE
+				  AND (category IN (` + offNicheTypes + `) OR LENGTH(category) > 100)
+			`)
+			if flagErr != nil {
+				slog.Warn("db: off-niche cleanup FLAG UPDATE failed — rolling back", "error", flagErr)
+				txB.Rollback() //nolint:errcheck
+			} else {
+				txB.Commit() //nolint:errcheck
+				flaggedRows, _ = res.RowsAffected()
+				slog.Info("db: off-niche cleanup FLAG applied", "rows_flagged", flaggedRows)
+			}
+		}
+
+		// STEP D — CLASSIFY: forward-fill niche_category for rows that survived
+		// the FLAG step (off_niche=FALSE). Mirrors the trigger CASE so old rows
+		// get the same classification as new rows. Single-pass UPDATE keyed by
+		// the same regex; rows that match no niche stay NULL.
+		var classifiedRows int64
+		if txC, txErr := db.Begin(); txErr != nil {
+			slog.Warn("db: off-niche cleanup CLASSIFY tx begin failed", "error", txErr)
+		} else {
+			txC.Exec(`SET LOCAL statement_timeout = '60000'`) //nolint:errcheck — advisory
+			res, classErr := txC.Exec(`
+				UPDATE business_listings SET niche_category = CASE
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\myoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti\M' THEN 'yoga'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\mpilates|reformer\M' THEN 'pilates'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\mcrossfit|bootcamp|hiit|barre|spin\M' THEN 'fitness'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\m(gym|fitness)\M' THEN 'fitness'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\mmeditation|mindfulness|breathwork\M' THEN 'meditation'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\mreiki|sound healing|energy healing|healing\M' THEN 'healing'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\mayurved\M' THEN 'ayurveda'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\m(spa|massage|thermal)\M' THEN 'spa'
+				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
+				             COALESCE(page_title,'') || ' ' ||
+				             COALESCE(description,'')) ~ '\m(wellness|holistic)\M' THEN 'wellness'
+				  ELSE niche_category
+				END
+				WHERE off_niche IS NOT TRUE
+				  AND niche_category IS NULL
+			`)
+			if classErr != nil {
+				slog.Warn("db: off-niche cleanup CLASSIFY UPDATE failed — rolling back", "error", classErr)
+				txC.Rollback() //nolint:errcheck
+			} else {
+				txC.Commit() //nolint:errcheck
+				classifiedRows, _ = res.RowsAffected()
+				slog.Info("db: off-niche cleanup CLASSIFY applied", "rows_classified", classifiedRows)
+			}
+		}
+
+		// STEP E — VERIFY. Wrapped in tx + statement_timeout per CLAUDE.md
+		// Invariant #2 (same reason as PRE-COUNT above). The partial indexes
+		// idx_bl_niche_active + idx_bl_off_niche_false back these COUNTs so
+		// the planner should pick index-only scans, but the timeout is the
+		// safety net for cases where the planner picks a seqscan instead
+		// (e.g. statistics not yet refreshed after the bulk UPDATEs above).
+		var finalOffNiche, finalClassified, finalUnclassified int
+		if vTx, vtxErr := db.Begin(); vtxErr != nil {
+			slog.Warn("db: off-niche cleanup VERIFY tx begin failed", "error", vtxErr)
+		} else {
+			vTx.Exec(`SET LOCAL statement_timeout = '5000'`) //nolint:errcheck — advisory
+			_ = vTx.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS TRUE`).Scan(&finalOffNiche)
+			_ = vTx.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`).Scan(&finalClassified)
+			_ = vTx.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE off_niche IS NOT TRUE AND niche_category IS NULL`).Scan(&finalUnclassified)
+			vTx.Rollback() //nolint:errcheck — read-only, nothing to commit
+		}
+		slog.Info("db: off-niche cleanup VERIFY",
+			"total_off_niche", finalOffNiche,
+			"total_in_niche_classified", finalClassified,
+			"total_in_niche_unclassified", finalUnclassified,
+		)
+
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			offNicheCleanupVersion,
+			"flag off_niche from category blacklist + meta-keyword-soup, then classify niche_category from name/title/description",
+		); err != nil {
+			slog.Warn("db: off-niche cleanup version record failed", "error", err)
 		}
 	}
 

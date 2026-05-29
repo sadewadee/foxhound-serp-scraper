@@ -11,8 +11,19 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/query"
 )
 
+// queriesCountTTL is the cache TTL for filtered COUNT(*) on queries.
+// 60s — list mutates only on manual create/retry, not in the hot path.
+const queriesCountTTL = 60 * time.Second
+
 // handleV2ListQueries returns paginated queries wrapped in V2 format.
+// COUNT is Redis-cached (60s TTL) and protected by a 10s statement_timeout.
+// On count timeout the handler still serves data with total=-1 sentinel — the
+// envelope's TotalKnown=false signals to consumers that pagination math is
+// unreliable, avoiding a cascade 500 on an ILIKE search hitting an unindexed scan.
 func (s *Server) handleV2ListQueries(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := v2RequestContext(r)
+	defer cancel()
+
 	q := r.URL.Query()
 	page := queryInt(q, "page", 1)
 	perPage := queryInt(q, "per_page", 50)
@@ -36,8 +47,10 @@ func (s *Server) handleV2ListQueries(w http.ResponseWriter, r *http.Request) {
 		argIdx++
 	}
 
-	var total int
-	s.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM queries %s", where), args...).Scan(&total)
+	total, err := s.cachedCount(ctx, "queries", where, args, queriesCountTTL, 10*time.Second)
+	if err != nil {
+		slog.Warn("v2: queries count failed (serving with -1 sentinel)", "error", err)
+	}
 
 	dataQuery := fmt.Sprintf(`
 		SELECT id, text, status, result_count, COALESCE(error_msg,''), created_at
@@ -47,7 +60,7 @@ func (s *Server) handleV2ListQueries(w http.ResponseWriter, r *http.Request) {
 	`, where, argIdx, argIdx+1)
 	args = append(args, perPage, offset)
 
-	rows, err := s.db.Query(dataQuery, args...)
+	rows, err := s.db.QueryContext(ctx, dataQuery, args...)
 	if err != nil {
 		slog.Error("v2: list queries error", "error", err)
 		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to fetch queries")

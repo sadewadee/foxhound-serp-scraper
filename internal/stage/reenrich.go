@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,14 +46,30 @@ func NewReenrichStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *Re
 	return &ReenrichStage{cfg: cfg, db: database, dedup: dd}
 }
 
-// reenrichRow is a candidate row from the eligibility query.
+// reenrichRow is a candidate row from the eligibility query. Address /
+// Country / City are surfaced for the offline pre-pass (applyOfflineParse)
+// so we can fill missing geo fields from the existing address blob without
+// paying a network refetch. EmailCount / PhoneCount drive the skip-fetch
+// decision — a row that already has contact data and just needs geo can
+// graduate via offline parse alone.
 type reenrichRow struct {
-	ID     int64
-	Domain string
-	URL    string
+	ID         int64
+	Domain     string
+	URL        string
+	Address    sql.NullString
+	Country    sql.NullString
+	City       sql.NullString
+	EmailCount int64
+	PhoneCount int64
 }
 
-// Run starts numWorkers goroutines each running the continuous re-enrich loop.
+// Run starts numWorkers goroutines each running the continuous re-enrich loop
+// plus one lock-reaper goroutine that deterministically releases stale claims.
+// The reaper exists because the worker's eligibility-query stale-claim recovery
+// is best-effort: the query scans re_enriched_at IS NULL rows in index order
+// and stops at the first LIMIT eligible rows, so a stale lock deep in the pool
+// may not resurface for a long time. Rows stuck for hours/days would otherwise
+// accumulate; the reaper closes that gap with a deterministic sweep.
 func (r *ReenrichStage) Run(ctx context.Context) error {
 	numWorkers := r.cfg.ReenrichWorkerCount
 	if numWorkers < 1 {
@@ -62,6 +79,11 @@ func (r *ReenrichStage) Run(ctx context.Context) error {
 
 	// Health file so the container healthcheck doesn't kill us while idle.
 	go touchHealthFile(ctx, "/tmp/worker-healthy")
+
+	// Lock-leak reaper — deterministic stale-lock release every 5 minutes.
+	// Operates independently of worker loops; idempotent UPDATE so multiple
+	// reaper instances would be safe but we only spawn one.
+	go r.lockReaper(ctx)
 
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -148,39 +170,27 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 	}
 }
 
-// fetchEligibleBatch atomically claims up to limit business_listings rows.
+// reenrichMaxAttempts caps how many times a row can be claimed by the reenrich
+// worker before being treated as permanently dead. Cap chosen at 10 — high
+// enough to absorb transient fetch/network errors, low enough that genuinely
+// broken sites (DNS gone, perpetual 403, etc.) drop out of the eligibility
+// pool instead of cycling forever and burning proxy budget.
 //
-// Multi-worker correctness: uses CTE with FOR UPDATE OF bl SKIP LOCKED to
-// prevent two workers from picking the same row. Claim is recorded by
-// setting re_enrich_locked_at = NOW() in the same statement, so the row
-// stops appearing in subsequent eligibility queries even after the lock
-// is released by COMMIT.
-//
-// Stale-claim recovery: rows with re_enrich_locked_at older than 15 min
-// are considered abandoned (worker crashed mid-processing) and become
-// eligible again — no separate janitor needed.
-//
-// Score (must be < threshold to be eligible):
-//   - 40 pts: has a valid email (is_acceptable=true OR score>=0.7)
-//   - 20 pts: phone or phones array non-empty
-//   - 15 pts: business_name AND category both non-empty
-//   - 15 pts: address non-empty OR (city AND country non-empty)
-//   - 10 pts: at least one social link present
-//     Total = 100
-//
-// Statement timeout 5s prevents holding a connection on the 500K-row table
-// (per gotchas.md 2026-04-06: collectSnapshot COUNT(*) pattern).
-func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold int, limit int) ([]reenrichRow, error) {
-	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+// Mirrors the enrich reconciler cap (15) from .dev-squad/gotchas.md — same
+// anti-pattern (zero-reset retry) caused the 2026-04-06 pipeline deadlock.
+const reenrichMaxAttempts = 10
 
-	const q = `
+// eligibilityQuery is the exact SQL fetchEligibleBatch runs, lifted to package
+// scope so TestEligibilityQuery_NoOrderByRandom can guard against the ORDER BY
+// RANDOM() regression that stalled the reenrich worker (issue #28).
+const eligibilityQuery = `
 		WITH eligible AS (
 			SELECT bl.id
 			FROM business_listings bl
 			WHERE re_enriched_at IS NULL
 			  AND (re_enrich_locked_at IS NULL
 			       OR re_enrich_locked_at < NOW() - INTERVAL '15 minutes')
+			  AND COALESCE(bl.re_enrich_attempts, 0) < $3
 			  AND (
 				CASE WHEN EXISTS(
 					SELECT 1 FROM business_emails be
@@ -204,16 +214,67 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 				CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb
 				THEN 10 ELSE 0 END
 			  ) < $1
-			ORDER BY RANDOM()
+			-- Deliberately NOT randomly ordered: a random sort over the whole
+			-- eligible pool forced a full index scan + sort of every
+			-- re_enriched_at IS NULL row (~340K), so the SELECT blew the 5s
+			-- statement_timeout on every loop and the worker claimed ~0 rows
+			-- (issue #28 — reenrich stalled at ~88 rows/hr). Index-order scan +
+			-- LIMIT short-circuits after the first $2 eligible rows (~4ms on
+			-- prod). Work is still spread across workers/iterations by FOR UPDATE
+			-- OF bl SKIP LOCKED plus the 15-min re_enrich_locked_at window, which
+			-- advances the scan as claimed rows drop out of the candidate set.
 			LIMIT $2
 			FOR UPDATE OF bl SKIP LOCKED
 		)
 		UPDATE business_listings bl
-		SET re_enrich_locked_at = NOW()
+		SET re_enrich_locked_at = NOW(),
+		    re_enrich_attempts  = COALESCE(bl.re_enrich_attempts, 0) + 1
 		FROM eligible
 		WHERE bl.id = eligible.id
-		RETURNING bl.id, bl.domain, COALESCE(bl.website, 'https://' || bl.domain)
+		RETURNING
+			bl.id,
+			bl.domain,
+			COALESCE(bl.website, 'https://' || bl.domain),
+			bl.address,
+			bl.country,
+			bl.city,
+			(SELECT COUNT(*) FROM business_emails be WHERE be.business_id = bl.id),
+			(CASE WHEN bl.phone IS NOT NULL AND bl.phone != '' THEN 1 ELSE 0 END
+			 + COALESCE(array_length(bl.phones, 1), 0))
 	`
+
+// fetchEligibleBatch atomically claims up to limit business_listings rows.
+//
+// Multi-worker correctness: uses CTE with FOR UPDATE OF bl SKIP LOCKED to
+// prevent two workers from picking the same row. Claim is recorded by
+// setting re_enrich_locked_at = NOW() and incrementing re_enrich_attempts
+// in the same statement.
+//
+// Stale-claim recovery: rows with re_enrich_locked_at older than 15 min
+// are considered abandoned. The lockReaper goroutine sweeps them out
+// deterministically every 5 min; the WHERE here also covers them as a
+// secondary safety net for the gap between reaper ticks.
+//
+// Retry cap: rows with re_enrich_attempts >= reenrichMaxAttempts (10) are
+// excluded so genuinely broken sites stop cycling. Manual reset via
+// `UPDATE business_listings SET re_enrich_attempts = 0 WHERE domain = ...`
+// brings them back if needed.
+//
+// Score (must be < threshold to be eligible):
+//   - 40 pts: has a valid email (is_acceptable=true OR score>=0.7)
+//   - 20 pts: phone or phones array non-empty
+//   - 15 pts: business_name AND category both non-empty
+//   - 15 pts: address non-empty OR (city AND country non-empty)
+//   - 10 pts: at least one social link present
+//     Total = 100
+//
+// Statement timeout 5s prevents holding a connection on the 500K-row table
+// (per gotchas.md 2026-04-06: collectSnapshot COUNT(*) pattern).
+func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold int, limit int) ([]reenrichRow, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	const q = eligibilityQuery
 
 	tx, err := r.db.BeginTx(queryCtx, nil)
 	if err != nil {
@@ -225,7 +286,7 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 		return nil, err
 	}
 
-	dbRows, err := tx.QueryContext(queryCtx, q, scoreThreshold, limit)
+	dbRows, err := tx.QueryContext(queryCtx, q, scoreThreshold, limit, reenrichMaxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +295,11 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 	var result []reenrichRow
 	for dbRows.Next() {
 		var row reenrichRow
-		if err := dbRows.Scan(&row.ID, &row.Domain, &row.URL); err != nil {
+		if err := dbRows.Scan(
+			&row.ID, &row.Domain, &row.URL,
+			&row.Address, &row.Country, &row.City,
+			&row.EmailCount, &row.PhoneCount,
+		); err != nil {
 			slog.Warn("reenrich: scan row failed", "error", err)
 			continue
 		}
@@ -251,6 +316,14 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 }
 
 func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFetcher, row reenrichRow, workerID int) {
+	// Offline pre-pass: derive country/city from the existing address blob
+	// before paying for a network refetch. If the row already had contact
+	// data (emails/phones) and the offline parse fills in country+city, we
+	// can mark it done and skip the fetch entirely.
+	if r.applyOfflineParse(ctx, row, workerID) {
+		return
+	}
+
 	timeout := time.Duration(r.cfg.Enrich.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -270,6 +343,7 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 
 	// Extract contacts from fetched body.
 	cd := internalScraper.ExtractContacts([]byte(body))
+	internalScraper.ApplyTLDCountryFallback(cd, row.URL)
 	emails := internalScraper.FilterEmails(cd.Emails)
 	phones := internalScraper.FilterPhones(cd.Phones)
 	socialLinks := buildSocialLinks(cd) // reuse enrich.go helper — same package
@@ -357,6 +431,86 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 	}
 }
 
+// applyOfflineParse derives country/city from row.Address via the tail-parse
+// logic used by ExtractContacts, then writes any newly-derived values back to
+// business_listings. If the row already had at least one email/phone AND the
+// offline parse produced (or row already had) both country and city, the row
+// is marked re_enriched_at = NOW() and the function returns true — caller
+// skips the network fetch.
+//
+// Returns true when the network fetch can be skipped, false when the worker
+// should proceed with the normal fetch path. Errors fall through to the
+// network path (defensive — better to refetch than lose a row).
+func (r *ReenrichStage) applyOfflineParse(ctx context.Context, row reenrichRow, workerID int) bool {
+	if !row.Address.Valid || strings.TrimSpace(row.Address.String) == "" {
+		return false
+	}
+
+	parsedCountry, parsedCity := internalScraper.ParseAddressFallback(row.Address.String)
+	newCountry, newCity, skipFetch := offlineParseDecision(row, parsedCountry, parsedCity)
+
+	if newCountry.Valid || newCity.Valid {
+		// COALESCE on the SQL side mirrors the trigger's merge semantics: only
+		// overwrite when the existing column is NULL. Defensive against races
+		// where another worker filled the column between our SELECT and UPDATE.
+		_, err := r.db.ExecContext(ctx, `
+			UPDATE business_listings
+			SET country    = COALESCE(country, $2),
+			    city       = COALESCE(city,    $3),
+			    updated_at = NOW()
+			WHERE id = $1
+		`, row.ID, newCountry, newCity)
+		if err != nil {
+			slog.Warn("reenrich: offline parse update failed, will fall through to fetch",
+				"id", row.ID, "domain", row.Domain, "error", err, "worker", workerID)
+			return false
+		}
+		slog.Debug("reenrich: offline parse filled",
+			"id", row.ID, "domain", row.Domain,
+			"new_country", newCountry.String, "new_city", newCity.String,
+			"worker", workerID)
+	}
+
+	if !skipFetch {
+		return false
+	}
+
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE business_listings
+		SET re_enriched_at = NOW(), re_enrich_locked_at = NULL
+		WHERE id = $1
+	`, row.ID)
+	if err != nil {
+		slog.Warn("reenrich: mark done after offline parse failed, falling through to fetch",
+			"id", row.ID, "domain", row.Domain, "error", err, "worker", workerID)
+		return false
+	}
+	r.processed.Add(1)
+	slog.Info("reenrich: completed via offline parse (no network)",
+		"id", row.ID, "domain", row.Domain,
+		"filled_country", newCountry.Valid, "filled_city", newCity.Valid,
+		"worker", workerID)
+	return true
+}
+
+// offlineParseDecision is the pure-logic core of applyOfflineParse — given
+// the row's current state and the parsed (country, city) values from
+// scraper.ParseAddressFallback, it decides what to write back and whether
+// the network fetch can be skipped. No I/O; trivially unit-testable.
+func offlineParseDecision(row reenrichRow, parsedCountry, parsedCity string) (newCountry, newCity sql.NullString, skipFetch bool) {
+	if (!row.Country.Valid || row.Country.String == "") && parsedCountry != "" {
+		newCountry = sql.NullString{String: parsedCountry, Valid: true}
+	}
+	if (!row.City.Valid || row.City.String == "") && parsedCity != "" {
+		newCity = sql.NullString{String: parsedCity, Valid: true}
+	}
+	hasContact := row.EmailCount > 0 || row.PhoneCount > 0
+	countryFinal := (row.Country.Valid && row.Country.String != "") || newCountry.Valid
+	cityFinal := (row.City.Valid && row.City.String != "") || newCity.Valid
+	skipFetch = hasContact && countryFinal && cityFinal
+	return
+}
+
 // releaseLock clears re_enrich_locked_at so another worker can immediately
 // re-attempt the row. Used after fetch/insert errors that don't warrant
 // marking the row done. Errors here are non-fatal — the 15-min stale-claim
@@ -366,6 +520,58 @@ func (r *ReenrichStage) releaseLock(ctx context.Context, id int64) {
 		`UPDATE business_listings SET re_enrich_locked_at = NULL WHERE id = $1`, id)
 	if err != nil {
 		slog.Debug("reenrich: release lock failed (will auto-expire)", "id", id, "error", err)
+	}
+}
+
+// lockReaper releases stale re_enrich_locked_at claims deterministically on
+// a 5-minute tick. Without this, the eligibility query (which scans in index
+// order and stops at the LIMIT) may not revisit specific stuck rows for a long
+// time — production audit (2026-05-12) found 708 rows stale-locked, oldest 3
+// days. The reaper closes that gap.
+//
+// Idempotent — clearing a non-stale lock is a no-op. Safe to run alongside
+// workers; the 15-min threshold is much longer than max processRow timeout
+// (30s default), so we cannot race against an in-flight worker.
+func (r *ReenrichStage) lockReaper(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// Run once at startup to clear any existing stale locks from a prior
+	// crash before workers begin claiming. Production audit found this
+	// snapshot can be hundreds of rows.
+	r.reapStaleLocks(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.reapStaleLocks(ctx)
+		}
+	}
+}
+
+// reapStaleLocks performs one reaper sweep — released rows go back into the
+// eligibility pool on the next worker batch. Tight context timeout so a slow
+// DB doesn't pile up overlapping reaper UPDATEs.
+func (r *ReenrichStage) reapStaleLocks(ctx context.Context) {
+	queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	res, err := r.db.ExecContext(queryCtx, `
+		UPDATE business_listings
+		SET re_enrich_locked_at = NULL
+		WHERE re_enrich_locked_at IS NOT NULL
+		  AND re_enrich_locked_at < NOW() - INTERVAL '15 minutes'
+		  AND re_enriched_at IS NULL
+	`)
+	if err != nil {
+		slog.Warn("reenrich: lock reaper sweep failed", "error", err)
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		slog.Info("reenrich: lock reaper released stale claims", "released", n)
 	}
 }
 

@@ -1,16 +1,37 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
+// dashboardStatsCacheTTL is the Redis cache window for /api/v2/stats.
+// Dashboard polling clients re-hit within this window for ~free.
+const dashboardStatsCacheTTL = 30 * time.Second
+
 // handleV2DashboardStats returns the full dashboard stats wrapped in V2 format.
+// Backed by a 30s Redis cache with single-flight to prevent thundering herd
+// when the cache TTL expires under polling load.
 func (s *Server) handleV2DashboardStats(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := v2RequestContext(r)
 	defer cancel()
 
-	// -- Queries --
+	s.cachedJSON(ctx, w,
+		"v2:stats:dashboard", dashboardStatsCacheTTL, 5*time.Second,
+		func() (any, error) {
+			return s.computeDashboardStats(ctx)
+		},
+	)
+}
+
+// computeDashboardStats runs the dashboard COUNT(*) queries against the live DB.
+// Wrapped by cachedJSON above. The V2 envelope {"data": ...} is constructed
+// inline because cachedJSON caches raw JSON bytes; going through writeV2Single
+// inside the cached path would re-wrap on every cache miss.
+func (s *Server) computeDashboardStats(ctx context.Context) (map[string]any, error) {
+	// -- Queries (small table, no timeout needed) --
 	queries := map[string]int{}
 	qRows, _ := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM queries GROUP BY status`)
 	if qRows != nil {
@@ -28,26 +49,23 @@ func (s *Server) handleV2DashboardStats(w http.ResponseWriter, r *http.Request) 
 	}
 	queries["total"] = qTotal
 
-	// -- SERP Jobs (with statement timeout) --
-	serp := map[string]any{}
-	var serpTotal, serpNew, serpProcessing, serpCompleted, serpFailed int
-	var serpURLsFound, serpPerHour, serpToday int
-
+	// -- Big-table aggregates: serp_jobs + enrichment_jobs + emails --
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		slog.Error("v2: dashboard tx error", "error", err)
-		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to fetch dashboard stats")
-		return
+		return nil, err
 	}
 	defer tx.Rollback()
 
-	// 15s — serp_jobs (5.7M rows) and emails (828K+) need more headroom.
+	// 15s — serp_jobs (5.7M rows) and emails (828K+) need headroom.
 	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'"); err != nil {
 		slog.Error("v2: set timeout error", "error", err)
-		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to set timeout")
-		return
+		return nil, err
 	}
 
+	serp := map[string]any{}
+	var serpTotal, serpNew, serpProcessing, serpCompleted, serpFailed int
+	var serpURLsFound, serpPerHour, serpToday int
 	tx.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
@@ -69,7 +87,6 @@ func (s *Server) handleV2DashboardStats(w http.ResponseWriter, r *http.Request) 
 	serp["rate_per_hour"] = serpPerHour
 	serp["today"] = serpToday
 
-	// -- Enrich Jobs --
 	enrich := map[string]any{}
 	var enrichTotal, enrichPending, enrichProcessing, enrichCompleted, enrichFailed, enrichDead int
 	var enrichPerHour, enrichToday int
@@ -94,20 +111,17 @@ func (s *Server) handleV2DashboardStats(w http.ResponseWriter, r *http.Request) 
 	enrich["rate_per_hour"] = enrichPerHour
 	enrich["today"] = enrichToday
 
-	// -- Results --
 	results := map[string]any{}
 	var totalEmails, emailsToday, emailsLastHour, uniqueDomains int
 	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails`).Scan(&totalEmails)
 	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
 	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsLastHour)
 	tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT domain) FROM business_listings`).Scan(&uniqueDomains)
-
 	results["total_emails"] = totalEmails
 	results["emails_today"] = emailsToday
 	results["emails_per_hour"] = emailsLastHour
 	results["unique_domains"] = uniqueDomains
 
-	// Top email providers.
 	providerRows, _ := tx.QueryContext(ctx, `
 		SELECT domain, COUNT(*) AS cnt
 		FROM emails
@@ -127,20 +141,25 @@ func (s *Server) handleV2DashboardStats(w http.ResponseWriter, r *http.Request) 
 
 	tx.Commit()
 
-	// -- Queues (Redis) --
 	queueMap := map[string]int64{}
-	qd, _ := s.redis.ZCard(ctx, "serp:queue:queries").Result()
-	queueMap["serp:queue:queries"] = qd
-	sb, _ := s.redis.LLen(ctx, "serp:buffer").Result()
-	queueMap["serp:buffer"] = sb
-	eb, _ := s.redis.LLen(ctx, "enrich:buffer").Result()
-	queueMap["enrich:buffer"] = eb
+	if s.redis != nil {
+		qd, _ := s.redis.ZCard(ctx, "serp:queue:queries").Result()
+		queueMap["serp:queue:queries"] = qd
+		sb, _ := s.redis.LLen(ctx, "serp:buffer").Result()
+		queueMap["serp:buffer"] = sb
+		eb, _ := s.redis.LLen(ctx, "enrich:buffer").Result()
+		queueMap["enrich:buffer"] = eb
+	}
 
-	writeV2Single(w, map[string]any{
-		"queries": queries,
-		"serp":    serp,
-		"enrich":  enrich,
-		"results": results,
-		"queues":  queueMap,
-	})
+	// Wrap in V2 envelope manually since cachedJSON caches the raw bytes —
+	// returning the inner object alone would force callers to re-wrap on hit.
+	return map[string]any{
+		"data": map[string]any{
+			"queries": queries,
+			"serp":    serp,
+			"enrich":  enrich,
+			"results": results,
+			"queues":  queueMap,
+		},
+	}, nil
 }

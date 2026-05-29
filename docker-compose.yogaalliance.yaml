@@ -1,0 +1,26 @@
+# Dedicated one-shot crawler container for the Yoga Alliance directory.
+# Runs on kurama (Dokploy) where it has Postgres access, harvests the in-niche
+# RYT/RYS directory via the guest Apex API, and inserts straight into the
+# existing tables tagged source='yogaalliance'. restart:"no" — it's a batch job
+# that exits when the ~78K-teacher harvest completes (re-run to refresh).
+#
+# Deploy via Dokploy as a separate compose target, or locally on kurama:
+#   POSTGRES_DSN=... docker compose -f docker-compose.yogaalliance.yaml up --build
+#
+# Rollback/source: every row it writes is tagged via business_emails.source =
+# 'yogaalliance' + business_listings.category = 'yogaalliance' + a
+# *.ryt.yogaalliance.org synthetic domain, so the whole batch is trivially
+# identifiable and deletable if needed.
+
+services:
+  yogaalliance:
+    build:
+      context: .
+      dockerfile: Dockerfile.yogaalliance
+    image: ghcr.mcpke.dev/yogaalliance-crawler:${YA_TAG:-v1}
+    pull_policy: never
+    environment:
+      POSTGRES_DSN: ${POSTGRES_DSN}
+      TZ: Asia/Jakarta
+    command: ["-mode", "teacher", "-insert", "-concurrency", "8"]
+    restart: "no"
