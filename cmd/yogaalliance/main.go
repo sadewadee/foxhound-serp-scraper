@@ -641,10 +641,9 @@ func fetchSchoolPage(c *http.Client, params map[string]any) ([]schoolRec, error)
 // pass (empty location) caps at ~2000, so we then sweep schoolCenters worldwide
 // (radius 50mi each) until the deduped count reaches the reported total. limit
 // caps the result (0 = all).
-func enumerateSchools(c *http.Client, limit int) []schoolRec {
+func enumerateSchools(c *http.Client, total, limit int) []schoolRec {
 	seen := map[string]bool{}
 	var out []schoolRec
-	total := fetchSchoolCount(c)
 
 	add := func(recs []schoolRec) {
 		for _, rec := range recs {
@@ -659,7 +658,11 @@ func enumerateSchools(c *http.Client, limit int) []schoolRec {
 	sweep := func(lat, lng float64, addr, country string) {
 		for page := 1; page <= 120; page++ {
 			recs, err := fetchSchoolPage(c, searchParams(lat, lng, addr, country, schoolPageSize, page))
-			if err != nil || len(recs) == 0 {
+			if err != nil {
+				log.Printf("  sweep %q page %d: %v — stopping this location (may undercount it)", addr, page, err)
+				break
+			}
+			if len(recs) == 0 {
 				break
 			}
 			add(recs)
@@ -726,7 +729,7 @@ func (s *school) row() []string {
 func runSchools(c *http.Client, db *sql.DB, conc, limit int, outPath string) {
 	total := fetchSchoolCount(c)
 	log.Printf("yogaalliance: school — directory reports %d published RYS schools globally", total)
-	recs := enumerateSchools(c, limit)
+	recs := enumerateSchools(c, total, limit)
 	log.Printf("yogaalliance: school — %d unique schools to fetch (concurrency=%d, insert=%v, csv=%q)", len(recs), conc, db != nil, outPath)
 
 	var w *csv.Writer
