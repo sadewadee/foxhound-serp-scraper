@@ -2,23 +2,25 @@
 # registry. The push is done MANUALLY (not here) because the Traefik ingress in
 # front of ghcr.mcpke.dev kills large blob uploads at ~60s ("client disconnected"
 # 500 → docker retries forever). Proven push path instead:
-#   kurama: docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.4-niche | gzip
+#   kurama: docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.5-niche | gzip
 #         | ssh (via Mac) hachibi: docker load
-#   hachibi: docker tag …:v0.8.4-niche localhost:32769/foxhound-serp-scraper:v0.8.4-niche
+#   hachibi: docker tag …:v0.8.5-niche localhost:32769/foxhound-serp-scraper:v0.8.5-niche
 #          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.4-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.5-niche
+# v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
+#   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 #
-# Deploy: set IMAGE_TAG=v0.8.4-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.8.5-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.4-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.5-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
