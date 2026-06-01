@@ -1502,6 +1502,15 @@ func Migrate(db *sql.DB) error {
 	}
 	defer conn.Close()
 
+	// pg_advisory_lock() BLOCKS until the lock is free, which routinely exceeds
+	// the server statement_timeout (60s) while another container is migrating.
+	// The timeout MUST be disabled on this connection, or the lock wait is
+	// cancelled with 57014 → Migrate() errors → the process exits → every
+	// non-first container crash-loops on boot and the manager API never starts
+	// (exactly what v0.8.7 hit in prod 2026-06-01). Scoped to this conn only.
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = 0`); err != nil {
+		return fmt.Errorf("db: migrate: disable conn timeout: %w", err)
+	}
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrateAdvisoryLockKey); err != nil {
 		return fmt.Errorf("db: migrate: advisory lock: %w", err)
 	}
