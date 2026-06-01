@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestOfflineParseDecision covers the pure decision logic of applyOfflineParse:
@@ -241,37 +242,46 @@ func TestEligibilityQuery_NoOrderByRandom(t *testing.T) {
 	}
 }
 
-// TestReenrichHealthGate covers the honest-healthcheck logic (issue #28, fix #4):
-// the worker stays healthy while eligibility queries succeed (even with zero
-// rows), and only reports degraded after reenrichMaxConsecutiveEligFailures
-// consecutive failures — at which point touchHealthFile stops refreshing the
-// health file so autoheal can restart the stalled worker.
+// TestReenrichHealthGate covers the progress-based healthcheck (issue #28 +
+// 2026-06-01 doom-loop fix): the worker is healthy while it makes progress, and
+// only reports degraded after reenrichHealthWindow with NO progress. Crucially,
+// transient eligibility-query timeouts (57014) must NOT flip a still-progressing
+// worker unhealthy — that restart re-ran Migrate() and re-fired the boot DDL
+// herd, deepening the contention that caused the timeout.
 func TestReenrichHealthGate(t *testing.T) {
 	r := &ReenrichStage{}
 
 	if !r.healthy() {
-		t.Fatal("a fresh worker must report healthy")
+		t.Fatal("a fresh worker (no progress recorded yet) must report healthy")
 	}
 
-	// Failures just below the threshold keep it healthy.
-	for i := 0; i < reenrichMaxConsecutiveEligFailures-1; i++ {
+	// Recording progress keeps it healthy.
+	r.recordProgress()
+	if !r.healthy() {
+		t.Fatal("worker must be healthy immediately after recording progress")
+	}
+
+	// No progress for longer than the window -> degraded (genuine stall).
+	r.lastProgress.Store(time.Now().Add(-2 * reenrichHealthWindow).UnixNano())
+	if r.healthy() {
+		t.Fatalf("worker should report degraded after %v without progress", reenrichHealthWindow)
+	}
+
+	// REGRESSION GUARD (doom loop): a flood of eligibility-query timeouts must
+	// NOT mark a recently-progressing worker unhealthy.
+	r.recordProgress()
+	for i := 0; i < reenrichMaxConsecutiveEligFailures+5; i++ {
 		r.recordEligibilityFailure()
 	}
 	if !r.healthy() {
-		t.Fatalf("worker should still be healthy after %d failures (threshold %d)",
-			reenrichMaxConsecutiveEligFailures-1, reenrichMaxConsecutiveEligFailures)
+		t.Fatal("eligibility-query timeouts alone must not mark a progressing worker unhealthy")
 	}
 
-	// One more failure crosses the threshold -> degraded.
-	r.recordEligibilityFailure()
-	if r.healthy() {
-		t.Fatalf("worker should report degraded after %d consecutive failures",
-			reenrichMaxConsecutiveEligFailures)
-	}
-
-	// A single success resets the counter — the worker is doing work again.
+	// A successful eligibility query records progress -> restores health even if
+	// the worker had gone stale.
+	r.lastProgress.Store(time.Now().Add(-2 * reenrichHealthWindow).UnixNano())
 	r.recordEligibilitySuccess()
 	if !r.healthy() {
-		t.Fatal("a successful eligibility query must reset health to healthy")
+		t.Fatal("a successful eligibility query must restore health (records progress)")
 	}
 }

@@ -41,11 +41,20 @@ type ReenrichStage struct {
 	found     atomic.Int64
 
 	// eligFailures counts consecutive eligibility-query failures across all
-	// workers. Reset to 0 on any successful claim (issue #28 — the worker used
-	// to time out on every loop yet report "healthy", silently producing ~0
-	// rows). When this crosses reenrichMaxConsecutiveEligFailures the health
-	// probe reports degraded so the container healthcheck can stop lying.
+	// workers — kept for observability/logging only. It no longer gates health:
+	// a transient 57014 statement-timeout under load must not flip the worker
+	// unhealthy, because the resulting autoheal restart re-runs Migrate() and
+	// re-fires the boot DDL herd, deepening the very contention that caused the
+	// timeout (the 2026-06-01 doom loop). Health is progress-based instead.
 	eligFailures atomic.Int64
+
+	// lastProgress is the unix-nanos timestamp of the worker's last sign of
+	// life: a successful eligibility query (even zero rows — the query ran) or a
+	// processed row. healthy() reports degraded only when NO progress has
+	// happened for reenrichHealthWindow — that still catches a genuinely stalled
+	// worker (issue #28: every query times out, zero rows ever) while ignoring
+	// the intermittent timeouts a busy-but-progressing worker sees under load.
+	lastProgress atomic.Int64
 }
 
 // NewReenrichStage creates a new ReenrichStage.
@@ -83,6 +92,9 @@ func (r *ReenrichStage) Run(ctx context.Context) error {
 		numWorkers = 1
 	}
 	slog.Info("reenrich: starting workers", "count", numWorkers, "min_score", r.cfg.ReenrichScore)
+
+	// Seed progress so a freshly-booted worker reports healthy during startup.
+	r.recordProgress()
 
 	// Health file so the container healthcheck doesn't kill us while idle.
 	// The probe lets the file go stale once eligibility queries have been
@@ -145,16 +157,23 @@ func (r *ReenrichStage) worker(ctx context.Context, workerID int) {
 			slog.Warn("reenrich: eligibility query failed",
 				"worker", workerID, "error", err, "consecutive_failures", fails)
 			if fails >= reenrichMaxConsecutiveEligFailures {
-				// Surface the stall instead of hiding behind a green healthcheck
-				// (issue #28). touchHealthFile sees healthy()==false and stops
-				// refreshing /tmp/worker-healthy, so autoheal restarts us.
-				slog.Error("reenrich: eligibility query failing repeatedly — reporting degraded health",
+				// Operator signal only. Health is progress-based now, so a
+				// 57014 statement-timeout under load no longer forces a restart
+				// (that restart re-ran Migrate() → boot DDL herd → more
+				// contention → the 2026-06-01 doom loop). A genuinely stuck
+				// worker (zero rows processed) still goes unhealthy on the
+				// reenrichHealthWindow timer.
+				slog.Error("reenrich: eligibility query failing repeatedly — DB likely under contention, check pg_stat_activity",
 					"worker", workerID, "consecutive_failures", fails)
 			}
+			// Staggered backoff de-synchronizes the worker fleet so they stop
+			// retrying in lockstep and piling onto the same index head via
+			// SKIP LOCKED.
+			backoff := time.Duration(10+(workerID%6)*2) * time.Second
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(15 * time.Second):
+			case <-time.After(backoff):
 			}
 			continue
 		}
@@ -211,22 +230,43 @@ const reenrichMaxAttempts = 10
 // #7: fail-open paths must signal).
 const reenrichMaxConsecutiveEligFailures = 5
 
-// recordEligibilitySuccess clears the consecutive-failure counter after any
-// successful eligibility query (including one that legitimately returns zero
-// eligible rows — that means the query ran, the worker is not stalled).
-func (r *ReenrichStage) recordEligibilitySuccess() { r.eligFailures.Store(0) }
+// reenrichHealthWindow is how long the worker can go without ANY progress
+// (successful eligibility query or processed row) before healthy() reports
+// degraded. Generous enough to ride out a transient DB blip; short enough that
+// a genuinely stalled worker (issue #28: every query times out, zero rows ever)
+// still surfaces to autoheal. A 57014 timeout alone never trips this as long as
+// the worker keeps making progress.
+const reenrichHealthWindow = 5 * time.Minute
+
+// recordProgress stamps the worker's last sign of life (unix nanos).
+func (r *ReenrichStage) recordProgress() { r.lastProgress.Store(time.Now().UnixNano()) }
+
+// recordEligibilitySuccess clears the consecutive-failure counter and records
+// progress after any successful eligibility query (including one that returns
+// zero eligible rows — the query ran, so the worker is alive and not stalled).
+func (r *ReenrichStage) recordEligibilitySuccess() {
+	r.eligFailures.Store(0)
+	r.recordProgress()
+}
 
 // recordEligibilityFailure increments the consecutive-failure counter after an
-// eligibility query error (statement timeout, etc.).
+// eligibility query error (statement timeout, etc.). Observability only — it
+// does NOT record progress and does NOT directly gate health.
 func (r *ReenrichStage) recordEligibilityFailure() { r.eligFailures.Add(1) }
 
-// healthy reports whether the reenrich worker is doing useful work. It returns
-// false once eligibility queries have failed reenrichMaxConsecutiveEligFailures
-// times in a row, so touchHealthFile stops refreshing the health file and the
-// container healthcheck eventually fails — making the silent-degradation in
-// issue #28 visible to autoheal.
+// healthy reports whether the reenrich worker is doing useful work, keyed on
+// recent progress rather than eligibility-query outcomes. A worker that keeps
+// processing rows stays healthy even while the eligibility fetch intermittently
+// times out under load — which stops the autoheal→Migrate→DDL-herd doom loop
+// (2026-06-01). A worker making no progress for reenrichHealthWindow (issue #28)
+// reports degraded so touchHealthFile lets the health file go stale and autoheal
+// restarts it. A zero lastProgress means "not started yet" → healthy.
 func (r *ReenrichStage) healthy() bool {
-	return r.eligFailures.Load() < reenrichMaxConsecutiveEligFailures
+	lp := r.lastProgress.Load()
+	if lp == 0 {
+		return true
+	}
+	return time.Since(time.Unix(0, lp)) < reenrichHealthWindow
 }
 
 // eligibilityQuery is the exact SQL fetchEligibleBatch runs, lifted to package
@@ -237,6 +277,14 @@ const eligibilityQuery = `
 			SELECT bl.id
 			FROM business_listings bl
 			WHERE re_enriched_at IS NULL
+			  -- YogaAlliance synthetic domains (<id>.ryt/.rys.yogaalliance.org)
+			  -- have no real website: a network refetch yields nothing and they
+			  -- can never reach min_score, so they stay permanently eligible and
+			  -- dominate the candidate pool — burning 16 workers' cycles for ~0
+			  -- new emails (the 2026-06-01 churn). Exclude them; their contact
+			  -- data already came from the dedicated crawler.
+			  AND bl.domain NOT LIKE '%.ryt.yogaalliance.org'
+			  AND bl.domain NOT LIKE '%.rys.yogaalliance.org'
 			  AND (re_enrich_locked_at IS NULL
 			       OR re_enrich_locked_at < NOW() - INTERVAL '15 minutes')
 			  AND COALESCE(bl.re_enrich_attempts, 0) < $3
@@ -365,6 +413,10 @@ func (r *ReenrichStage) fetchEligibleBatch(ctx context.Context, scoreThreshold i
 }
 
 func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFetcher, row reenrichRow, workerID int) {
+	// Claiming + working a row is a sign of life — keep the worker healthy even
+	// if the next eligibility fetch times out under load.
+	r.recordProgress()
+
 	// Offline pre-pass: derive country/city from the existing address blob
 	// before paying for a network refetch. If the row already had contact
 	// data (emails/phones) and the offline parse fills in country+city, we

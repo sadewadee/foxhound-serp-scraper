@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -317,6 +318,15 @@ func runMigrations(db *sql.DB) error {
 		slog.Warn("db: idx_queries_processing_updated CONCURRENTLY failed — planner will use idx_queries_status fallback", "error", err)
 	}
 
+	// Backs the reenrich eligibility EXISTS subquery
+	// (e.is_acceptable = true OR e.score >= 0.7), which otherwise re-evaluates
+	// per candidate row and was a contributor to the 5s statement_timeout that
+	// drove the reenrich health-flap (2026-06-01). CONCURRENTLY + log-continue,
+	// same pattern as the niche indexes above.
+	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_emails_acceptable_score ON emails (is_acceptable, score)`); err != nil {
+		slog.Warn("db: idx_emails_acceptable_score CONCURRENTLY failed — reenrich eligibility EXISTS will fall back to PK scan", "error", err)
+	}
+
 	// --- Triggers ---
 
 	// Trigger 1: serp_results INSERT -> create enrichment_job.
@@ -333,11 +343,24 @@ func runMigrations(db *sql.DB) error {
 	`); err != nil {
 		return fmt.Errorf("db: create trg_enqueue_enrichment function: %w", err)
 	}
+	// Bind the trigger only if it is missing. CREATE OR REPLACE FUNCTION above
+	// already updates the body lock-free; the previous unconditional
+	// DROP TRIGGER … CREATE TRIGGER took an ACCESS EXCLUSIVE lock on serp_results
+	// on EVERY boot and was a primary driver of the boot DDL herd. The trigger
+	// binding never changes, so create it once and skip thereafter. (If the
+	// binding ever needs to change, do it via a one-shot versioned migration.)
 	if _, err := db.Exec(`
-		DROP TRIGGER IF EXISTS trg_serp_results_enqueue ON serp_results;
-		CREATE TRIGGER trg_serp_results_enqueue
-		  AFTER INSERT ON serp_results
-		  FOR EACH ROW EXECUTE FUNCTION trg_enqueue_enrichment();
+		DO $$
+		BEGIN
+		  IF NOT EXISTS (
+		    SELECT 1 FROM pg_trigger
+		    WHERE tgname = 'trg_serp_results_enqueue' AND NOT tgisinternal
+		  ) THEN
+		    CREATE TRIGGER trg_serp_results_enqueue
+		      AFTER INSERT ON serp_results
+		      FOR EACH ROW EXECUTE FUNCTION trg_enqueue_enrichment();
+		  END IF;
+		END $$;
 	`); err != nil {
 		return fmt.Errorf("db: create trg_serp_results_enqueue trigger: %w", err)
 	}
@@ -498,13 +521,25 @@ func runMigrations(db *sql.DB) error {
 	// locked_by, attempt_count). At peak throughput enrichment_jobs sees
 	// thousands of UPDATEs/h that have no normalization work to do; this WHEN
 	// clause cuts that overhead to zero.
+	// Same idempotent binding as trg_serp_results_enqueue: the function body is
+	// kept current by CREATE OR REPLACE FUNCTION above (lock-free); the trigger
+	// binding is created once. The previous DROP/CREATE took ACCESS EXCLUSIVE on
+	// the 7M-row enrichment_jobs table on every boot. The WHEN filter is part of
+	// the binding — if it ever changes, ship a one-shot versioned migration.
 	if _, err := db.Exec(`
-		DROP TRIGGER IF EXISTS trg_enrichment_normalize ON enrichment_jobs;
-		CREATE TRIGGER trg_enrichment_normalize
-		  AFTER UPDATE ON enrichment_jobs
-		  FOR EACH ROW
-		  WHEN (NEW.status = 'completed' AND OLD.status IS DISTINCT FROM 'completed')
-		  EXECUTE FUNCTION trg_normalize_enrichment();
+		DO $$
+		BEGIN
+		  IF NOT EXISTS (
+		    SELECT 1 FROM pg_trigger
+		    WHERE tgname = 'trg_enrichment_normalize' AND NOT tgisinternal
+		  ) THEN
+		    CREATE TRIGGER trg_enrichment_normalize
+		      AFTER UPDATE ON enrichment_jobs
+		      FOR EACH ROW
+		      WHEN (NEW.status = 'completed' AND OLD.status IS DISTINCT FROM 'completed')
+		      EXECUTE FUNCTION trg_normalize_enrichment();
+		  END IF;
+		END $$;
 	`); err != nil {
 		return fmt.Errorf("db: create trg_enrichment_normalize trigger: %w", err)
 	}
@@ -1413,8 +1448,40 @@ func runMigrations(db *sql.DB) error {
 	return nil
 }
 
+// migrateAdvisoryLockKey serializes Migrate() across all booting containers.
+// Every container (serp×N, enrich×N, reenrich×N, manager) runs Migrate() on
+// boot via cmd/run.go. Without serialization their concurrent DROP/CREATE
+// TRIGGER + ALTER TABLE statements take ACCESS EXCLUSIVE locks that pile up
+// and freeze serp_results / serp_jobs writes fleet-wide — the 2026-06-01
+// reenrich-flap ↔ DDL-herd doom loop. Holding one session-level advisory lock
+// for the whole migration means exactly one container migrates at a time; the
+// rest block on pg_advisory_lock(), then proceed and find everything already
+// present (fast IF NOT EXISTS / IF NOT EXISTS-guarded no-ops).
+const migrateAdvisoryLockKey int64 = 778120601
+
 // Migrate creates all tables if they don't exist, then runs incremental migrations.
+//
+// The whole body is serialized across containers by a session advisory lock
+// held on a dedicated *sql.Conn (see migrateAdvisoryLockKey). The lock lives on
+// `conn` for the duration; schema + runMigrations still execute on the pool,
+// which is fine — only one container ever gets past pg_advisory_lock at a time.
 func Migrate(db *sql.DB) error {
+	ctx := context.Background()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("db: migrate: acquire conn: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrateAdvisoryLockKey); err != nil {
+		return fmt.Errorf("db: migrate: advisory lock: %w", err)
+	}
+	defer func() {
+		// Best-effort explicit release; closing the conn also drops the session lock.
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrateAdvisoryLockKey)
+	}()
+
 	db.Exec(`SET statement_timeout = '300s'`)
 	defer db.Exec(`SET statement_timeout = '60s'`)
 
