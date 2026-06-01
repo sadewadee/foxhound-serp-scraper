@@ -301,6 +301,22 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	// Healing index: makes healZombieQueries fast on the ~116K stuck-processing
+	// rows. The reconciler hits this predicate every 60s; without the index it
+	// would do a full seqscan on the 3.16M-row queries table.
+	//
+	// Using CONCURRENTLY (outside any tx) so it doesn't take a ShareLock that
+	// would stall writes on the queries table during deploy (same reason as the
+	// niche indexes above). CONCURRENTLY cannot run inside a transaction block.
+	// Log-and-continue: if it fails (e.g. a previous failed concurrent build
+	// left an INVALID index), the migration still succeeds — the planner will
+	// fall back to the existing idx_queries_status B-tree, which is slower but
+	// correct. The next successful deploy will retry and IF NOT EXISTS will no-op
+	// once the valid index exists.
+	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_queries_processing_updated ON queries (updated_at) WHERE status = 'processing'`); err != nil {
+		slog.Warn("db: idx_queries_processing_updated CONCURRENTLY failed — planner will use idx_queries_status fallback", "error", err)
+	}
+
 	// --- Triggers ---
 
 	// Trigger 1: serp_results INSERT -> create enrichment_job.

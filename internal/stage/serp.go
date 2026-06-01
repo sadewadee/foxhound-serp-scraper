@@ -812,6 +812,36 @@ var queryExpanders = []string{
 	"\"@gmail.com\"", "\"@yahoo.com\"", "email", "contact", "instagram",
 }
 
+// offTargetBeautySubstrings lists beauty/grooming substrings that identify
+// off-target queries which must never be re-expanded. Match is lowercased
+// Contains — ONLY these categories; wellness/spa/yoga/pilates remain on-target.
+var offTargetBeautySubstrings = []string{
+	"hair stylist",
+	"hair salon",
+	"barbershop",
+	"barber",
+	"nail salon",
+	"nail technician",
+	"beauty salon",
+	"beauty therapist",
+	"lash technician",
+	"makeup artist",
+	"esthetician",
+	"skin therapist",
+}
+
+// isOffTargetQuery returns true if the query text contains a known
+// beauty/grooming substring that marks it as off-target for this pipeline.
+func isOffTargetQuery(text string) bool {
+	lower := strings.ToLower(text)
+	for _, sub := range offTargetBeautySubstrings {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *SERPStage) expandCompletedQueries() {
 	rows, err := s.db.Query(`
 		SELECT id, text FROM queries
@@ -830,6 +860,14 @@ func (s *SERPStage) expandCompletedQueries() {
 		if err := rows.Scan(&id, &text); err != nil {
 			continue
 		}
+
+		// Defense-in-depth: skip re-expansion for off-target (beauty/grooming)
+		// legacy queries. Mark expanded_at now so they never re-enter this loop.
+		if isOffTargetQuery(text) {
+			s.db.Exec(`UPDATE queries SET expanded_at = NOW() WHERE id = $1`, id)
+			continue
+		}
+
 		for _, suffix := range queryExpanders {
 			variant := text + " " + suffix
 			inserted, insertErr := s.queryRepo.InsertBatch([]string{variant})
@@ -851,9 +889,11 @@ func (s *SERPStage) expandCompletedQueries() {
 }
 
 func (s *SERPStage) requeueStuckJobs() {
+	// Limit raised to 5000 so a fresh deploy drains a larger slice of the
+	// boot backlog (previously capped at 500, leaving ~116K queries stuck).
 	res, err := s.db.Exec(`
 		UPDATE serp_jobs SET status = 'new', locked_by = NULL, locked_at = NULL, picked_at = NULL, updated_at = NOW()
-		WHERE id IN (SELECT id FROM serp_jobs WHERE status = 'processing' LIMIT 500)
+		WHERE id IN (SELECT id FROM serp_jobs WHERE status = 'processing' LIMIT 5000)
 	`)
 	if err != nil {
 		slog.Warn("serp: requeueStuckJobs failed", "error", err)
@@ -863,7 +903,7 @@ func (s *SERPStage) requeueStuckJobs() {
 
 	qRes, qErr := s.db.Exec(`
 		UPDATE queries SET status = 'pending', updated_at = NOW()
-		WHERE id IN (SELECT id FROM queries WHERE status = 'processing' LIMIT 500)
+		WHERE id IN (SELECT id FROM queries WHERE status = 'processing' LIMIT 5000)
 	`)
 	if qErr != nil {
 		slog.Warn("serp: requeue stuck queries failed", "error", qErr)

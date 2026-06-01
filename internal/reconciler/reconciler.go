@@ -130,15 +130,31 @@ func (r *ProjectReconciler) tick(ctx context.Context) {
 func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 	snap := Snapshot{Taken: time.Now()}
 
-	// Queries.
-	r.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending'),
-			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'error')
-		FROM queries
-	`).Scan(&snap.QueriesPending, &snap.QueriesProcessing, &snap.QueriesCompleted, &snap.QueriesError)
+	// Queries — bounded by statement_timeout to avoid holding both pool
+	// connections on the 3.16M-row queries table (Operational Invariant #2).
+	// On timeout we degrade gracefully: keep last-known counts from prev
+	// snapshot so the tick continues and healing is not blocked.
+	if tx, txErr := r.db.Begin(); txErr == nil {
+		tx.Exec("SET LOCAL statement_timeout = '5000'")
+		err := tx.QueryRow(`
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'pending'),
+				COUNT(*) FILTER (WHERE status = 'processing'),
+				COUNT(*) FILTER (WHERE status = 'completed'),
+				COUNT(*) FILTER (WHERE status = 'error')
+			FROM queries
+		`).Scan(&snap.QueriesPending, &snap.QueriesProcessing, &snap.QueriesCompleted, &snap.QueriesError)
+		if err != nil {
+			slog.Warn("project-reconciler: queries snapshot timed out, using last-known counts", "error", err)
+			r.mu.RLock()
+			snap.QueriesPending = r.snapshot.QueriesPending
+			snap.QueriesProcessing = r.snapshot.QueriesProcessing
+			snap.QueriesCompleted = r.snapshot.QueriesCompleted
+			snap.QueriesError = r.snapshot.QueriesError
+			r.mu.RUnlock()
+		}
+		tx.Commit()
+	}
 
 	// SERP jobs — bounded by statement_timeout to avoid holding connections on large tables.
 	if tx, txErr := r.db.Begin(); txErr == nil {
@@ -192,12 +208,14 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 }
 
 // healZombieQueries resets processing queries that have no active serp_jobs.
+// Limit raised to 5000 so the healer can outrun the inflow of stuck rows
+// (~116K backlog observed in production, oldest from March).
 func (r *ProjectReconciler) healZombieQueries(ctx context.Context, snap Snapshot) {
 	if snap.QueriesProcessing < 100 {
 		return
 	}
 
-	limit := 1000
+	const limit = 5000
 
 	res, err := r.db.Exec(fmt.Sprintf(`
 		UPDATE queries SET status = 'pending', updated_at = NOW()
@@ -292,11 +310,18 @@ func (r *ProjectReconciler) requeuePendingQueries(ctx context.Context, limit int
 	defer rows.Close()
 
 	pipe := r.redis.Pipeline()
+	// Score = future Unix timestamp so healed queries land at the BACK of the
+	// ZPOPMIN sorted set (Operational Invariant #3). Using q.ID as score put
+	// low-numbered IDs at the front, causing a tight re-process loop.
+	// Stagger each entry by 1 second to preserve ordering among the batch.
+	base := time.Now().Unix() + 60
+	i := int64(0)
 	for rows.Next() {
 		var q queryMsg
 		if err := rows.Scan(&q.ID, &q.Text); err == nil {
 			data, _ := json.Marshal(q)
-			pipe.ZAdd(ctx, "serp:queue:queries", redis.Z{Score: float64(q.ID), Member: string(data)})
+			pipe.ZAdd(ctx, "serp:queue:queries", redis.Z{Score: float64(base + i), Member: string(data)})
+			i++
 		}
 	}
 	pipe.Exec(ctx)
