@@ -1,29 +1,37 @@
 # Build-only compose for kurama. Builds the image and tags it for the kremlit
 # registry. The push is done MANUALLY (not here) because the Traefik ingress in
 # front of ghcr.mcpke.dev kills large blob uploads at ~60s ("client disconnected"
-# 500 → docker retries forever). Proven push path instead:
-#   kurama: docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.6-niche | gzip
-#         | ssh (via Mac) hachibi: docker load
-#   hachibi: docker tag …:v0.8.6-niche localhost:32769/foxhound-serp-scraper:v0.8.6-niche
+# 500 → docker retries forever). Proven push path instead — NO ROUTE FROM THE MAC,
+# EVER (zero image bytes may transit the local machine); save to a FILE then scp
+# DIRECTLY kurama→hachibi by bare hostname (NOT a Tailscale IP):
+#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.7-niche | gzip -1 > /tmp/v0.8.7-niche.tgz
+#   kurama:  scp -o BatchMode=yes /tmp/v0.8.7-niche.tgz hachibi:/tmp/v0.8.7-niche.tgz
+#   hachibi: docker load < /tmp/v0.8.7-niche.tgz
+#   hachibi: docker tag …:v0.8.7-niche localhost:32769/foxhound-serp-scraper:v0.8.7-niche
 #          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.6-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.7-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
 #   heal limit 5000, requeue-score invariant #3 fix, snapshot statement_timeout
 #   invariant #2 fix, partial idx_queries_processing_updated, off-target guard).
+# v0.8.7-niche = v0.8.6-niche + Phase 1 doom-loop fix: advisory-lock Migrate()
+#   (serialize the boot DDL herd), idempotent trigger bindings (no per-boot ACCESS
+#   EXCLUSIVE on serp_results/enrichment_jobs), progress-based reenrich health
+#   (stop the autoheal flap), exclude YA synthetic domains from reenrich,
+#   idx_emails_acceptable_score.
 #
-# Deploy: set IMAGE_TAG=v0.8.6-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.8.7-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.6-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.7-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
