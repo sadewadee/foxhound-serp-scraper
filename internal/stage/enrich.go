@@ -361,7 +361,7 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 			WHERE id IN (
 				SELECT id FROM enrichment_jobs
 				WHERE status = 'processing' AND locked_at < NOW() - INTERVAL '5 minutes'
-				LIMIT 200
+				LIMIT 200 FOR UPDATE SKIP LOCKED
 			)
 		`)
 		if err == nil {
@@ -401,7 +401,7 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				  AND error_msg NOT LIKE '%no such host%'
 				  AND error_msg NOT LIKE '%server misbehaving%'
 				  AND error_msg NOT LIKE 'permanently dead%'
-				LIMIT 1000
+				LIMIT 1000 FOR UPDATE SKIP LOCKED
 			)
 		`)
 		if deadRes != nil {
@@ -418,7 +418,7 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				WHERE status = 'failed'
 				  AND next_attempt_at IS NOT NULL AND next_attempt_at <= NOW()
 				  AND attempt_count < max_attempts
-				LIMIT 1000
+				LIMIT 1000 FOR UPDATE SKIP LOCKED
 			)
 		`)
 		if failedRes != nil {

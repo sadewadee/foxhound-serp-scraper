@@ -41,17 +41,29 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 		argIdx++
 	}
 	if provider := q.Get("email_provider"); provider != "" {
-		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.email LIKE $%d)", argIdx)
-		args = append(args, "%@"+provider)
+		// Match on e.domain (exact) rather than LIKE '%@provider' — avoids
+		// a full-index scan of the emails table on large datasets.
+		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.domain = $%d)", argIdx)
+		args = append(args, provider)
 		argIdx++
 	}
 
-	// Count total.
+	// Count total — bounded context + statement_timeout to prevent pool starvation
+	// when business_listings is large (>1M rows).  5s matches the enrich reconciler
+	// budget; a timeout silently leaves total=0 (pagination still works).
+	countCtx, countCancel := context.WithTimeout(r.Context(), 6*time.Second)
+	defer countCancel()
 	var total int
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
-	s.db.QueryRow(countQuery, args...).Scan(&total)
+	countTx, err := s.db.BeginTx(countCtx, nil)
+	if err == nil {
+		countTx.ExecContext(countCtx, "SET LOCAL statement_timeout = '5000'")
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM business_listings bl %s", where)
+		countTx.QueryRowContext(countCtx, countQuery, args...).Scan(&total)
+		countTx.Rollback() // read-only, always rollback
+	}
 
-	// Fetch rows.
+	// Query 1: Fetch page of listings WITHOUT a correlated email subquery.
+	// Emails are fetched in a single batch query below (avoids N+1).
 	dataQuery := fmt.Sprintf(`
 		SELECT bl.id, COALESCE(bl.business_name,''), COALESCE(bl.category,''),
 		       COALESCE(bl.description,''), COALESCE(bl.website,''),
@@ -59,11 +71,6 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.address,''), COALESCE(bl.location,''),
 		       COALESCE(bl.opening_hours,''), COALESCE(bl.rating,''),
 		       COALESCE(bl.page_title,''), bl.created_at,
-		       COALESCE(
-		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id
-		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending', 'unknown')),
-		         '{}'
-		       ) AS emails,
 		       COALESCE(bl.phone, '') AS phone
 		FROM business_listings bl %s
 		ORDER BY bl.id DESC
@@ -71,7 +78,7 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	`, where, argIdx, argIdx+1)
 	args = append(args, perPage, offset)
 
-	rows, err := s.db.Query(dataQuery, args...)
+	rows, err := s.db.QueryContext(r.Context(), dataQuery, args...)
 	if err != nil {
 		slog.Error("handler error", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
@@ -79,34 +86,76 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var contacts []map[string]any
+	// Temporary struct to hold listings before email stitching.
+	type listingRow struct {
+		id                                                   int64
+		businessName, category, description, website         string
+		domain, url, address, location, openingHours, rating string
+		pageTitle, phone                                     string
+		socialLinksJSON                                      []byte
+		createdAt                                            time.Time
+	}
+	var listings []listingRow
+	var listingIDs []int64
+
 	for rows.Next() {
-		var id int64
-		var businessName, category, description, website string
-		var domain, url, address, location, openingHours, rating, pageTitle, phone string
-		var socialLinksJSON []byte
-		var createdAt time.Time
-		var emails []string
+		var lr listingRow
+		rows.Scan(&lr.id, &lr.businessName, &lr.category, &lr.description, &lr.website,
+			&lr.domain, &lr.url, &lr.socialLinksJSON,
+			&lr.address, &lr.location, &lr.openingHours, &lr.rating, &lr.pageTitle,
+			&lr.createdAt, &lr.phone)
+		listings = append(listings, lr)
+		listingIDs = append(listingIDs, lr.id)
+	}
+	rows.Close()
 
-		rows.Scan(&id, &businessName, &category, &description, &website,
-			&domain, &url, &socialLinksJSON,
-			&address, &location, &openingHours, &rating, &pageTitle, &createdAt,
-			pq.Array(&emails), &phone)
-
-		var phones []string
-		if phone != "" {
-			phones = []string{phone}
+	// Query 2: Batch-fetch emails for all listing IDs in one round-trip.
+	// This replaces the correlated array_agg subquery that fired once per row.
+	emailMap := make(map[int64][]string, len(listingIDs))
+	if len(listingIDs) > 0 {
+		emailRows, err := s.db.QueryContext(r.Context(), `
+			SELECT be.business_id, e.email
+			FROM business_emails be
+			JOIN emails e ON e.id = be.email_id
+			WHERE be.business_id = ANY($1)
+			  AND e.validation_status IN ('valid', 'pending', 'unknown')
+			ORDER BY be.business_id, e.email
+		`, pq.Array(listingIDs))
+		if err != nil {
+			slog.Error("v1: batch email fetch error", "error", err)
+			// Continue without emails — don't fail the whole response.
+		} else {
+			defer emailRows.Close()
+			for emailRows.Next() {
+				var bizID int64
+				var email string
+				if err := emailRows.Scan(&bizID, &email); err == nil {
+					emailMap[bizID] = append(emailMap[bizID], email)
+				}
+			}
 		}
+	}
 
+	// Stitch emails back into contact records.
+	var contacts []map[string]any
+	for _, lr := range listings {
+		emails := emailMap[lr.id]
+		if emails == nil {
+			emails = []string{}
+		}
+		var phones []string
+		if lr.phone != "" {
+			phones = []string{lr.phone}
+		}
 		contacts = append(contacts, map[string]any{
-			"id":            id,
-			"business_name": businessName, "business_category": category,
-			"description": description, "website": website,
-			"emails": emails, "phones": phones, "domain": domain,
-			"url": url, "social_links": json.RawMessage(socialLinksJSON),
-			"address": address, "location": location, "opening_hours": openingHours,
-			"rating": rating, "page_title": pageTitle,
-			"created_at": createdAt,
+			"id":            lr.id,
+			"business_name": lr.businessName, "business_category": lr.category,
+			"description": lr.description, "website": lr.website,
+			"emails": emails, "phones": phones, "domain": lr.domain,
+			"url": lr.url, "social_links": json.RawMessage(lr.socialLinksJSON),
+			"address": lr.address, "location": lr.location, "opening_hours": lr.openingHours,
+			"rating": lr.rating, "page_title": lr.pageTitle,
+			"created_at": lr.createdAt,
 		})
 	}
 
@@ -125,7 +174,19 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 		format = "json"
 	}
 
+	// Hard cap: unbounded export on a >1M-row table holds a DB conn for
+	// minutes and starves the 2-conn pool.  Default 50 000; caller may
+	// lower via ?limit=N but never raise above the cap.
+	const exportHardLimit = 50_000
+	exportLimit := queryInt(q, "limit", exportHardLimit)
+	if exportLimit <= 0 || exportLimit > exportHardLimit {
+		exportLimit = exportHardLimit
+	}
+
+	// Build WHERE clause — parameterised to avoid SQL injection.
 	where := "WHERE EXISTS (SELECT 1 FROM business_emails be WHERE be.business_id = bl.id)"
+	args := []any{}
+	argIdx := 1
 	if provider := q.Get("email_provider"); provider != "" {
 		safe := true
 		for _, c := range provider {
@@ -135,24 +196,29 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if safe {
-			where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.email LIKE '%%@%s')", provider)
+			// Match on e.domain (exact) instead of LIKE '%@provider'.
+			where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be2 JOIN emails e ON e.id = be2.email_id WHERE be2.business_id = bl.id AND e.domain = $%d)", argIdx)
+			args = append(args, provider)
+			argIdx++
 		}
 	}
 
-	exportQuery := fmt.Sprintf(`
-		SELECT COALESCE(bl.business_name,''), COALESCE(bl.category,''),
+	// Query 1: listings page (no correlated subquery).  LIMIT is enforced here.
+	listQuery := fmt.Sprintf(`
+		SELECT bl.id, COALESCE(bl.business_name,''), COALESCE(bl.category,''),
 		       COALESCE(bl.website,''), bl.domain, bl.social_links,
 		       COALESCE(bl.address,''), COALESCE(bl.location,''),
-		       COALESCE(bl.phone,''),
-		       COALESCE(
-		         (SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id
-		          WHERE be.business_id = bl.id AND e.validation_status IN ('valid', 'pending', 'unknown')),
-		         '{}'
-		       ) AS emails
-		FROM business_listings bl %s ORDER BY bl.id ASC
-	`, where)
+		       COALESCE(bl.phone,'')
+		FROM business_listings bl %s
+		ORDER BY bl.id ASC
+		LIMIT $%d
+	`, where, argIdx)
+	args = append(args, exportLimit)
 
-	rows, err := s.db.Query(exportQuery)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, listQuery, args...)
 	if err != nil {
 		slog.Error("handler error", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
@@ -160,21 +226,65 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
+	type exportRow struct {
+		id              int64
+		businessName    string
+		category        string
+		website         string
+		domain          string
+		socialLinksJSON []byte
+		address         string
+		location        string
+		phone           string
+	}
+	var exportRows []exportRow
+	var exportIDs []int64
+	for rows.Next() {
+		var er exportRow
+		rows.Scan(&er.id, &er.businessName, &er.category, &er.website, &er.domain,
+			&er.socialLinksJSON, &er.address, &er.location, &er.phone)
+		exportRows = append(exportRows, er)
+		exportIDs = append(exportIDs, er.id)
+	}
+	rows.Close()
+
+	// Query 2: Batch-fetch emails for all IDs — replaces per-row array_agg subquery.
+	emailMap := make(map[int64][]string, len(exportIDs))
+	if len(exportIDs) > 0 {
+		emailRows, err := s.db.QueryContext(ctx, `
+			SELECT be.business_id, e.email
+			FROM business_emails be
+			JOIN emails e ON e.id = be.email_id
+			WHERE be.business_id = ANY($1)
+			  AND e.validation_status IN ('valid', 'pending', 'unknown')
+			ORDER BY be.business_id, e.email
+		`, pq.Array(exportIDs))
+		if err != nil {
+			slog.Error("v1: export batch email fetch error", "error", err)
+			// Continue — export rows with empty email lists rather than 500.
+		} else {
+			defer emailRows.Close()
+			for emailRows.Next() {
+				var bizID int64
+				var email string
+				if err := emailRows.Scan(&bizID, &email); err == nil {
+					emailMap[bizID] = append(emailMap[bizID], email)
+				}
+			}
+		}
+	}
+
 	if format == "csv" {
 		w.Header().Set("Content-Type", "text/csv")
 		w.Header().Set("Content-Disposition", "attachment; filename=contacts.csv")
 		fmt.Fprintln(w, "business_name,category,website,emails,domain,social_links,address,location,phone")
-		for rows.Next() {
-			var businessName, category, website, domain, address, location, phone string
-			var socialLinksJSON []byte
-			var emails []string
-			rows.Scan(&businessName, &category, &website, &domain, &socialLinksJSON,
-				&address, &location, &phone, pq.Array(&emails))
+		for _, er := range exportRows {
+			emails := emailMap[er.id]
 			fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-				csvEscape(businessName), csvEscape(category),
-				csvEscape(website), csvEscape(strings.Join(emails, ";")),
-				csvEscape(domain), csvEscape(string(socialLinksJSON)),
-				csvEscape(address), csvEscape(location), csvEscape(phone))
+				csvEscape(er.businessName), csvEscape(er.category),
+				csvEscape(er.website), csvEscape(strings.Join(emails, ";")),
+				csvEscape(er.domain), csvEscape(string(er.socialLinksJSON)),
+				csvEscape(er.address), csvEscape(er.location), csvEscape(er.phone))
 		}
 		return
 	}
@@ -184,22 +294,19 @@ func (s *Server) handleExportContacts(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("["))
 	enc := json.NewEncoder(w)
-	first := true
-	for rows.Next() {
-		var businessName, category, website, domain, address, location, phone string
-		var socialLinksJSON []byte
-		var emails []string
-		rows.Scan(&businessName, &category, &website, &domain, &socialLinksJSON,
-			&address, &location, &phone, pq.Array(&emails))
-		if !first {
+	for i, er := range exportRows {
+		if i > 0 {
 			w.Write([]byte(","))
 		}
-		first = false
+		emails := emailMap[er.id]
+		if emails == nil {
+			emails = []string{}
+		}
 		enc.Encode(map[string]any{
-			"business_name": businessName, "business_category": category,
-			"website": website, "emails": emails, "domain": domain,
-			"social_links": json.RawMessage(socialLinksJSON),
-			"address":      address, "location": location, "phone": phone,
+			"business_name": er.businessName, "business_category": er.category,
+			"website": er.website, "emails": emails, "domain": er.domain,
+			"social_links": json.RawMessage(er.socialLinksJSON),
+			"address":      er.address, "location": er.location, "phone": er.phone,
 		})
 	}
 	w.Write([]byte("]"))
@@ -327,7 +434,24 @@ func (s *Server) handleDeleteContacts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(`
+	// GROUP BY on business_listings can be expensive at scale; bound with a
+	// transaction-local statement_timeout so a slow scan can't stall the pool.
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '7000'"); err != nil {
+		slog.Error("handler error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT bl.domain,
 		       COUNT(DISTINCT be.email_id) as email_count
 		FROM business_listings bl
@@ -352,11 +476,25 @@ func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
 			"domain": domain, "emails": emailCount,
 		})
 	}
+	rows.Close()
+	tx.Commit()
 	writeJSON(w, http.StatusOK, domains)
 }
 
 func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(`
+	// COUNT(*) GROUP BY on a large table: bound with statement_timeout to
+	// prevent pool starvation (see Operational Invariants §2).
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	defer tx.Rollback()
+	tx.ExecContext(ctx, "SET LOCAL statement_timeout = '7000'")
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT category, COUNT(*) AS cnt
 		FROM business_listings
 		WHERE category IS NOT NULL AND category != ''
@@ -375,6 +513,8 @@ func (s *Server) handleListCategories(w http.ResponseWriter, r *http.Request) {
 		rows.Scan(&cat, &cnt)
 		cats = append(cats, map[string]any{"category": cat, "count": cnt})
 	}
+	rows.Close()
+	tx.Commit()
 	if cats == nil {
 		cats = []map[string]any{}
 	}

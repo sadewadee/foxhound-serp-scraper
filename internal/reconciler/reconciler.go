@@ -186,14 +186,48 @@ func (r *ProjectReconciler) collectSnapshot(ctx context.Context) Snapshot {
 		tx.Commit()
 	}
 
-	// Contacts from normalized tables.
-	r.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&snap.EmailsTotal)
-	r.db.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE phone IS NOT NULL AND phone != ''`).Scan(&snap.PhonesTotal)
+	// Contacts totals — bounded by statement_timeout to avoid full-scan stalls on
+	// emails (can exceed 10M rows) and business_listings (Invariant #2).
+	// On timeout, degrade gracefully: keep last-known values so the tick proceeds.
+	if tx, txErr := r.db.Begin(); txErr == nil {
+		tx.Exec("SET LOCAL statement_timeout = '5000'")
+		err := tx.QueryRow(`
+			SELECT
+				(SELECT COUNT(*) FROM emails),
+				(SELECT COUNT(*) FROM business_listings WHERE phone IS NOT NULL AND phone != '')
+		`).Scan(&snap.EmailsTotal, &snap.PhonesTotal)
+		if err != nil {
+			slog.Warn("project-reconciler: contacts totals snapshot timed out, using last-known counts", "error", err)
+			r.mu.RLock()
+			snap.EmailsTotal = r.snapshot.EmailsTotal
+			snap.PhonesTotal = r.snapshot.PhonesTotal
+			r.mu.RUnlock()
+		}
+		tx.Commit()
+	}
 
 	// Throughput rates from DB timestamps (5-min window * 12 = hourly projection).
-	r.db.QueryRow(`SELECT COUNT(*) * 12 FROM emails WHERE created_at > NOW() - INTERVAL '5 minutes'`).Scan(&snap.EmailsPerHour)
-	r.db.QueryRow(`SELECT COUNT(*) * 12 FROM serp_results WHERE created_at > NOW() - INTERVAL '5 minutes'`).Scan(&snap.SerpPerHour)
-	r.db.QueryRow(`SELECT COUNT(*) * 12 FROM enrichment_jobs WHERE completed_at > NOW() - INTERVAL '5 minutes' AND status='completed'`).Scan(&snap.EnrichPerHour)
+	// Bounded by statement_timeout — these hit serp_results and enrichment_jobs
+	// which routinely exceed 1M rows (Invariant #2).
+	// On timeout, degrade gracefully: keep last-known rates.
+	if tx, txErr := r.db.Begin(); txErr == nil {
+		tx.Exec("SET LOCAL statement_timeout = '5000'")
+		err := tx.QueryRow(`
+			SELECT
+				(SELECT COUNT(*) * 12 FROM emails         WHERE created_at   > NOW() - INTERVAL '5 minutes'),
+				(SELECT COUNT(*) * 12 FROM serp_results   WHERE created_at   > NOW() - INTERVAL '5 minutes'),
+				(SELECT COUNT(*) * 12 FROM enrichment_jobs WHERE completed_at > NOW() - INTERVAL '5 minutes' AND status = 'completed')
+		`).Scan(&snap.EmailsPerHour, &snap.SerpPerHour, &snap.EnrichPerHour)
+		if err != nil {
+			slog.Warn("project-reconciler: throughput rates snapshot timed out, using last-known rates", "error", err)
+			r.mu.RLock()
+			snap.EmailsPerHour = r.snapshot.EmailsPerHour
+			snap.SerpPerHour = r.snapshot.SerpPerHour
+			snap.EnrichPerHour = r.snapshot.EnrichPerHour
+			r.mu.RUnlock()
+		}
+		tx.Commit()
+	}
 
 	// Redis queues.
 	snap.QueueQueries, _ = r.redis.ZCard(ctx, "serp:queue:queries").Result()
@@ -310,17 +344,18 @@ func (r *ProjectReconciler) requeuePendingQueries(ctx context.Context, limit int
 	defer rows.Close()
 
 	pipe := r.redis.Pipeline()
-	// Score = future Unix timestamp so healed queries land at the BACK of the
-	// ZPOPMIN sorted set (Operational Invariant #3). Using q.ID as score put
-	// low-numbered IDs at the front, causing a tight re-process loop.
-	// Stagger each entry by 1 second to preserve ordering among the batch.
-	base := time.Now().Unix() + 60
+	// Score in UnixMicro to MATCH pushQueryToQueue (QueueKey is scored in micros);
+	// +60s places healed queries at the BACK of the ZPOPMIN set (Invariant #3).
+	// Scoring in Unix SECONDS (~1.7e9) would sort BELOW every micro-scored insert
+	// (~1.7e15) and jump healed queries to the FRONT — the very tight re-process
+	// loop we are preventing. Stagger each entry by 1s (in micros) for batch order.
+	base := time.Now().Add(60 * time.Second).UnixMicro()
 	i := int64(0)
 	for rows.Next() {
 		var q queryMsg
 		if err := rows.Scan(&q.ID, &q.Text); err == nil {
 			data, _ := json.Marshal(q)
-			pipe.ZAdd(ctx, "serp:queue:queries", redis.Z{Score: float64(base + i), Member: string(data)})
+			pipe.ZAdd(ctx, "serp:queue:queries", redis.Z{Score: float64(base + i*1_000_000), Member: string(data)})
 			i++
 		}
 	}

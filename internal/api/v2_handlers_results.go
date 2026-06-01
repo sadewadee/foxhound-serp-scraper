@@ -44,8 +44,12 @@ func buildResultsFilter(q url.Values) (string, []any, int) {
 		argIdx++
 	}
 	if provider := q.Get("email_provider"); provider != "" {
-		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.email LIKE $%d)", argIdx)
-		args = append(args, "%@"+provider)
+		// emails.domain stores the exact after-@ part (e.g. "gmail.com") and is
+		// indexed by idx_emails_domain — avoids the leading-wildcard LIKE scan on
+		// the full email address that the previous e.email LIKE '%@provider' path
+		// caused (non-sargable on any btree index).
+		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id AND e.domain = $%d)", argIdx)
+		args = append(args, provider)
 		argIdx++
 	}
 	if emailStatus := q.Get("email_status"); emailStatus != "" {
@@ -88,6 +92,19 @@ func buildResultsFilter(q url.Values) (string, []any, int) {
 	if niche := q.Get("niche"); niche != "" {
 		where += fmt.Sprintf(" AND bl.niche_category = $%d", argIdx)
 		args = append(args, niche)
+		argIdx++
+	}
+	if category := q.Get("category"); category != "" {
+		// Exact-match on bl.category; backed by idx_bl_category (added in migrate.go).
+		where += fmt.Sprintf(" AND bl.category = $%d", argIdx)
+		args = append(args, category)
+		argIdx++
+	}
+	if source := q.Get("source"); source != "" {
+		// Filter to listings that have at least one email with the given source
+		// label (e.g. "enrichment", "directory", "manual").
+		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM business_emails be WHERE be.business_id = bl.id AND be.source = $%d)", argIdx)
+		args = append(args, source)
 		argIdx++
 	}
 

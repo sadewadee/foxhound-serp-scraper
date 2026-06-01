@@ -136,35 +136,66 @@ func (b *Bot) broadcastReport(ctx context.Context) {
 	}
 }
 
+// scanKeyCount counts Redis keys matching pattern using non-blocking SCAN
+// (avoids O(N) KEYS which blocks the entire Redis event loop).
+func (b *Bot) scanKeyCount(ctx context.Context, pattern string) int {
+	var count int
+	var cursor uint64
+	for {
+		keys, next, err := b.redis.Scan(ctx, cursor, pattern, 1000).Result()
+		if err != nil {
+			break
+		}
+		count += len(keys)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return count
+}
+
 // buildRateReport generates the auto hourly report (broadcast to all chats).
 func (b *Bot) buildRateReport(ctx context.Context) string {
-	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
-	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
+	serpLockCount := b.scanKeyCount(ctx, "serp:lock:*")
+	enrichLockCount := b.scanKeyCount(ctx, "enrich:lock:*")
 
 	var serpHour, serpPrevHour int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
-		FROM serp_jobs
-	`).Scan(&serpHour, &serpPrevHour)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
+				COUNT(*) FILTER (WHERE status = 'completed' AND updated_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
+			FROM serp_jobs
+		`).Scan(&serpHour, &serpPrevHour)
+		tx.Commit() //nolint:errcheck
+	}
 
 	var enrichHour, enrichPrevHour int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
-		FROM enrichment_jobs
-	`).Scan(&enrichHour, &enrichPrevHour)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+				COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
+			FROM enrichment_jobs
+		`).Scan(&enrichHour, &enrichPrevHour)
+		tx.Commit() //nolint:errcheck
+	}
 
 	var emailsHour, emailsPrevHour, emailsToday, emailsTotal int
-	b.db.QueryRow(`
-		SELECT
-			(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
-			(SELECT COUNT(*) FROM emails)
-	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsTotal)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'),
+				(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
+				(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
+				(SELECT COUNT(*) FROM emails)
+		`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsTotal)
+		tx.Commit() //nolint:errcheck
+	}
 
 	var etaStr string
 	if emailsHour > 0 {
@@ -183,7 +214,7 @@ func (b *Bot) buildRateReport(ctx context.Context) string {
 	lines := []string{
 		fmt.Sprintf("*Hourly Report* (%s)", time.Now().Format("15:04 MST")),
 		"",
-		fmt.Sprintf("_Active:_ SERP: *%d*  Enrich: *%d*", len(serpLocks), len(enrichLocks)),
+		fmt.Sprintf("_Active:_ SERP: *%d*  Enrich: *%d*", serpLockCount, enrichLockCount),
 		"",
 		fmt.Sprintf("  SERP: *%d*/hr %s", serpHour, delta(serpHour, serpPrevHour)),
 		fmt.Sprintf("  Enrich: *%d*/hr %s", enrichHour, delta(enrichHour, enrichPrevHour)),

@@ -160,70 +160,95 @@ func (b *Bot) handleGenerate(msg *Message, args string) {
 
 // /status
 func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
-	serpLocks, _ := b.redis.Keys(ctx, "serp:lock:*").Result()
-	enrichLocks, _ := b.redis.Keys(ctx, "enrich:lock:*").Result()
+	// Use non-blocking SCAN instead of O(N) KEYS which blocks the Redis event loop.
+	serpLockCount := b.scanKeyCount(ctx, "serp:lock:*")
+	enrichLockCount := b.scanKeyCount(ctx, "enrich:lock:*")
 
 	var qPending, qProcessing, qCompleted int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending'),
-			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed')
-		FROM queries
-	`).Scan(&qPending, &qProcessing, &qCompleted)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'pending'),
+				COUNT(*) FILTER (WHERE status = 'processing'),
+				COUNT(*) FILTER (WHERE status = 'completed')
+			FROM queries
+		`).Scan(&qPending, &qProcessing, &qCompleted)
+		tx.Commit() //nolint:errcheck
+	}
 
 	var serpCompleted, serpFailed, serpHour, serpPrevHour int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
-		FROM serp_jobs
-	`).Scan(&serpCompleted, &serpFailed, &serpHour, &serpPrevHour)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'completed'),
+				COUNT(*) FILTER (WHERE status = 'failed'),
+				COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
+				COUNT(*) FILTER (WHERE status = 'completed' AND updated_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
+			FROM serp_jobs
+		`).Scan(&serpCompleted, &serpFailed, &serpHour, &serpPrevHour)
+		tx.Commit() //nolint:errcheck
+	}
 
 	var enCompleted, enFailed, enDead, enHour, enPrevHour int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COUNT(*) FILTER (WHERE status = 'dead'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
-		FROM enrichment_jobs
-	`).Scan(&enCompleted, &enFailed, &enDead, &enHour, &enPrevHour)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'completed'),
+				COUNT(*) FILTER (WHERE status = 'failed'),
+				COUNT(*) FILTER (WHERE status = 'dead'),
+				COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
+				COUNT(*) FILTER (WHERE status = 'completed' AND completed_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour')
+			FROM enrichment_jobs
+		`).Scan(&enCompleted, &enFailed, &enDead, &enHour, &enPrevHour)
+		tx.Commit() //nolint:errcheck
+	}
 
 	// Emails from normalized table.
 	var emailsHour, emailsPrevHour, emailsToday, emailsYesterday, emailsTotal int
-	b.db.QueryRow(`
-		SELECT
-			(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
-			(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
-			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
-			(SELECT COUNT(*) FROM emails)
-	`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsYesterday, &emailsTotal)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'),
+				(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '2 hours' AND NOW() - INTERVAL '1 hour'),
+				(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
+				(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
+				(SELECT COUNT(*) FROM emails)
+		`).Scan(&emailsHour, &emailsPrevHour, &emailsToday, &emailsYesterday, &emailsTotal)
+		tx.Commit() //nolint:errcheck
+	}
 
 	// Worker count from DB: online (heartbeat recent), busy (delta>0), idle (delta=0), dead.
 	var serpOnline, serpBusy, serpDead, enrichOnline, enrichBusy, enrichDead, totalWorkers int
-	b.db.QueryRow(`SELECT
-		COUNT(*) FILTER (WHERE worker_type='serp' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes'),
-		COUNT(*) FILTER (WHERE worker_type='serp' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes' AND pages_delta > 0),
-		COUNT(*) FILTER (WHERE worker_type='serp' AND (status='dead' OR last_heartbeat < NOW() - INTERVAL '2 minutes')),
-		COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes'),
-		COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes' AND pages_delta > 0),
-		COUNT(*) FILTER (WHERE worker_type='enrich' AND (status='dead' OR last_heartbeat < NOW() - INTERVAL '2 minutes')),
-		COUNT(*)
-	FROM workers`).Scan(&serpOnline, &serpBusy, &serpDead, &enrichOnline, &enrichBusy, &enrichDead, &totalWorkers)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `SELECT
+			COUNT(*) FILTER (WHERE worker_type='serp' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes'),
+			COUNT(*) FILTER (WHERE worker_type='serp' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes' AND pages_delta > 0),
+			COUNT(*) FILTER (WHERE worker_type='serp' AND (status='dead' OR last_heartbeat < NOW() - INTERVAL '2 minutes')),
+			COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes'),
+			COUNT(*) FILTER (WHERE worker_type='enrich' AND status='working' AND last_heartbeat > NOW() - INTERVAL '2 minutes' AND pages_delta > 0),
+			COUNT(*) FILTER (WHERE worker_type='enrich' AND (status='dead' OR last_heartbeat < NOW() - INTERVAL '2 minutes')),
+			COUNT(*)
+		FROM workers`).Scan(&serpOnline, &serpBusy, &serpDead, &enrichOnline, &enrichBusy, &enrichDead, &totalWorkers)
+		tx.Commit() //nolint:errcheck
+	}
 
 	// Current rate from DB timestamps (5-min window * 12 = hourly projection).
 	var emailRate5m, serpRate5m, urlRate5m, enrichRate5m int
-	b.db.QueryRow(`SELECT
-		(SELECT COUNT(*) * 12 FROM emails WHERE created_at > NOW() - INTERVAL '5 minutes'),
-		(SELECT COUNT(*) * 12 FROM serp_jobs WHERE status='completed' AND updated_at > NOW() - INTERVAL '5 minutes'),
-		(SELECT COUNT(*) * 12 FROM serp_results WHERE created_at > NOW() - INTERVAL '5 minutes'),
-		(SELECT COUNT(*) * 12 FROM enrichment_jobs WHERE status='completed' AND completed_at > NOW() - INTERVAL '5 minutes')
-	`).Scan(&emailRate5m, &serpRate5m, &urlRate5m, &enrichRate5m)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `SELECT
+			(SELECT COUNT(*) * 12 FROM emails WHERE created_at > NOW() - INTERVAL '5 minutes'),
+			(SELECT COUNT(*) * 12 FROM serp_jobs WHERE status='completed' AND updated_at > NOW() - INTERVAL '5 minutes'),
+			(SELECT COUNT(*) * 12 FROM serp_results WHERE created_at > NOW() - INTERVAL '5 minutes'),
+			(SELECT COUNT(*) * 12 FROM enrichment_jobs WHERE status='completed' AND completed_at > NOW() - INTERVAL '5 minutes')
+		`).Scan(&emailRate5m, &serpRate5m, &urlRate5m, &enrichRate5m)
+		tx.Commit() //nolint:errcheck
+	}
 
 	// Queues.
 	serpBuf, _ := b.redis.LLen(ctx, "serp:buffer").Result()
@@ -235,24 +260,35 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		count int
 	}
 	var providers []provider
-	providerRows, _ := b.db.Query(`
-		SELECT domain, COUNT(*)
-		FROM emails
-		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
-	`)
-	if providerRows != nil {
-		for providerRows.Next() {
-			var p provider
-			providerRows.Scan(&p.name, &p.count)
-			providers = append(providers, p)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		providerRows, _ := tx.QueryContext(ctx, `
+			SELECT domain, COUNT(*)
+			FROM emails
+			GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+		`)
+		if providerRows != nil {
+			for providerRows.Next() {
+				var p provider
+				providerRows.Scan(&p.name, &p.count)
+				providers = append(providers, p)
+			}
+			providerRows.Close()
 		}
-		providerRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 
 	// Email yield rate + validation stats.
 	var enrichWithEmail, validatedCount int
-	b.db.QueryRow(`SELECT COUNT(DISTINCT be.business_id) FROM business_emails be`).Scan(&enrichWithEmail)
-	b.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE validation_status = 'valid'`).Scan(&validatedCount)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(DISTINCT be.business_id) FROM business_emails be),
+				(SELECT COUNT(*) FROM emails WHERE validation_status = 'valid')
+		`).Scan(&enrichWithEmail, &validatedCount)
+		tx.Commit() //nolint:errcheck
+	}
 	yieldPct := 0.0
 	if enCompleted > 0 {
 		yieldPct = float64(enrichWithEmail) / float64(enCompleted) * 100
@@ -280,7 +316,7 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 	lines := []string{
 		fmt.Sprintf("*Dashboard* (%s)", time.Now().Format("15:04 MST")),
 		"",
-		fmt.Sprintf("_Active:_ SERP: *%d* locks  Enrich: *%d* locks", len(serpLocks), len(enrichLocks)),
+		fmt.Sprintf("_Active:_ SERP: *%d* locks  Enrich: *%d* locks", serpLockCount, enrichLockCount),
 		fmt.Sprintf("_Workers (%d total):_", totalWorkers),
 		fmt.Sprintf("  SERP: *%d* online (%d busy, %d idle) %d dead", serpOnline, serpBusy, serpOnline-serpBusy, serpDead),
 		fmt.Sprintf("  Enrich: *%d* online (%d busy, %d idle) %d dead", enrichOnline, enrichBusy, enrichOnline-enrichBusy, enrichDead),
@@ -318,19 +354,23 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		count  int
 	}
 	var targets []targetProv
-	targetRows, tErr := b.db.Query(`
-		SELECT domain, COUNT(*)
-		FROM emails
-		WHERE domain IN ('gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com')
-		GROUP BY 1
-	`)
-	if tErr == nil && targetRows != nil {
-		for targetRows.Next() {
-			var tp targetProv
-			targetRows.Scan(&tp.domain, &tp.count)
-			targets = append(targets, tp)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		targetRows, tErr := tx.QueryContext(ctx, `
+			SELECT domain, COUNT(*)
+			FROM emails
+			WHERE domain IN ('gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com')
+			GROUP BY 1
+		`)
+		if tErr == nil && targetRows != nil {
+			for targetRows.Next() {
+				var tp targetProv
+				targetRows.Scan(&tp.domain, &tp.count)
+				targets = append(targets, tp)
+			}
+			targetRows.Close()
 		}
-		targetRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 	if len(targets) > 0 {
 		parts := make([]string, 0, len(targets))
@@ -349,19 +389,23 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		count int
 	}
 	var topCats []catCount
-	catRows, cErr := b.db.Query(`
-		SELECT category, COUNT(*)
-		FROM business_listings
-		WHERE category IS NOT NULL AND category != ''
-		GROUP BY 1 ORDER BY 2 DESC LIMIT 3
-	`)
-	if cErr == nil && catRows != nil {
-		for catRows.Next() {
-			var cc catCount
-			catRows.Scan(&cc.name, &cc.count)
-			topCats = append(topCats, cc)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		catRows, cErr := tx.QueryContext(ctx, `
+			SELECT category, COUNT(*)
+			FROM business_listings
+			WHERE category IS NOT NULL AND category != ''
+			GROUP BY 1 ORDER BY 2 DESC LIMIT 3
+		`)
+		if cErr == nil && catRows != nil {
+			for catRows.Next() {
+				var cc catCount
+				catRows.Scan(&cc.name, &cc.count)
+				topCats = append(topCats, cc)
+			}
+			catRows.Close()
 		}
-		catRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 	if len(topCats) > 0 {
 		lines = append(lines, "", "_Top categories:_")
@@ -383,19 +427,23 @@ func (b *Bot) handleStatus(ctx context.Context, msg *Message) {
 		count  int
 	}
 	var engines []engineRate
-	engineRows, eErr := b.db.Query(`
-		SELECT engine, COUNT(*)
-		FROM serp_jobs
-		WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'
-		GROUP BY engine
-	`)
-	if eErr == nil && engineRows != nil {
-		for engineRows.Next() {
-			var er engineRate
-			engineRows.Scan(&er.engine, &er.count)
-			engines = append(engines, er)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		engineRows, eErr := tx.QueryContext(ctx, `
+			SELECT engine, COUNT(*)
+			FROM serp_jobs
+			WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'
+			GROUP BY engine
+		`)
+		if eErr == nil && engineRows != nil {
+			for engineRows.Next() {
+				var er engineRate
+				engineRows.Scan(&er.engine, &er.count)
+				engines = append(engines, er)
+			}
+			engineRows.Close()
 		}
-		engineRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 	if len(engines) > 0 {
 		lines = append(lines, "", "_SERP engines (last hr):_")
@@ -422,29 +470,34 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		serp   int
 	}
 	var hours []hourBucket
-	hourRows, _ := b.db.Query(`
-		SELECT
-			to_char(h, 'HH24:MI') as hr,
-			(SELECT COUNT(*) FROM enrichment_jobs WHERE status = 'completed'
-				AND completed_at >= h AND completed_at < h + INTERVAL '1 hour'),
-			(SELECT COUNT(*) FROM emails
-				WHERE created_at >= h AND created_at < h + INTERVAL '1 hour'),
-			(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
-				AND updated_at >= h AND updated_at < h + INTERVAL '1 hour')
-		FROM generate_series(
-			date_trunc('hour', NOW()) - INTERVAL '5 hours',
-			date_trunc('hour', NOW()),
-			INTERVAL '1 hour'
-		) AS h
-		ORDER BY h
-	`)
-	if hourRows != nil {
-		for hourRows.Next() {
-			var hb hourBucket
-			hourRows.Scan(&hb.hour, &hb.enrich, &hb.emails, &hb.serp)
-			hours = append(hours, hb)
+	// generate_series queries are multi-aggregate — use 15s timeout.
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'")
+		hourRows, hrErr := tx.QueryContext(ctx, `
+			SELECT
+				to_char(h, 'HH24:MI') as hr,
+				(SELECT COUNT(*) FROM enrichment_jobs WHERE status = 'completed'
+					AND completed_at >= h AND completed_at < h + INTERVAL '1 hour'),
+				(SELECT COUNT(*) FROM emails
+					WHERE created_at >= h AND created_at < h + INTERVAL '1 hour'),
+				(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
+					AND updated_at >= h AND updated_at < h + INTERVAL '1 hour')
+			FROM generate_series(
+				date_trunc('hour', NOW()) - INTERVAL '5 hours',
+				date_trunc('hour', NOW()),
+				INTERVAL '1 hour'
+			) AS h
+			ORDER BY h
+		`)
+		if hrErr == nil && hourRows != nil {
+			for hourRows.Next() {
+				var hb hourBucket
+				hourRows.Scan(&hb.hour, &hb.enrich, &hb.emails, &hb.serp)
+				hours = append(hours, hb)
+			}
+			hourRows.Close()
 		}
-		hourRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 
 	type dayBucket struct {
@@ -454,62 +507,86 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		serp   int
 	}
 	var days []dayBucket
-	dayRows, _ := b.db.Query(`
-		SELECT
-			to_char(d, 'Mon DD') as dy,
-			(SELECT COUNT(*) FROM enrichment_jobs WHERE status = 'completed'
-				AND completed_at >= d AND completed_at < d + INTERVAL '1 day'),
-			(SELECT COUNT(*) FROM emails
-				WHERE created_at >= d AND created_at < d + INTERVAL '1 day'),
-			(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
-				AND updated_at >= d AND updated_at < d + INTERVAL '1 day')
-		FROM generate_series(
-			date_trunc('day', NOW()) - INTERVAL '6 days',
-			date_trunc('day', NOW()),
-			INTERVAL '1 day'
-		) AS d
-		ORDER BY d
-	`)
-	if dayRows != nil {
-		for dayRows.Next() {
-			var db dayBucket
-			dayRows.Scan(&db.day, &db.enrich, &db.emails, &db.serp)
-			days = append(days, db)
+	// generate_series queries are multi-aggregate — use 15s timeout.
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'")
+		dayRows, drErr := tx.QueryContext(ctx, `
+			SELECT
+				to_char(d, 'Mon DD') as dy,
+				(SELECT COUNT(*) FROM enrichment_jobs WHERE status = 'completed'
+					AND completed_at >= d AND completed_at < d + INTERVAL '1 day'),
+				(SELECT COUNT(*) FROM emails
+					WHERE created_at >= d AND created_at < d + INTERVAL '1 day'),
+				(SELECT COUNT(*) FROM serp_jobs WHERE status = 'completed'
+					AND updated_at >= d AND updated_at < d + INTERVAL '1 day')
+			FROM generate_series(
+				date_trunc('day', NOW()) - INTERVAL '6 days',
+				date_trunc('day', NOW()),
+				INTERVAL '1 day'
+			) AS d
+			ORDER BY d
+		`)
+		if drErr == nil && dayRows != nil {
+			for dayRows.Next() {
+				var db dayBucket
+				dayRows.Scan(&db.day, &db.enrich, &db.emails, &db.serp)
+				days = append(days, db)
+			}
+			dayRows.Close()
 		}
-		dayRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 
 	var emailsToday, emailsYesterday, emails7d, emailsPrev7d int
-	b.db.QueryRow(`
-		SELECT
-			(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
-			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
-			(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '7 days'),
-			(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days')
-	`).Scan(&emailsToday, &emailsYesterday, &emails7d, &emailsPrev7d)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM emails WHERE created_at > date_trunc('day', NOW())),
+				(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW())),
+				(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '7 days'),
+				(SELECT COUNT(*) FROM emails WHERE created_at BETWEEN NOW() - INTERVAL '14 days' AND NOW() - INTERVAL '7 days')
+		`).Scan(&emailsToday, &emailsYesterday, &emails7d, &emailsPrev7d)
+		tx.Commit() //nolint:errcheck
+	}
 
 	var enrichToday, enrichYesterday int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE completed_at > date_trunc('day', NOW())),
-			COUNT(*) FILTER (WHERE completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW()))
-		FROM enrichment_jobs WHERE status = 'completed'
-	`).Scan(&enrichToday, &enrichYesterday)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE completed_at > date_trunc('day', NOW())),
+				COUNT(*) FILTER (WHERE completed_at BETWEEN date_trunc('day', NOW()) - INTERVAL '1 day' AND date_trunc('day', NOW()))
+			FROM enrichment_jobs WHERE status = 'completed'
+		`).Scan(&enrichToday, &enrichYesterday)
+		tx.Commit() //nolint:errcheck
+	}
 
 	var emailsTotal, validatedTotal int
-	b.db.QueryRow(`SELECT COUNT(*) FROM emails`).Scan(&emailsTotal)
-	b.db.QueryRow(`SELECT COUNT(*) FROM emails WHERE validation_status = 'valid'`).Scan(&validatedTotal)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM emails),
+				(SELECT COUNT(*) FROM emails WHERE validation_status = 'valid')
+		`).Scan(&emailsTotal, &validatedTotal)
+		tx.Commit() //nolint:errcheck
+	}
 	pctOf10M := float64(emailsTotal) / 10_000_000 * 100
 
 	// Dead job breakdown.
 	var dead404, dead403, deadOther int
-	b.db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 404%'),
-			COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 403%'),
-			COUNT(*) FILTER (WHERE error_msg NOT LIKE 'HTTP 404%' AND error_msg NOT LIKE 'HTTP 403%')
-		FROM enrichment_jobs WHERE status = 'dead'
-	`).Scan(&dead404, &dead403, &deadOther)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 404%'),
+				COUNT(*) FILTER (WHERE error_msg LIKE 'HTTP 403%'),
+				COUNT(*) FILTER (WHERE error_msg NOT LIKE 'HTTP 404%' AND error_msg NOT LIKE 'HTTP 403%')
+			FROM enrichment_jobs WHERE status = 'dead'
+		`).Scan(&dead404, &dead403, &deadOther)
+		tx.Commit() //nolint:errcheck
+	}
 
 	// Build message.
 	lines := []string{
@@ -573,26 +650,31 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		count int
 	}
 	var gmailDays []gmailDay
-	gmailRows, gmErr := b.db.Query(`
-		SELECT
-			to_char(d, 'Mon DD') AS dy,
-			(SELECT COUNT(*) FROM emails
-				WHERE domain = 'gmail.com'
-				AND created_at >= d AND created_at < d + INTERVAL '1 day')
-		FROM generate_series(
-			date_trunc('day', NOW()) - INTERVAL '6 days',
-			date_trunc('day', NOW()),
-			INTERVAL '1 day'
-		) AS d
-		ORDER BY d
-	`)
-	if gmErr == nil && gmailRows != nil {
-		for gmailRows.Next() {
-			var gd gmailDay
-			gmailRows.Scan(&gd.day, &gd.count)
-			gmailDays = append(gmailDays, gd)
+	// generate_series multi-aggregate — use 15s timeout.
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'")
+		gmailRows, gmErr := tx.QueryContext(ctx, `
+			SELECT
+				to_char(d, 'Mon DD') AS dy,
+				(SELECT COUNT(*) FROM emails
+					WHERE domain = 'gmail.com'
+					AND created_at >= d AND created_at < d + INTERVAL '1 day')
+			FROM generate_series(
+				date_trunc('day', NOW()) - INTERVAL '6 days',
+				date_trunc('day', NOW()),
+				INTERVAL '1 day'
+			) AS d
+			ORDER BY d
+		`)
+		if gmErr == nil && gmailRows != nil {
+			for gmailRows.Next() {
+				var gd gmailDay
+				gmailRows.Scan(&gd.day, &gd.count)
+				gmailDays = append(gmailDays, gd)
+			}
+			gmailRows.Close()
 		}
-		gmailRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 	if len(gmailDays) > 0 {
 		lines = append(lines, "", "_Gmail trend (7 days):_")
@@ -614,19 +696,23 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		count int
 	}
 	var catStats []catStat
-	catStatRows, csErr := b.db.Query(`
-		SELECT category, COUNT(*)
-		FROM business_listings
-		WHERE category IS NOT NULL AND category != ''
-		GROUP BY 1 ORDER BY 2 DESC LIMIT 5
-	`)
-	if csErr == nil && catStatRows != nil {
-		for catStatRows.Next() {
-			var cs catStat
-			catStatRows.Scan(&cs.name, &cs.count)
-			catStats = append(catStats, cs)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		catStatRows, csErr := tx.QueryContext(ctx, `
+			SELECT category, COUNT(*)
+			FROM business_listings
+			WHERE category IS NOT NULL AND category != ''
+			GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+		`)
+		if csErr == nil && catStatRows != nil {
+			for catStatRows.Next() {
+				var cs catStat
+				catStatRows.Scan(&cs.name, &cs.count)
+				catStats = append(catStats, cs)
+			}
+			catStatRows.Close()
 		}
-		catStatRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 	if len(catStats) > 0 {
 		lines = append(lines, "", "_Top 5 categories:_")
@@ -648,19 +734,23 @@ func (b *Bot) handleAnalytics(ctx context.Context, msg *Message) {
 		emailsH int
 	}
 	var wRates []workerRate
-	wRows, wErr := b.db.Query(`
-		SELECT worker_id, worker_type,
-			pages_delta * 120, emails_delta * 120
-		FROM workers WHERE status='working'
-		ORDER BY worker_type, emails_delta DESC
-	`)
-	if wErr == nil && wRows != nil {
-		for wRows.Next() {
-			var wr workerRate
-			wRows.Scan(&wr.id, &wr.wtype, &wr.pagesH, &wr.emailsH)
-			wRates = append(wRates, wr)
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		wRows, wErr := tx.QueryContext(ctx, `
+			SELECT worker_id, worker_type,
+				pages_delta * 120, emails_delta * 120
+			FROM workers WHERE status='working'
+			ORDER BY worker_type, emails_delta DESC
+		`)
+		if wErr == nil && wRows != nil {
+			for wRows.Next() {
+				var wr workerRate
+				wRows.Scan(&wr.id, &wr.wtype, &wr.pagesH, &wr.emailsH)
+				wRates = append(wRates, wr)
+			}
+			wRows.Close()
 		}
-		wRows.Close()
+		tx.Commit() //nolint:errcheck
 	}
 	if len(wRates) > 0 {
 		lines = append(lines, "", "_Worker Throughput (30s delta):_")
@@ -690,13 +780,23 @@ func (b *Bot) handleQueries(msg *Message) {
 }
 
 func (b *Bot) handleContacts(msg *Message) {
+	ctx := context.Background()
 	var totalBiz, withEmail, uniqueDomains, lastHour, last24h int
 
-	b.db.QueryRow("SELECT COUNT(*) FROM business_listings").Scan(&totalBiz)
-	b.db.QueryRow("SELECT COUNT(DISTINCT be.business_id) FROM business_emails be").Scan(&withEmail)
-	b.db.QueryRow("SELECT COUNT(DISTINCT domain) FROM business_listings").Scan(&uniqueDomains)
-	b.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'").Scan(&lastHour)
-	b.db.QueryRow("SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'").Scan(&last24h)
+	// Each scalar query is individually guarded so a slow count on one table
+	// doesn't block or invalidate the others.
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		tx.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM business_listings),
+				(SELECT COUNT(DISTINCT be.business_id) FROM business_emails be),
+				(SELECT COUNT(DISTINCT domain) FROM business_listings),
+				(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'),
+				(SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours')
+		`).Scan(&totalBiz, &withEmail, &uniqueDomains, &lastHour, &last24h)
+		tx.Commit() //nolint:errcheck
+	}
 
 	lines := []string{
 		"*Contact Stats*",
@@ -708,20 +808,24 @@ func (b *Bot) handleContacts(msg *Message) {
 		fmt.Sprintf("Emails last 24h: %d", last24h),
 	}
 
-	providerRows, _ := b.db.Query(`
-		SELECT domain, COUNT(*) AS cnt
-		FROM emails
-		GROUP BY domain ORDER BY cnt DESC LIMIT 5
-	`)
-	if providerRows != nil {
-		defer providerRows.Close()
-		lines = append(lines, "", "_Top providers:_")
-		for providerRows.Next() {
-			var provider string
-			var cnt int
-			providerRows.Scan(&provider, &cnt)
-			lines = append(lines, fmt.Sprintf("  %s: %d", provider, cnt))
+	if tx, err := b.db.BeginTx(ctx, nil); err == nil {
+		tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+		providerRows, pErr := tx.QueryContext(ctx, `
+			SELECT domain, COUNT(*) AS cnt
+			FROM emails
+			GROUP BY domain ORDER BY cnt DESC LIMIT 5
+		`)
+		if pErr == nil && providerRows != nil {
+			lines = append(lines, "", "_Top providers:_")
+			for providerRows.Next() {
+				var provider string
+				var cnt int
+				providerRows.Scan(&provider, &cnt)
+				lines = append(lines, fmt.Sprintf("  %s: %d", provider, cnt))
+			}
+			providerRows.Close()
 		}
+		tx.Commit() //nolint:errcheck
 	}
 
 	b.sendMessage(msg.Chat.ID, strings.Join(lines, "\n"))
@@ -757,7 +861,16 @@ func (b *Bot) handleExport(msg *Message, args string) {
 
 	b.sendMessage(msg.Chat.ID, fmt.Sprintf("Generating CSV export (filter: %s)...", filterLabel))
 
-	rows, err := b.db.Query(fmt.Sprintf(`
+	ctx := context.Background()
+	tx, txErr := b.db.BeginTx(ctx, nil)
+	if txErr != nil {
+		b.sendMessage(msg.Chat.ID, "Error: "+txErr.Error())
+		return
+	}
+	defer tx.Rollback() //nolint:errcheck
+	tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
+
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
 			COALESCE(
 				(SELECT array_agg(e.email) FROM business_emails be JOIN emails e ON e.id = be.email_id WHERE be.business_id = bl.id),
@@ -808,6 +921,8 @@ func (b *Bot) handleExport(msg *Message, args string) {
 		)
 		count++
 	}
+	rows.Close()
+	tx.Commit() //nolint:errcheck
 
 	if count == 0 {
 		b.sendMessage(msg.Chat.ID, "No contacts with email found.")

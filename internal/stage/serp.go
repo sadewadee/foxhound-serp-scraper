@@ -267,7 +267,11 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 		if pendingCount > 50000 {
 			slog.Info("serp: backpressure — too many pending serp jobs", "count", pendingCount)
 			data, _ := json.Marshal(qMsg)
-			s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(time.Now().Unix() + 60), Member: string(data)})
+			// Score in UnixMicro to MATCH pushQueryToQueue (the queue is scored in
+			// micros); +60s places this behind currently-enqueued items. Scoring in
+			// Unix seconds (~1.7e9) would sort BELOW every micro-scored item (~1.7e15)
+			// and jump re-queues to the FRONT — the tight loop Invariant #3 forbids.
+			s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(time.Now().Add(60 * time.Second).UnixMicro()), Member: string(data)})
 			s.db.Exec(`UPDATE queries SET status = 'pending', updated_at = NOW() WHERE id = $1`, qMsg.ID)
 			select {
 			case <-ctx.Done():
@@ -318,7 +322,7 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 					INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, engine, status)
 					VALUES ($1, $2, $3, $4, $5, 'new')
 					ON CONFLICT (id) DO UPDATE SET
-						status = 'new', attempt_count = 0, error_msg = '', locked_by = NULL,
+						status = 'new', error_msg = '', locked_by = NULL,
 						next_attempt_at = NULL, picked_at = NULL, updated_at = NOW()
 					WHERE serp_jobs.status = 'failed'
 				`, jobID, qMsg.ID, serpURL, page, eng.Name())
@@ -931,7 +935,11 @@ func (s *SERPStage) requeuePendingQueriesToRedis(ctx context.Context) {
 			Text string `json:"text"`
 		}{id, text}
 		data, _ := json.Marshal(payload)
-		s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(id), Member: string(data)})
+		// UnixMicro to match pushQueryToQueue's scoring unit; +60s future base so
+		// recovered queries land at the BACK, +1s-per-item stagger (in micros) to
+		// preserve batch order. (Unix-seconds scoring would jump these ahead of
+		// every fresh micro-scored insert — Invariant #3.)
+		s.redis.ZAdd(ctx, query.QueueKey, redis.Z{Score: float64(time.Now().Add(60*time.Second).UnixMicro() + int64(n)*1_000_000), Member: string(data)})
 		n++
 	}
 	if n > 0 {

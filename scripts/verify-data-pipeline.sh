@@ -177,6 +177,44 @@ if [[ "$phones_count" -lt 3 ]]; then
 fi
 echo "[ok ] api.phones length=${phones_count}"
 
+# ─── Step 5: smoke ?category= and ?source= filter params return 200 ──────────
+echo "[step 5] smoke-testing ?category= filter"
+category_json="$(curl -fsS -H "x-api-key: ${API_KEY}" \
+  "${API_BASE_URL}/api/v2/results?category=yogaalliance&per_page=1" || true)"
+if [[ -z "$category_json" ]]; then
+  echo "[FAIL] /api/v2/results?category=yogaalliance returned empty body"
+  exit 2
+fi
+# Must be a valid envelope — data key must exist (may be empty array when no
+# yogaalliance rows are present, but the shape must be correct).
+category_data_type="$(printf '%s' "$category_json" | jq -r 'if .data != null then "ok" else "missing" end')"
+if [[ "$category_data_type" != "ok" ]]; then
+  echo "[FAIL] /api/v2/results?category=yogaalliance — .data key missing in response"
+  printf '%s\n' "$category_json" | jq .
+  exit 2
+fi
+echo "[ok ] ?category=yogaalliance → 200 with valid envelope"
+
+echo "[step 5b] smoke-testing ?source= filter"
+source_json="$(curl -fsS -H "x-api-key: ${API_KEY}" \
+  "${API_BASE_URL}/api/v2/results?source=verify_test&per_page=1" || true)"
+if [[ -z "$source_json" ]]; then
+  echo "[FAIL] /api/v2/results?source=verify_test returned empty body"
+  exit 2
+fi
+source_data_type="$(printf '%s' "$source_json" | jq -r 'if .data != null then "ok" else "missing" end')"
+if [[ "$source_data_type" != "ok" ]]; then
+  echo "[FAIL] /api/v2/results?source=verify_test — .data key missing in response"
+  printf '%s\n' "$source_json" | jq .
+  exit 2
+fi
+# The test row we inserted uses source='verify_test'; if the filter works, the
+# returned listing's domain must match our test domain.
+if [[ "$(printf '%s' "$source_json" | jq -r '.data | length')" -gt 0 ]]; then
+  assert_json_field domain "${TEST_DOMAIN}" "$source_json"
+fi
+echo "[ok ] ?source=verify_test → 200 with valid envelope"
+
 echo
 echo "✅ verify-data-pipeline.sh passed all checks"
 echo "   write path → schema → trigger → read path are aligned end-to-end."

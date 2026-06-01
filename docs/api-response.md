@@ -284,6 +284,8 @@ Query (semua optional, kecuali pagination):
 | `email_status` | string | Filter `validation_status` (`valid`, `pending`, `invalid`, dst). |
 | `search` | string | ILIKE `%x%` pada `business_name`. |
 | `niche` | string | Filter `niche_category` eksak: `yoga`, `pilates`, `fitness`, `wellness`, `meditation`, `healing`, `ayurveda`, `spa`. |
+| `category` | string | ILIKE match pada `category` (business category dari enrich). Contoh: `?category=yogaalliance`, `?category=Wellness`. Case-insensitive prefix/exact tergantung implementasi handler. |
+| `source` | string | Filter berdasarkan `source` field — identifier asal enrichment job (e.g. `verify_test`, `bing`, `duckduckgo`, `google`, `yogaalliance`). |
 | `include_off_niche` | `true` | **Default tertutup**: off_niche rows (Hotel/AutoDealer/Dentist/dst) di-filter habis. Set `true` untuk lihat semua row apa adanya (debugging/manual review). |
 
 **Cursor mode response** (saat `cursor` di-set) — tanpa `meta`, ganti dengan `next_cursor` + `has_more`:

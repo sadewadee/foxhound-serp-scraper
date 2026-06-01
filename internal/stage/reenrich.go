@@ -445,8 +445,20 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 	// Extract contacts from fetched body.
 	cd := internalScraper.ExtractContacts([]byte(body))
 	internalScraper.ApplyTLDCountryFallback(cd, row.URL)
-	emails := internalScraper.FilterEmails(cd.Emails)
-	phones := internalScraper.FilterPhones(cd.Phones)
+	rawEmails := internalScraper.FilterEmails(cd.Emails)
+	rawPhones := internalScraper.FilterPhones(cd.Phones)
+
+	// Sanitize emails and phones: strip invalid UTF-8 bytes that would cause
+	// "pq: invalid byte sequence for encoding UTF8" on the Postgres upsert.
+	emails := make([]string, len(rawEmails))
+	for i, e := range rawEmails {
+		emails[i] = sanitizeUTF8(e)
+	}
+	phones := make([]string, len(rawPhones))
+	for i, p := range rawPhones {
+		phones[i] = sanitizeUTF8(p)
+	}
+
 	socialLinks := buildSocialLinks(cd) // reuse enrich.go helper — same package
 	socialJSON, _ := json.Marshal(socialLinks)
 
@@ -495,10 +507,10 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 	`,
 		row.URL, urlHash, row.Domain,
 		pq.Array(emails), pq.Array(phones), socialJSON,
-		nullIfEmpty(cd.BusinessName), nullIfEmpty(cd.BusinessCategory), nullIfEmpty(cd.Address),
-		nullIfEmpty(cd.PageTitle), nullIfEmpty(cd.Description), nullIfEmpty(cd.Location), nullIfEmpty(cd.Country),
-		nullIfEmpty(cd.City), nullIfEmpty(cd.ContactName), nullIfEmpty(cd.OpeningHours), nullIfEmpty(cd.Rating),
-		nullIfEmpty(cd.TikTok), nullIfEmpty(cd.YouTube), nullIfEmpty(cd.Telegram),
+		nullIfEmpty(sanitizeUTF8(cd.BusinessName)), nullIfEmpty(sanitizeUTF8(cd.BusinessCategory)), nullIfEmpty(sanitizeUTF8(cd.Address)),
+		nullIfEmpty(sanitizeUTF8(cd.PageTitle)), nullIfEmpty(sanitizeUTF8(cd.Description)), nullIfEmpty(sanitizeUTF8(cd.Location)), nullIfEmpty(sanitizeUTF8(cd.Country)),
+		nullIfEmpty(sanitizeUTF8(cd.City)), nullIfEmpty(sanitizeUTF8(cd.ContactName)), nullIfEmpty(sanitizeUTF8(cd.OpeningHours)), nullIfEmpty(sanitizeUTF8(cd.Rating)),
+		nullIfEmpty(sanitizeUTF8(cd.TikTok)), nullIfEmpty(sanitizeUTF8(cd.YouTube)), nullIfEmpty(sanitizeUTF8(cd.Telegram)),
 	)
 	if insertErr != nil {
 		// DB-side failure (transient). Release the claim so another worker
@@ -681,3 +693,10 @@ func (r *ReenrichStage) Processed() int64 { return r.processed.Load() }
 
 // Found returns the total valid emails found by this stage instance.
 func (r *ReenrichStage) Found() int64 { return r.found.Load() }
+
+// sanitizeUTF8 strips any byte sequences that are not valid UTF-8 from s.
+// Applied to every string that originates from scraped page content before it
+// is written into Postgres — prevents "pq: invalid byte sequence for encoding
+// UTF8" upsert failures on pages with mixed/binary encodings (e.g. windows-1252
+// pages that slipped through the response-body decoder).
+func sanitizeUTF8(s string) string { return strings.ToValidUTF8(s, "") }

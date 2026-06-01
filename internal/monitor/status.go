@@ -4,16 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 
 	"github.com/redis/go-redis/v9"
 )
 
 // Status holds pipeline status information.
 type Status struct {
-	Queries  TableStatus   `json:"queries"`
-	Seeds    TableStatus   `json:"seeds"`
-	Enrich   TableStatus   `json:"enrich"`
-	Queues   []QueueStatus `json:"queues"`
+	Queries TableStatus   `json:"queries"`
+	Seeds   TableStatus   `json:"seeds"`
+	Enrich  TableStatus   `json:"enrich"`
+	Queues  []QueueStatus `json:"queues"`
 }
 
 // TableStatus shows counts per status for a table.
@@ -56,13 +57,35 @@ func GetStatus(db *sql.DB, redisClient *redis.Client) (*Status, error) {
 func getTableStatus(db *sql.DB, table string) TableStatus {
 	ts := TableStatus{ByStatus: make(map[string]int)}
 
-	// Total count.
-	row := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table))
-	row.Scan(&ts.Total)
-
-	// Count by status.
-	rows, err := db.Query(fmt.Sprintf("SELECT status, COUNT(*) FROM %s GROUP BY status", table))
+	// All COUNT(*) queries run inside a short-lived read-only transaction whose
+	// statement_timeout is capped at 5 s (Invariant #2: no unbounded COUNT on
+	// large tables such as serp_jobs/enrichment_jobs which exceed 1 M rows).
+	// On any error we return the zero/partial value gracefully rather than
+	// blocking the status endpoint.
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
+		slog.Warn("getTableStatus: could not begin tx", "table", table, "err", err)
+		return ts
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; rollback is always safe
+
+	if _, err = tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'"); err != nil {
+		slog.Warn("getTableStatus: could not set statement_timeout", "table", table, "err", err)
+		return ts
+	}
+
+	// Total count — bounded by the 5 s timeout set above.
+	row := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", table))
+	if err = row.Scan(&ts.Total); err != nil {
+		slog.Warn("getTableStatus: total count failed", "table", table, "err", err)
+		return ts
+	}
+
+	// Count by status — also bounded by the same timeout.
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT status, COUNT(*) FROM %s GROUP BY status", table))
+	if err != nil {
+		slog.Warn("getTableStatus: by-status count failed", "table", table, "err", err)
 		return ts
 	}
 	defer rows.Close()

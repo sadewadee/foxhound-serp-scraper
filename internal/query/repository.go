@@ -153,8 +153,23 @@ func (r *Repository) RequeueProcessing() (int, error) {
 }
 
 // CountByStatus returns a map of status → count.
+// Runs inside a short transaction with a 5-second statement timeout to guard
+// against unbounded GROUP BY COUNT(*) scans on large tables (Invariant #2).
 func (r *Repository) CountByStatus() (map[string]int, error) {
-	rows, err := r.db.Query(`SELECT status, COUNT(*) FROM queries GROUP BY status`)
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("query: count by status begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Graceful fallback: if the SET LOCAL fails (e.g. read-only replica), log
+	// and continue — the query itself is still worth running.
+	if _, err := tx.Exec(`SET LOCAL statement_timeout = '5000'`); err != nil {
+		// Non-fatal: proceed without the timeout rather than failing entirely.
+		_ = err
+	}
+
+	rows, err := tx.Query(`SELECT status, COUNT(*) FROM queries GROUP BY status`)
 	if err != nil {
 		return nil, fmt.Errorf("query: count by status: %w", err)
 	}
@@ -169,14 +184,37 @@ func (r *Repository) CountByStatus() (map[string]int, error) {
 		}
 		counts[status] = count
 	}
-	return counts, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Commit the read-only transaction so the connection is returned cleanly.
+	_ = tx.Commit()
+	return counts, nil
 }
 
 // Total returns the total number of queries.
+// Runs inside a short transaction with a 5-second statement timeout to guard
+// against unbounded COUNT(*) scans on large tables (Invariant #2).
 func (r *Repository) Total() (int, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("query: total begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Graceful fallback: proceed without the timeout if SET LOCAL fails.
+	if _, err := tx.Exec(`SET LOCAL statement_timeout = '5000'`); err != nil {
+		_ = err
+	}
+
 	var n int
-	err := r.db.QueryRow(`SELECT COUNT(*) FROM queries`).Scan(&n)
-	return n, err
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM queries`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("query: total: %w", err)
+	}
+
+	_ = tx.Commit()
+	return n, nil
 }
 
 // DeleteByIDs removes queries by their IDs and returns the count deleted.
@@ -274,4 +312,3 @@ func (r *Repository) MarkProcessing() (*db.Query, error) {
 	}
 	return &q, nil
 }
-

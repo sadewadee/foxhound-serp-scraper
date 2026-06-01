@@ -327,6 +327,34 @@ func runMigrations(db *sql.DB) error {
 		slog.Warn("db: idx_emails_acceptable_score CONCURRENTLY failed — reenrich eligibility EXISTS will fall back to PK scan", "error", err)
 	}
 
+	// Read-path indexes for business_listings and business_emails.
+	//
+	//   idx_bl_created_at  — backs ORDER BY created_at DESC on the v2 results
+	//                         listing endpoint; without it every paginated read
+	//                         on the 779K-row table does a full sort.
+	//   idx_bl_updated_at  — backs ORDER BY updated_at DESC for the "recently
+	//                         enriched" feed and the reenrich eligibility query.
+	//   idx_bl_category    — backs ?category= filter on v2 results; partial
+	//                         (category IS NOT NULL) keeps the index small.
+	//   idx_be_email_id    — backs the business_emails → emails JOIN on
+	//                         email_id; the junction's PK covers (business_id,
+	//                         email_id) but not the reverse lookup.
+	//
+	// All created CONCURRENTLY outside any tx (same reason as the niche indexes
+	// above). Log-and-continue: failure here is non-fatal — the planner falls
+	// back to PK scans, slower but correct.
+	for _, stmt := range []string{
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_created_at ON business_listings (created_at DESC)`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_updated_at ON business_listings (updated_at DESC)`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category ON business_listings (category) WHERE category IS NOT NULL`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_email_id ON business_emails (email_id)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("db: read-path index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
+				"stmt", stmt, "error", err)
+		}
+	}
+
 	// --- Triggers ---
 
 	// Trigger 1: serp_results INSERT -> create enrichment_job.
