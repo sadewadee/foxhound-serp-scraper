@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/sadewadee/serp-scraper/internal/api"
 	"github.com/sadewadee/serp-scraper/internal/config"
@@ -43,7 +45,25 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database); err != nil {
+	// Migrate is serialized across containers by a session advisory lock, but the
+	// catalog DDL (CREATE OR REPLACE FUNCTION / trigger binding) can still hit a
+	// transient "tuple concurrently updated" (XX000) during a fleet boot when
+	// other sessions touch the same pg_catalog tuples (autovacuum, overlapping
+	// boots, orphaned sessions). It's safe to retry — the whole migration is
+	// idempotent (IF NOT EXISTS / version-gated / CONCURRENTLY log-and-continue).
+	// Without this the manager would exit on the conflict and crash-loop with the
+	// API never starting (the 2026-06-01/02 incident).
+	for attempt := 1; ; attempt++ {
+		err := db.Migrate(database)
+		if err == nil {
+			break
+		}
+		if attempt < 8 && strings.Contains(err.Error(), "tuple concurrently updated") {
+			slog.Warn("run: migrate transient catalog conflict — retrying",
+				"attempt", attempt, "error", err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
 		return fmt.Errorf("run: %w", err)
 	}
 
