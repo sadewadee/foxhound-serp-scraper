@@ -352,7 +352,16 @@ func runMigrations(db *sql.DB) error {
 		// over the (high-cardinality) filtered set, e.g. category=yogaalliance
 		// has ~77K rows and timed out the plain category+PK-backward-scan path.
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category_id ON business_listings (category, id DESC) WHERE category IS NOT NULL`,
+		// Partial composite over the DEFAULT off_niche-excluded set: the v2 results
+		// count for ?category=X filters `off_niche IS NOT TRUE`, which idx_bl_category
+		// can't cover (heap fetch per row → ~12s on the 77K yogaalliance category).
+		// This makes the count an index-only scan and the list an index scan.
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category_offniche ON business_listings (category, id DESC) WHERE off_niche IS NOT TRUE`,
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_email_id ON business_emails (email_id)`,
+		// Backs the ?source= filter EXISTS(business_emails.source = $N). Partial on
+		// the ~80K non-'enrichment' (directory-crawler) rows only — without it the
+		// correlated EXISTS seq-scans 3.9M rows → 57014 timeout (500).
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_source ON business_emails (source, business_id) WHERE source <> 'enrichment'`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			slog.Warn("db: read-path index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
