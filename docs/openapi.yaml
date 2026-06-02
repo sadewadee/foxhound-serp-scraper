@@ -1,0 +1,2636 @@
+openapi: 3.1.0
+
+info:
+  title: Serp-Scraper API
+  version: "2.0"
+  description: |
+    REST API for the serp-scraper distributed pipeline.
+
+    **V2 is the supported surface** — all responses are envelope-wrapped
+    (`{"data":...}` for singles, `{"data":[...],"meta":{...}}` for lists,
+    `{"error":{"code":"...","message":"..."}}` for errors).
+
+    **V1 is legacy** — bare responses (`{...}`, `{"error":"...string"}`).
+    New consumers should use V2 only.
+
+    ## Authentication
+
+    All endpoints except `/api/health`, `/api/v2/health`, `/api/auth/login`,
+    and `/api/v2/auth/login` require authentication.
+
+    Two equivalent schemes are accepted:
+    - `Authorization: Bearer <token>` — token obtained from a login endpoint.
+    - `x-api-key: <key>` — static key configured per user on the server.
+
+    ## Roles
+
+    - **viewer** — GET-only access to read endpoints.
+    - **admin** — full access including all mutations (POST, DELETE).
+
+    Admin satisfies any viewer-role check; viewer cannot call admin-only endpoints
+    (returns `403`).
+
+servers:
+  - url: https://serpina.kremlit.dev
+    description: Production
+
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        HMAC-SHA256 signed token. Obtain from `POST /api/v2/auth/login`.
+        Valid for 24 hours (`expires_in: 86400`).
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Static per-user API key configured on the server.
+
+  schemas:
+
+    # ── V2 envelope types ───────────────────────────────────────────────────
+
+    V2SingleEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          description: The response payload (object or array depending on endpoint).
+
+    V2PaginatedEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: {}
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    PaginationMeta:
+      type: object
+      required: [page, per_page, total, total_pages, total_known]
+      properties:
+        page:
+          type: integer
+          example: 1
+        per_page:
+          type: integer
+          example: 50
+        total:
+          type: integer
+          description: |
+            Total matching rows. `0` when `total_known=false` (count timed out).
+          example: 500000
+        total_pages:
+          type: integer
+          description: |
+            `0` when `total_known=false`.
+          example: 10000
+        total_known:
+          type: boolean
+          description: |
+            `false` when the COUNT(*) query timed out or failed.
+            Consumers must branch on this before computing pagination UI.
+          example: true
+        next_cursor:
+          type: string
+          description: |
+            Present in OFFSET-mode responses when the current page is ordered
+            `id_desc` and further rows exist. Lets the client escape deep-OFFSET
+            timeouts by switching to keyset mode (`?cursor=<next_cursor>`).
+            Omitted when keyset is not applicable for this page.
+          example: "eyJpZCI6MTIyOTV9"
+
+    V2CursorEnvelope:
+      type: object
+      required: [data, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/V2BusinessListing'
+        next_cursor:
+          type: string
+          description: |
+            Opaque base64url cursor. Pass verbatim as `?cursor=<value>` on the
+            next request. Empty string when `has_more=false`.
+          example: "eyJpZCI6MTIyOTV9"
+        has_more:
+          type: boolean
+          description: "`true` when additional pages exist."
+          example: true
+
+    V2Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: "invalid_cursor"
+            message:
+              type: string
+              example: "cursor is malformed"
+
+    V1Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "missing authorization"
+
+    # ── Core domain types ────────────────────────────────────────────────────
+
+    V2BusinessListing:
+      type: object
+      description: |
+        A business listing enriched from a SERP result. Returned by V2 results
+        endpoints. Fields come from `business_listings` joined with `emails` /
+        `business_emails`.
+      required:
+        - id
+        - domain
+        - url
+        - business_name
+        - category
+        - niche_category
+        - off_niche
+        - description
+        - address
+        - location
+        - city
+        - country
+        - contact_name
+        - phone
+        - phones
+        - website
+        - page_title
+        - social_links
+        - tiktok
+        - youtube
+        - telegram
+        - opening_hours
+        - rating
+        - created_at
+        - updated_at
+        - emails
+        - emails_with_info
+        - total_email_count
+        - valid_email_count
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 123
+        domain:
+          type: string
+          example: "acme.com"
+        url:
+          type: string
+          example: "https://acme.com/about"
+        business_name:
+          type: string
+          example: "Acme Wellness Clinic"
+        category:
+          type: string
+          description: |
+            Coarse business category (e.g. "yogaalliance", "Wellness",
+            "yogaalliance-school"). Exact string from the directory extractor or
+            generic enricher. Use `?category=<value>` to filter by exact match.
+          example: "yogaalliance"
+        niche_category:
+          type: string
+          description: |
+            Fine-grained niche assigned by the domain scorer.
+            Known values: `yoga`, `pilates`, `fitness`, `wellness`, `meditation`,
+            `healing`, `ayurveda`, `spa`. Use `?niche=<value>` to filter.
+          example: "yoga"
+        off_niche:
+          type: boolean
+          description: |
+            `true` when the classifier determined this listing does not belong to
+            the wellness/fitness target niche (e.g. Hotel, Dentist, AutoDealer).
+            By default the results endpoints exclude `off_niche=true` rows.
+            Pass `?include_off_niche=true` to see them.
+          example: false
+        description:
+          type: string
+          example: "A yoga studio in Central Jakarta."
+        address:
+          type: string
+          example: "Jl. Sudirman No.1, Jakarta"
+        location:
+          type: string
+          example: "Jakarta, ID"
+        city:
+          type: string
+          example: "Jakarta"
+        country:
+          type: string
+          description: "ISO alpha-2 country code (stored upper-case)."
+          example: "ID"
+        contact_name:
+          type: string
+          example: "Budi Santoso"
+        phone:
+          type: string
+          description: |
+            Primary phone string (legacy single-phone column). May be empty.
+            Prefer `phones[]` for multi-phone rows.
+          example: "+62 21 555 1234"
+        phones:
+          type: array
+          items:
+            type: string
+          description: |
+            All phone numbers found. For rows created before 2026-04-27 that only
+            have the scalar `phone` column populated, the array is synthesised as
+            `[phone]` if non-empty, else `[]`.
+          example: ["+62 21 555 1234"]
+        website:
+          type: string
+          example: "https://acme.com"
+        page_title:
+          type: string
+          example: "Acme Wellness | About Us"
+        social_links:
+          type: object
+          description: |
+            Arbitrary key→URL map extracted from contact pages.
+            Keys are platform identifiers (e.g. `facebook`, `instagram`,
+            `twitter`, `linkedin`). Empty object `{}` when none found.
+          additionalProperties:
+            type: string
+          example:
+            facebook: "https://facebook.com/acme"
+            instagram: "https://instagram.com/acmeyoga"
+        tiktok:
+          type: string
+          example: ""
+        youtube:
+          type: string
+          example: ""
+        telegram:
+          type: string
+          example: ""
+        opening_hours:
+          type: string
+          example: "Mon-Fri 09:00-18:00"
+        rating:
+          type: string
+          example: "4.8"
+        source_query_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: "FK to the `queries` row that produced this listing."
+          example: 42
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-04-20T09:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-04-27T15:30:00Z"
+        emails:
+          type: array
+          items:
+            type: string
+          description: "Flat list of email addresses. Convenience alias for `emails_with_info[*].email`."
+          example: ["hi@acme.com"]
+        emails_with_info:
+          type: array
+          items:
+            $ref: '#/components/schemas/V2EmailInfo'
+          description: "Full email validation records. Empty array when no emails."
+        total_email_count:
+          type: integer
+          example: 2
+        valid_email_count:
+          type: integer
+          description: "Count of emails with `status=valid`."
+          example: 1
+
+    V2EmailInfo:
+      type: object
+      description: "One email address with its validation metadata."
+      required:
+        - email
+        - domain
+        - status
+        - reason
+        - source
+      properties:
+        email:
+          type: string
+          format: email
+          example: "hi@acme.com"
+        domain:
+          type: string
+          description: |
+            The part after `@` (e.g. `gmail.com`). This is the value matched
+            by the `?email_provider=<domain>` filter — pass the bare domain
+            without the leading `@`.
+          example: "acme.com"
+        status:
+          type: string
+          description: "Validation status: `valid`, `pending`, `invalid`, or `unknown`."
+          enum: [valid, pending, invalid, unknown]
+          example: "valid"
+        score:
+          type: number
+          format: float
+          nullable: true
+          example: 0.95
+        is_acceptable:
+          type: boolean
+          nullable: true
+          example: true
+        mx_valid:
+          type: boolean
+          nullable: true
+          example: true
+        deliverable:
+          type: boolean
+          nullable: true
+          example: true
+        disposable:
+          type: boolean
+          nullable: true
+          example: false
+        role_account:
+          type: boolean
+          nullable: true
+          example: false
+        free_email:
+          type: boolean
+          nullable: true
+          example: false
+        catch_all:
+          type: boolean
+          nullable: true
+          example: false
+        reason:
+          type: string
+          example: ""
+        source:
+          type: string
+          description: |
+            Origin of this email record. Values seen in production:
+            `enrichment` (default), `yogaalliance`, `yogaalliance-school`.
+            Use `?source=<value>` on results endpoints to filter listings by
+            email source.
+          example: "enrichment"
+        validated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-04-20T10:00:00Z"
+
+    V2ResultsStats:
+      type: object
+      required:
+        - total_listings
+        - with_email
+        - with_phone
+        - unique_domains
+        - total_emails
+        - valid_emails
+        - pending_emails
+        - invalid_emails
+        - emails_per_hour
+        - emails_per_24h
+        - top_providers
+      properties:
+        total_listings:
+          type: integer
+          example: 500000
+        with_email:
+          type: integer
+          example: 210000
+        with_phone:
+          type: integer
+          example: 95000
+        unique_domains:
+          type: integer
+          example: 87000
+        total_emails:
+          type: integer
+          example: 828000
+        valid_emails:
+          type: integer
+          example: 310000
+        pending_emails:
+          type: integer
+          example: 420000
+        invalid_emails:
+          type: integer
+          example: 98000
+        emails_per_hour:
+          type: integer
+          description: "Emails created in the last 1 hour."
+          example: 1200
+        emails_per_24h:
+          type: integer
+          description: "Emails created in the last 24 hours."
+          example: 34000
+        top_providers:
+          type: object
+          description: "Top 10 email provider domains by email count."
+          additionalProperties:
+            type: integer
+          example:
+            gmail.com: 420000
+            yahoo.com: 90000
+
+    V2CategoryStats:
+      type: object
+      required: [category, business_count, email_count]
+      properties:
+        category:
+          type: string
+          example: "yogaalliance"
+        business_count:
+          type: integer
+          example: 5421
+        email_count:
+          type: integer
+          example: 3200
+
+    V2DomainStats:
+      type: object
+      required: [domain, email_count]
+      properties:
+        domain:
+          type: string
+          example: "acme.com"
+        email_count:
+          type: integer
+          example: 12
+
+    # ── V1 types ─────────────────────────────────────────────────────────────
+
+    V1Contact:
+      type: object
+      description: "V1 contact record from `GET /api/contacts`."
+      properties:
+        id:
+          type: integer
+          format: int64
+        business_name:
+          type: string
+        business_category:
+          type: string
+        description:
+          type: string
+        website:
+          type: string
+        emails:
+          type: array
+          items:
+            type: string
+          description: "Email addresses with status in (valid, pending, unknown) only."
+        phones:
+          type: array
+          items:
+            type: string
+          description: "Single-element array if `phone` column is non-empty, else `[]`."
+        domain:
+          type: string
+        url:
+          type: string
+        social_links:
+          type: object
+          additionalProperties:
+            type: string
+        address:
+          type: string
+        location:
+          type: string
+        opening_hours:
+          type: string
+        rating:
+          type: string
+        page_title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    V1QueryRow:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        text:
+          type: string
+        status:
+          type: string
+        result_count:
+          type: integer
+        error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    V1SerpJob:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "UUID"
+        parent_job_id:
+          type: integer
+          format: int64
+        search_url:
+          type: string
+        page_num:
+          type: integer
+        status:
+          type: string
+        attempt_count:
+          type: integer
+        max_attempts:
+          type: integer
+        error:
+          type: string
+        result_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    V1EnrichJob:
+      type: object
+      properties:
+        id:
+          type: string
+          description: "UUID"
+        domain:
+          type: string
+        url:
+          type: string
+        status:
+          type: string
+        attempt_count:
+          type: integer
+        max_attempts:
+          type: integer
+        error:
+          type: string
+        emails:
+          type: array
+          items:
+            type: string
+        phones:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+  # ── Reusable parameters ───────────────────────────────────────────────────
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      schema:
+        type: integer
+        default: 1
+        minimum: 1
+      description: "Page number (OFFSET mode). Ignored when `cursor` is provided."
+
+    PerPageParam:
+      name: per_page
+      in: query
+      schema:
+        type: integer
+        default: 50
+        minimum: 1
+        maximum: 200
+      description: "Results per page. Capped at 200."
+
+    DomainFilterParam:
+      name: domain
+      in: query
+      schema:
+        type: string
+      description: "Exact match on `bl.domain`."
+      example: "acme.com"
+
+    HasEmailParam:
+      name: has_email
+      in: query
+      schema:
+        type: string
+        enum: ["true"]
+      description: "When `true`, only return listings with at least one email."
+
+    EmailParam:
+      name: email
+      in: query
+      schema:
+        type: string
+        format: email
+      description: "Exact email address match."
+
+    EmailProviderParam:
+      name: email_provider
+      in: query
+      schema:
+        type: string
+      description: |
+        Filter by the domain part of email addresses (e.g. `gmail.com`).
+        Matches `emails.domain` exactly — do NOT include the leading `@`.
+        Case-sensitive (stored lowercase).
+      example: "gmail.com"
+
+    EmailStatusParam:
+      name: email_status
+      in: query
+      schema:
+        type: string
+        enum: [valid, pending, invalid, unknown]
+      description: "Filter to listings that have at least one email with this `validation_status`."
+
+    SearchParam:
+      name: search
+      in: query
+      schema:
+        type: string
+      description: "Case-insensitive substring search on `business_name` (`ILIKE %x%`)."
+
+    CountryParam:
+      name: country
+      in: query
+      schema:
+        type: string
+      description: |
+        ISO alpha-2 country code. Case-insensitive (`id` ≡ `ID`). Exact
+        equality match against `UPPER(bl.country)`.
+      example: "ID"
+
+    CityParam:
+      name: city
+      in: query
+      schema:
+        type: string
+      description: |
+        Prefix ILIKE match on `bl.city`. `?city=Berlin` matches "Berlin",
+        "Berlin-Mitte", etc. Cheaper than substring match and compatible with
+        a btree index.
+      example: "Berlin"
+
+    HasPhoneParam:
+      name: has_phone
+      in: query
+      schema:
+        type: string
+        enum: ["true"]
+      description: "When `true`, only return listings where `phone` is non-empty."
+
+    HasSocialParam:
+      name: has_social
+      in: query
+      schema:
+        type: string
+        enum: ["true"]
+      description: |
+        When `true`, only return listings where `social_links` is non-empty
+        (the literal `{}` is treated as empty).
+
+    IncludeOffNicheParam:
+      name: include_off_niche
+      in: query
+      schema:
+        type: string
+        enum: ["true"]
+      description: |
+        By default all results endpoints **exclude** listings with
+        `off_niche=true` (Hotel, AutoDealer, Dentist, etc.).
+        Pass `include_off_niche=true` to opt in and see all rows. Useful for
+        debugging or manual review.
+
+    NicheParam:
+      name: niche
+      in: query
+      schema:
+        type: string
+        enum: [yoga, pilates, fitness, wellness, meditation, healing, ayurveda, spa]
+      description: "Exact match on `niche_category`."
+
+    CategoryParam:
+      name: category
+      in: query
+      schema:
+        type: string
+      description: |
+        Exact match on `bl.category`. Values are directory-specific identifiers
+        or generic enricher categories.
+        Examples: `yogaalliance`, `yogaalliance-school`, `Wellness`.
+      example: "yogaalliance"
+
+    SourceParam:
+      name: source
+      in: query
+      schema:
+        type: string
+      description: |
+        Filter to listings that have at least one email with this `source` label
+        on `business_emails.source`.
+        Known values: `enrichment` (default), `yogaalliance`, `yogaalliance-school`.
+      example: "enrichment"
+
+    SortParam:
+      name: sort
+      in: query
+      schema:
+        type: string
+        enum: [id_desc, id_asc, updated_desc, updated_asc, created_desc, created_asc]
+        default: id_desc
+      description: |
+        Sort order. Only applies in OFFSET mode — cursor mode always uses
+        `id_desc` to keep keyset boundary consistent.
+
+    CursorParam:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: |
+        Opaque base64url cursor obtained from `next_cursor` in a previous
+        response. When present, activates **keyset pagination** (O(log N) at
+        any depth). Mutually exclusive with `sort` (sort is ignored in cursor
+        mode). `page`/`per_page` still controls the page size.
+
+    CursorDirParam:
+      name: cursor_dir
+      in: query
+      schema:
+        type: string
+        enum: [next, prev]
+        default: next
+      description: |
+        Only meaningful when `cursor` is provided. `next` fetches rows after the
+        cursor (lower IDs, default). `prev` fetches rows before it (higher IDs).
+
+  responses:
+    Unauthorized:
+      description: "Missing or invalid authentication."
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/V1Error'
+          examples:
+            missing:
+              value: {"error": "missing authorization"}
+            expired:
+              value: {"error": "token expired"}
+            invalid_key:
+              value: {"error": "invalid API key"}
+
+    Forbidden:
+      description: "Authenticated but role is insufficient (viewer calling admin-only endpoint)."
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/V1Error'
+          example:
+            value: {"error": "insufficient permissions"}
+
+    V2Unauthorized:
+      description: "Missing or invalid authentication."
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/V2Error'
+          examples:
+            not_authenticated:
+              value: {"error": {"code": "not_authenticated", "message": "not authenticated"}}
+            invalid_key:
+              value: {"error": {"code": "invalid_key", "message": "invalid API key"}}
+
+    V2Forbidden:
+      description: "Authenticated but role is insufficient."
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/V2Error'
+
+    V2InternalError:
+      description: "Internal server error."
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/V2Error'
+          example:
+            value: {"error": {"code": "internal_error", "message": "failed to fetch results"}}
+
+    V1InternalError:
+      description: "Internal server error."
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/V1Error'
+          example:
+            value: {"error": "internal server error"}
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+
+paths:
+
+  # =========================================================================
+  # V1 — Auth (public)
+  # =========================================================================
+
+  /api/auth/login:
+    post:
+      summary: "V1 – Login with API key"
+      operationId: v1Login
+      tags: [V1 Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_key]
+              properties:
+                api_key:
+                  type: string
+            example:
+              api_key: "sk-..."
+      responses:
+        "200":
+          description: "Token issued."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  expires_in:
+                    type: integer
+                    example: 86400
+                  user:
+                    type: object
+                    properties:
+                      username:
+                        type: string
+                      role:
+                        type: string
+                        enum: [admin, viewer]
+        "401":
+          description: "Invalid API key."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Error'
+
+  /api/auth/refresh:
+    post:
+      summary: "V1 – Refresh token"
+      operationId: v1Refresh
+      tags: [V1 Auth]
+      description: |
+        Generates a new 24-hour token for the currently authenticated user.
+        Requires a valid Bearer token or x-api-key in the request.
+      responses:
+        "200":
+          description: "New token issued."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  expires_in:
+                    type: integer
+                    example: 86400
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  # =========================================================================
+  # V1 — Health (public)
+  # =========================================================================
+
+  /api/health:
+    get:
+      summary: "V1 – Health check"
+      operationId: v1Health
+      tags: [V1 Health]
+      security: []
+      responses:
+        "200":
+          description: "All dependencies healthy."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, degraded]
+                  postgres:
+                    type: string
+                    enum: [ok, error]
+                  redis:
+                    type: string
+                    enum: [ok, error]
+              example:
+                status: ok
+                postgres: ok
+                redis: ok
+        "503":
+          description: "One or more dependencies are unhealthy (status=degraded)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  postgres:
+                    type: string
+                  redis:
+                    type: string
+
+  # =========================================================================
+  # V1 — Contacts
+  # =========================================================================
+
+  /api/contacts:
+    get:
+      summary: "V1 – List contacts (paginated)"
+      operationId: v1ListContacts
+      tags: [V1 Contacts]
+      description: |
+        Returns paginated `business_listings` joined with emails that have
+        `validation_status IN ('valid','pending','unknown')`. Role: **viewer**.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+        - $ref: '#/components/parameters/DomainFilterParam'
+        - $ref: '#/components/parameters/HasEmailParam'
+        - $ref: '#/components/parameters/EmailParam'
+        - $ref: '#/components/parameters/EmailProviderParam'
+      responses:
+        "200":
+          description: "Paginated contacts."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/V1Contact'
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  per_page:
+                    type: integer
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+    delete:
+      summary: "V1 – Delete contacts by IDs or domain"
+      operationId: v1DeleteContacts
+      tags: [V1 Contacts]
+      description: |
+        Permanently deletes `business_listings` rows. Role: **admin**.
+        Provide either `ids` or `domain` — not both. Max 1000 IDs per request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: integer
+                    format: int64
+                  maxItems: 1000
+                domain:
+                  type: string
+              description: |
+                Exactly one of `ids` or `domain` must be provided.
+            examples:
+              byIds:
+                value: {"ids": [123, 456]}
+              byDomain:
+                value: {"domain": "spammer.com"}
+      responses:
+        "200":
+          description: "Delete count."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+                    format: int64
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Error'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/contacts/export:
+    get:
+      summary: "V1 – Export contacts as JSON or CSV"
+      operationId: v1ExportContacts
+      tags: [V1 Contacts]
+      description: |
+        Streaming export of contacts that have at least one email.
+        Hard-capped at 50,000 rows. For larger exports use
+        `GET /api/v2/results/download` which supports full keyset pagination.
+        Role: **viewer**.
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+          description: "Output format. Defaults to `json`."
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50000
+            maximum: 50000
+          description: "Maximum rows to return. Capped at 50,000 server-side."
+        - $ref: '#/components/parameters/EmailProviderParam'
+      responses:
+        "200":
+          description: |
+            JSON streaming array or CSV file.
+
+            JSON Content-Type: `application/json`
+            CSV Content-Type: `text/csv`; `Content-Disposition: attachment; filename=contacts.csv`
+
+            CSV columns: `business_name,category,website,emails,domain,social_links,address,location,phone`
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    business_name:
+                      type: string
+                    business_category:
+                      type: string
+                    website:
+                      type: string
+                    emails:
+                      type: array
+                      items:
+                        type: string
+                    domain:
+                      type: string
+                    social_links:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    address:
+                      type: string
+                    location:
+                      type: string
+                    phone:
+                      type: string
+            text/csv:
+              schema:
+                type: string
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/contacts/stats:
+    get:
+      summary: "V1 – Contact statistics"
+      operationId: v1ContactStats
+      tags: [V1 Contacts]
+      description: "Aggregate stats across `business_listings` and `emails`. Role: **viewer**."
+      responses:
+        "200":
+          description: "Contact stats."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                    description: "Total business_listings rows."
+                  with_email:
+                    type: integer
+                  unique_domains:
+                    type: integer
+                  unique_emails:
+                    type: integer
+                    description: "Total rows in `emails` table."
+                  last_hour:
+                    type: integer
+                    description: "Emails created in last 1 hour."
+                  last_24h:
+                    type: integer
+                    description: "Emails created in last 24 hours."
+                  providers:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: "Top 10 email provider domains by count."
+                  validation:
+                    type: object
+                    properties:
+                      valid:
+                        type: integer
+                      pending:
+                        type: integer
+                      invalid:
+                        type: integer
+              example:
+                total: 500000
+                with_email: 210000
+                unique_domains: 87000
+                unique_emails: 828000
+                last_hour: 1200
+                last_24h: 34000
+                providers:
+                  gmail.com: 420000
+                  yahoo.com: 90000
+                validation:
+                  valid: 310000
+                  pending: 420000
+                  invalid: 98000
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  # =========================================================================
+  # V1 — Domains & Categories
+  # =========================================================================
+
+  /api/domains:
+    get:
+      summary: "V1 – List domains with email counts"
+      operationId: v1ListDomains
+      tags: [V1 Domains & Categories]
+      description: "Top 500 domains by email count. Role: **viewer**."
+      responses:
+        "200":
+          description: "Domain list."
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    domain:
+                      type: string
+                    emails:
+                      type: integer
+              example:
+                - domain: "acme.com"
+                  emails: 12
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/categories:
+    get:
+      summary: "V1 – List categories with counts"
+      operationId: v1ListCategories
+      tags: [V1 Domains & Categories]
+      description: "Top 50 non-empty categories by business count. Role: **viewer**."
+      responses:
+        "200":
+          description: "Category list."
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    category:
+                      type: string
+                    count:
+                      type: integer
+              example:
+                - category: "Wellness"
+                  count: 5421
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+  # =========================================================================
+  # V1 — Queries
+  # =========================================================================
+
+  /api/queries:
+    get:
+      summary: "V1 – List queries"
+      operationId: v1ListQueries
+      tags: [V1 Queries]
+      description: "Paginated list of SERP queries. Role: **viewer**."
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [new, processing, completed, failed]
+          description: "Filter by query status."
+        - $ref: '#/components/parameters/SearchParam'
+      responses:
+        "200":
+          description: "Paginated queries."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/V1QueryRow'
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  per_page:
+                    type: integer
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+    post:
+      summary: "V1 – Create queries"
+      operationId: v1CreateQueries
+      tags: [V1 Queries]
+      description: |
+        Inserts search queries. Duplicates (same normalised text) are silently
+        skipped. Role: **admin**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [queries]
+              properties:
+                queries:
+                  type: array
+                  items:
+                    type: string
+                  maxItems: 500
+            example:
+              queries: ["yoga studio jakarta", "pilates class berlin"]
+      responses:
+        "201":
+          description: "Insert summary."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  inserted:
+                    type: integer
+                  duplicates:
+                    type: integer
+                  total:
+                    type: integer
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Error'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+    delete:
+      summary: "V1 – Delete queries by IDs"
+      operationId: v1DeleteQueries
+      tags: [V1 Queries]
+      description: "Deletes queries by IDs. Max 1000 IDs. Role: **admin**."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: integer
+                    format: int64
+                  maxItems: 1000
+      responses:
+        "200":
+          description: "Delete count."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+                    format: int64
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Error'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/queries/generate:
+    post:
+      summary: "V1 – Generate queries for a country"
+      operationId: v1GenerateQueries
+      tags: [V1 Queries]
+      description: |
+        Generates wellness/fitness keyword queries for the given country and
+        inserts them into the `queries` table. Pass `"all"` to generate for all
+        supported countries. Role: **admin**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [country]
+              properties:
+                country:
+                  type: string
+                  description: "Country name (e.g. `Indonesia`) or `\"all\"`."
+            example:
+              country: "Indonesia"
+      responses:
+        "201":
+          description: "Generation summary."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  country:
+                    type: string
+                  generated:
+                    type: integer
+                  inserted:
+                    type: integer
+                  duplicates:
+                    type: integer
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Error'
+          examples:
+            country_not_found:
+              value: {"error": "country not found"}
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/queries/retry:
+    post:
+      summary: "V1 – Retry failed queries"
+      operationId: v1RetryQueries
+      tags: [V1 Queries]
+      description: "Resets `status='failed'` queries back to `'new'`. Role: **admin**."
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: "Retry count."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  retried:
+                    type: integer
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/queries/stats:
+    get:
+      summary: "V1 – Query status counts"
+      operationId: v1QueryStats
+      tags: [V1 Queries]
+      description: "Returns row count per status plus `total`. Role: **viewer**."
+      responses:
+        "200":
+          description: "Status counts."
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: integer
+              example:
+                new: 120
+                processing: 5
+                completed: 980
+                failed: 15
+                total: 1120
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  # =========================================================================
+  # V1 — Pipeline
+  # =========================================================================
+
+  /api/pipeline/stats:
+    get:
+      summary: "V1 – Pipeline table counts + queue depths"
+      operationId: v1PipelineStats
+      tags: [V1 Pipeline]
+      description: |
+        Raw COUNT(*) for each pipeline table plus Redis queue depths.
+        Role: **viewer**.
+      responses:
+        "200":
+          description: "Pipeline stats."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queries_total:
+                    type: integer
+                  serp_jobs_total:
+                    type: integer
+                  enrichment_jobs_total:
+                    type: integer
+                  emails_total:
+                    type: integer
+                  business_listings_total:
+                    type: integer
+                  queues:
+                    type: object
+                    properties:
+                      "serp:queue:queries":
+                        type: integer
+                        format: int64
+                      "serp:buffer":
+                        type: integer
+                        format: int64
+                      "enrich:buffer":
+                        type: integer
+                        format: int64
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/dashboard:
+    get:
+      summary: "V1 – Full dashboard stats"
+      operationId: v1Dashboard
+      tags: [V1 Pipeline]
+      description: |
+        Aggregated dashboard: query status rollup, SERP job counts, enrich job
+        counts, email/provider stats, Redis queue depths. Role: **viewer**.
+      responses:
+        "200":
+          description: "Dashboard payload."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queries:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: "Status counts + `total`."
+                  serp:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      pending:
+                        type: integer
+                      processing:
+                        type: integer
+                      completed:
+                        type: integer
+                      failed:
+                        type: integer
+                      urls_found:
+                        type: integer
+                      rate_per_hour:
+                        type: integer
+                      today:
+                        type: integer
+                  enrich:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      pending:
+                        type: integer
+                      processing:
+                        type: integer
+                      completed:
+                        type: integer
+                      failed:
+                        type: integer
+                      dead:
+                        type: integer
+                      rate_per_hour:
+                        type: integer
+                      today:
+                        type: integer
+                  contacts:
+                    type: object
+                    properties:
+                      total_emails:
+                        type: integer
+                      unique_emails:
+                        type: integer
+                      emails_today:
+                        type: integer
+                      emails_per_hour:
+                        type: integer
+                      providers:
+                        type: object
+                        additionalProperties:
+                          type: integer
+                      unique_domains:
+                        type: integer
+                  queues:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                      format: int64
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/pipeline/reset:
+    post:
+      summary: "V1 – Clear Redis pipeline queues"
+      operationId: v1PipelineReset
+      tags: [V1 Pipeline]
+      description: |
+        Clears the Redis SERP and enrich buffers plus the query sorted set.
+        **Destructive** — in-flight work in those queues will be lost.
+        Role: **admin**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [queues]
+              properties:
+                queues:
+                  type: boolean
+                  description: "Must be `true`; any other value returns 400."
+            example:
+              queues: true
+      responses:
+        "200":
+          description: "Items cleared per key."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cleared:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                      format: int64
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Error'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  # =========================================================================
+  # V1 — Debug
+  # =========================================================================
+
+  /api/debug/serp-jobs:
+    get:
+      summary: "V1 – Debug SERP jobs"
+      operationId: v1DebugSerpJobs
+      tags: [V1 Debug]
+      description: |
+        Returns raw `serp_jobs` rows for debugging. Optionally filtered by
+        `query_id` (parent_job_id). Role: **viewer**.
+      parameters:
+        - name: query_id
+          in: query
+          schema:
+            type: string
+          description: "Filter by `parent_job_id`."
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: "Max rows to return."
+      responses:
+        "200":
+          description: "SERP job list."
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/V1SerpJob'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  /api/debug/enrich-jobs:
+    get:
+      summary: "V1 – Debug enrich jobs"
+      operationId: v1DebugEnrichJobs
+      tags: [V1 Debug]
+      description: "Returns raw `enrichment_jobs` rows ordered by `created_at DESC`. Role: **viewer**."
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, processing, completed, failed, dead]
+          description: "Filter by job status."
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: "Max rows to return."
+      responses:
+        "200":
+          description: "Enrich job list."
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/V1EnrichJob'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "500":
+          $ref: '#/components/responses/V1InternalError'
+
+  # =========================================================================
+  # V2 — Auth (public)
+  # =========================================================================
+
+  /api/v2/auth/login:
+    post:
+      summary: "V2 – Login with API key"
+      operationId: v2Login
+      tags: [V2 Auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_key]
+              properties:
+                api_key:
+                  type: string
+            example:
+              api_key: "sk-..."
+      responses:
+        "200":
+          description: "Token issued (V2 envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      token:
+                        type: string
+                      expires_in:
+                        type: integer
+                        example: 86400
+                      user:
+                        type: object
+                        properties:
+                          username:
+                            type: string
+                          role:
+                            type: string
+                            enum: [admin, viewer]
+        "400":
+          description: "Malformed request body."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+        "401":
+          description: "Invalid API key."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+          example:
+            value: {"error": {"code": "invalid_key", "message": "invalid API key"}}
+
+  /api/v2/auth/refresh:
+    post:
+      summary: "V2 – Refresh token"
+      operationId: v2Refresh
+      tags: [V2 Auth]
+      description: "Generates a new 24-hour token for the currently authenticated user."
+      responses:
+        "200":
+          description: "New token (V2 envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      token:
+                        type: string
+                      expires_in:
+                        type: integer
+                        example: 86400
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  # =========================================================================
+  # V2 — Health (public)
+  # =========================================================================
+
+  /api/v2/health:
+    get:
+      summary: "V2 – Health check"
+      operationId: v2Health
+      tags: [V2 Health]
+      security: []
+      responses:
+        "200":
+          description: "All dependencies healthy."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      status:
+                        type: string
+                        enum: [ok, degraded]
+                      postgres:
+                        type: string
+                        enum: [ok, error]
+                      redis:
+                        type: string
+                        enum: [ok, error]
+              example:
+                data:
+                  status: ok
+                  postgres: ok
+                  redis: ok
+        "503":
+          description: "One or more dependencies degraded."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+
+  # =========================================================================
+  # V2 — Results
+  # =========================================================================
+
+  /api/v2/results:
+    get:
+      summary: "V2 – List business listings"
+      operationId: v2ListResults
+      tags: [V2 Results]
+      description: |
+        Returns paginated `business_listings` with full email validation data.
+
+        ## Pagination modes
+
+        **OFFSET mode** (default): use `page` + `per_page` + optional `sort`.
+        The response includes `meta.total` (may be `0` with `total_known=false`
+        if the COUNT(*) query timed out). An optional `next_cursor` in `meta`
+        lets the client switch to keyset mode to escape deep-OFFSET timeouts.
+
+        **Cursor / keyset mode**: when `cursor` is present, the response is
+        `{data, next_cursor, has_more}` — no `meta.total`. O(log N) at any
+        depth. `sort` is ignored (always `id DESC`).
+
+        ## Default filter
+
+        `off_niche=true` rows are **excluded by default**. Pass
+        `include_off_niche=true` to see them.
+
+        Role: **viewer**.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/CursorDirParam'
+        - $ref: '#/components/parameters/SortParam'
+        - $ref: '#/components/parameters/DomainFilterParam'
+        - $ref: '#/components/parameters/HasEmailParam'
+        - $ref: '#/components/parameters/EmailParam'
+        - $ref: '#/components/parameters/EmailProviderParam'
+        - $ref: '#/components/parameters/EmailStatusParam'
+        - $ref: '#/components/parameters/SearchParam'
+        - $ref: '#/components/parameters/CountryParam'
+        - $ref: '#/components/parameters/CityParam'
+        - $ref: '#/components/parameters/HasPhoneParam'
+        - $ref: '#/components/parameters/HasSocialParam'
+        - $ref: '#/components/parameters/IncludeOffNicheParam'
+        - $ref: '#/components/parameters/NicheParam'
+        - $ref: '#/components/parameters/CategoryParam'
+        - $ref: '#/components/parameters/SourceParam'
+      responses:
+        "200":
+          description: |
+            OFFSET mode → `{data:[...], meta:{...}}`.
+            Cursor mode → `{data:[...], next_cursor:"...", has_more:true|false}`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - description: "OFFSET mode"
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/V2BusinessListing'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+                  - $ref: '#/components/schemas/V2CursorEnvelope'
+        "400":
+          description: |
+            Invalid cursor (`invalid_cursor`) or deep OFFSET timeout
+            (`offset_too_deep`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+          examples:
+            invalid_cursor:
+              value:
+                error:
+                  code: "invalid_cursor"
+                  message: "cursor is malformed"
+            offset_too_deep:
+              value:
+                error:
+                  code: "offset_too_deep"
+                  message: "this page is too deep to fetch by offset under load; switch to keyset pagination using the next_cursor returned on a shallower page"
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+    delete:
+      summary: "V2 – Delete results by IDs or domain"
+      operationId: v2DeleteResults
+      tags: [V2 Results]
+      description: |
+        Permanently deletes `business_listings` rows. Role: **admin**.
+        Provide either `ids` or `domain` — not both. Max 1000 IDs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: integer
+                    format: int64
+                  maxItems: 1000
+                domain:
+                  type: string
+              description: "Exactly one of `ids` or `domain` must be provided."
+            examples:
+              byIds:
+                value: {"ids": [123, 456]}
+              byDomain:
+                value: {"domain": "spammer.com"}
+      responses:
+        "200":
+          description: "Deleted count."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: integer
+                        format: int64
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+          examples:
+            missing_params:
+              value: {"error": {"code": "missing_params", "message": "provide ids or domain"}}
+            too_many_ids:
+              value: {"error": {"code": "too_many_ids", "message": "max 1000 ids per request"}}
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  /api/v2/results/stats:
+    get:
+      summary: "V2 – Results statistics"
+      operationId: v2ResultsStats
+      tags: [V2 Results]
+      description: |
+        Aggregate stats for `business_listings` and `emails` tables.
+        Role: **viewer**.
+      responses:
+        "200":
+          description: "Results stats (V2 single envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/V2ResultsStats'
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  /api/v2/results/count:
+    get:
+      summary: "V2 – Count filtered results"
+      operationId: v2ResultsCount
+      tags: [V2 Results]
+      description: |
+        Returns a filtered COUNT(*) against `business_listings` with the same
+        filter parameters as `GET /api/v2/results`. Cached for 60 seconds.
+
+        When the COUNT(*) times out, returns `{"data":{"count":0,"count_known":false}}`
+        instead of HTTP 500 so polling clients don't retry in a tight loop.
+
+        Role: **viewer**.
+      parameters:
+        - $ref: '#/components/parameters/DomainFilterParam'
+        - $ref: '#/components/parameters/HasEmailParam'
+        - $ref: '#/components/parameters/EmailParam'
+        - $ref: '#/components/parameters/EmailProviderParam'
+        - $ref: '#/components/parameters/EmailStatusParam'
+        - $ref: '#/components/parameters/SearchParam'
+        - $ref: '#/components/parameters/CountryParam'
+        - $ref: '#/components/parameters/CityParam'
+        - $ref: '#/components/parameters/HasPhoneParam'
+        - $ref: '#/components/parameters/HasSocialParam'
+        - $ref: '#/components/parameters/IncludeOffNicheParam'
+        - $ref: '#/components/parameters/NicheParam'
+        - $ref: '#/components/parameters/CategoryParam'
+        - $ref: '#/components/parameters/SourceParam'
+      responses:
+        "200":
+          description: "Count result."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    required: [count, count_known]
+                    properties:
+                      count:
+                        type: integer
+                        description: "`0` when `count_known=false`."
+                      count_known:
+                        type: boolean
+                        description: "`false` when the COUNT(*) timed out."
+              examples:
+                known:
+                  value: {"data": {"count": 12345, "count_known": true}}
+                unknown:
+                  value: {"data": {"count": 0, "count_known": false}}
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+
+  /api/v2/results/categories:
+    get:
+      summary: "V2 – Categories with business and email counts"
+      operationId: v2ResultsCategories
+      tags: [V2 Results]
+      description: |
+        Top 100 non-empty categories by business count.
+        Role: **viewer**.
+      responses:
+        "200":
+          description: "Category list (V2 single envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/V2CategoryStats'
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  /api/v2/results/domains:
+    get:
+      summary: "V2 – Domains with email counts"
+      operationId: v2ResultsDomains
+      tags: [V2 Results]
+      description: |
+        Top 500 domains by email count across all `business_listings`.
+        Role: **viewer**.
+      responses:
+        "200":
+          description: "Domain list (V2 single envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/V2DomainStats'
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  /api/v2/results/download:
+    get:
+      summary: "V2 – Download / export results"
+      operationId: v2ResultsDownload
+      tags: [V2 Results]
+      description: |
+        Streaming export of filtered `business_listings` with full email data.
+        Uses keyset pagination (1000 rows/batch) internally to avoid OOM on
+        large exports. Timeout is 5 minutes (vs 18s for normal endpoints).
+
+        Supports the same filter parameters as `GET /api/v2/results`.
+        No cursor or sort parameters — always exports ascending by `id`.
+
+        Role: **viewer**.
+
+        CSV columns:
+        `id,business_name,category,niche_category,off_niche,domain,website,
+        address,location,phone,emails,email_count,valid_email_count,created_at`
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+          description: "Output format. `json` → streaming JSON array. `csv` → CSV file."
+        - $ref: '#/components/parameters/DomainFilterParam'
+        - $ref: '#/components/parameters/HasEmailParam'
+        - $ref: '#/components/parameters/EmailParam'
+        - $ref: '#/components/parameters/EmailProviderParam'
+        - $ref: '#/components/parameters/EmailStatusParam'
+        - $ref: '#/components/parameters/SearchParam'
+        - $ref: '#/components/parameters/CountryParam'
+        - $ref: '#/components/parameters/CityParam'
+        - $ref: '#/components/parameters/HasPhoneParam'
+        - $ref: '#/components/parameters/HasSocialParam'
+        - $ref: '#/components/parameters/IncludeOffNicheParam'
+        - $ref: '#/components/parameters/NicheParam'
+        - $ref: '#/components/parameters/CategoryParam'
+        - $ref: '#/components/parameters/SourceParam'
+      responses:
+        "200":
+          description: |
+            Streaming JSON array or CSV.
+
+            JSON: `Content-Type: application/json`,
+                  `Content-Disposition: attachment; filename=results.json`
+
+            CSV: `Content-Type: text/csv`,
+                 `Content-Disposition: attachment; filename=results.csv`
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/V2BusinessListing'
+            text/csv:
+              schema:
+                type: string
+        "400":
+          description: "Invalid format parameter."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+          example:
+            value: {"error": {"code": "invalid_format", "message": "format must be json or csv"}}
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+
+  # =========================================================================
+  # V2 — Dashboard stats
+  # =========================================================================
+
+  /api/v2/stats:
+    get:
+      summary: "V2 – Dashboard stats"
+      operationId: v2DashboardStats
+      tags: [V2 Dashboard]
+      description: |
+        Full dashboard aggregation: query status rollup, SERP job counts, enrich
+        job counts, email/provider stats, Redis queue depths.
+        Cached in Redis for 30 seconds with single-flight to prevent thundering
+        herd. Role: **viewer**.
+      responses:
+        "200":
+          description: "Dashboard stats (V2 envelope; `data` is the inner object)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      queries:
+                        type: object
+                        additionalProperties:
+                          type: integer
+                        description: "Status counts (new, processing, completed, failed) + `total`."
+                      serp:
+                        type: object
+                        properties:
+                          total:
+                            type: integer
+                          pending:
+                            type: integer
+                          processing:
+                            type: integer
+                          completed:
+                            type: integer
+                          failed:
+                            type: integer
+                          urls_found:
+                            type: integer
+                          rate_per_hour:
+                            type: integer
+                          today:
+                            type: integer
+                      enrich:
+                        type: object
+                        properties:
+                          total:
+                            type: integer
+                          pending:
+                            type: integer
+                          processing:
+                            type: integer
+                          completed:
+                            type: integer
+                          failed:
+                            type: integer
+                          dead:
+                            type: integer
+                          rate_per_hour:
+                            type: integer
+                          today:
+                            type: integer
+                      results:
+                        type: object
+                        properties:
+                          total_emails:
+                            type: integer
+                          emails_today:
+                            type: integer
+                          emails_per_hour:
+                            type: integer
+                          unique_domains:
+                            type: integer
+                          providers:
+                            type: object
+                            additionalProperties:
+                              type: integer
+                      queues:
+                        type: object
+                        additionalProperties:
+                          type: integer
+                          format: int64
+                        description: "Redis key → depth. Keys: `serp:queue:queries`, `serp:buffer`, `enrich:buffer`."
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  # =========================================================================
+  # V2 — Queries
+  # =========================================================================
+
+  /api/v2/queries:
+    get:
+      summary: "V2 – List queries"
+      operationId: v2ListQueries
+      tags: [V2 Queries]
+      description: |
+        Paginated list of SERP queries. COUNT is Redis-cached for 60s.
+        `meta.total_known=false` when COUNT timed out. Role: **viewer**.
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [new, processing, completed, failed]
+          description: "Filter by query status."
+        - $ref: '#/components/parameters/SearchParam'
+      responses:
+        "200":
+          description: "Paginated queries (V2 envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                          format: int64
+                        text:
+                          type: string
+                        status:
+                          type: string
+                        result_count:
+                          type: integer
+                        error:
+                          type: string
+                        created_at:
+                          type: string
+                          format: date-time
+                  meta:
+                    $ref: '#/components/schemas/PaginationMeta'
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+    post:
+      summary: "V2 – Create queries"
+      operationId: v2CreateQueries
+      tags: [V2 Queries]
+      description: |
+        Inserts search queries. Duplicates (same normalised text) are silently
+        skipped. Max 500 queries per request. Role: **admin**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [queries]
+              properties:
+                queries:
+                  type: array
+                  items:
+                    type: string
+                  maxItems: 500
+            example:
+              queries: ["yoga studio jakarta", "pilates class berlin"]
+      responses:
+        "200":
+          description: "Insert summary (V2 single envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      inserted:
+                        type: integer
+                      duplicates:
+                        type: integer
+                      total:
+                        type: integer
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+    delete:
+      summary: "V2 – Delete queries by IDs"
+      operationId: v2DeleteQueries
+      tags: [V2 Queries]
+      description: "Deletes queries by IDs. Max 1000 IDs. Role: **admin**."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: integer
+                    format: int64
+                  maxItems: 1000
+      responses:
+        "200":
+          description: "Delete count (V2 single envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: integer
+                        format: int64
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  /api/v2/queries/generate:
+    post:
+      summary: "V2 – Generate queries for a country"
+      operationId: v2GenerateQueries
+      tags: [V2 Queries]
+      description: |
+        Generates wellness/fitness keyword queries for the given country and
+        inserts them. Pass `"all"` for all countries. Role: **admin**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [country]
+              properties:
+                country:
+                  type: string
+                  description: "Country name (e.g. `Indonesia`) or `\"all\"`."
+            example:
+              country: "Indonesia"
+      responses:
+        "200":
+          description: "Generation summary (V2 single envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      country:
+                        type: string
+                      generated:
+                        type: integer
+                      inserted:
+                        type: integer
+                      duplicates:
+                        type: integer
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V2Error'
+          examples:
+            country_not_found:
+              value: {"error": {"code": "country_not_found", "message": "country not found"}}
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+  /api/v2/queries/retry:
+    post:
+      summary: "V2 – Retry failed queries"
+      operationId: v2RetryQueries
+      tags: [V2 Queries]
+      description: "Resets `status='failed'` queries back to `'new'`. Role: **admin**."
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: "Retry count (V2 single envelope)."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      retried:
+                        type: integer
+        "401":
+          $ref: '#/components/responses/V2Unauthorized'
+        "403":
+          $ref: '#/components/responses/V2Forbidden'
+        "500":
+          $ref: '#/components/responses/V2InternalError'
+
+tags:
+  - name: V1 Auth
+    description: "Legacy v1 authentication (no envelope wrapper)."
+  - name: V1 Health
+    description: "Legacy v1 health check."
+  - name: V1 Contacts
+    description: "Legacy v1 contacts / business listings."
+  - name: V1 Domains & Categories
+    description: "Legacy v1 domain and category lookups."
+  - name: V1 Queries
+    description: "Legacy v1 SERP query management."
+  - name: V1 Pipeline
+    description: "Legacy v1 pipeline stats and control."
+  - name: V1 Debug
+    description: "V1 debug endpoints for raw job inspection."
+  - name: V2 Auth
+    description: "V2 authentication (envelope-wrapped responses)."
+  - name: V2 Health
+    description: "V2 health check."
+  - name: V2 Results
+    description: "V2 business listings — primary consumer surface."
+  - name: V2 Dashboard
+    description: "V2 dashboard aggregation."
+  - name: V2 Queries
+    description: "V2 SERP query management."
