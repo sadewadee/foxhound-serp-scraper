@@ -263,6 +263,11 @@ func runMigrations(db *sql.DB) error {
 		// trigger below so new rows get tagged at insert time.
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS off_niche BOOLEAN DEFAULT FALSE`,
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_category TEXT`,
+		// completeness_score (0-100): precomputed reenrich-eligibility score, set by
+		// trg_normalize_enrichment + a one-time backfill, so the reenrich worker
+		// filters on an indexed column instead of a per-candidate correlated EXISTS
+		// (the 2026-06-02 eligibility timeout storm). NULL = not yet scored.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS completeness_score SMALLINT`,
 		// idx_bl_niche_active + idx_bl_off_niche_false are created BELOW with
 		// CONCURRENTLY (auditor P1 fix): plain CREATE INDEX takes ShareLock on
 		// business_listings (779K rows), and with 7 deploy containers racing
@@ -362,6 +367,9 @@ func runMigrations(db *sql.DB) error {
 		// the ~80K non-'enrichment' (directory-crawler) rows only — without it the
 		// correlated EXISTS seq-scans 3.9M rows → 57014 timeout (500).
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_source ON business_emails (source, business_id) WHERE source <> 'enrichment'`,
+		// Backs the reenrich eligibility query: WHERE re_enriched_at IS NULL AND
+		// completeness_score < $1. Partial on the (shrinking) un-reenriched set.
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_reenrich_score ON business_listings (completeness_score) WHERE re_enriched_at IS NULL`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			slog.Warn("db: read-path index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
@@ -537,6 +545,29 @@ func runMigrations(db *sql.DB) error {
 		          ON CONFLICT DO NOTHING;
 		        END IF;
 		      END LOOP;
+		    END IF;
+
+		    -- 2b. Precompute completeness_score (0-100) so the reenrich worker can
+		    -- filter on an indexed column instead of a per-candidate correlated
+		    -- EXISTS (the 2026-06-02 eligibility timeout storm). The email-EXISTS
+		    -- runs ONCE here per completion, not per scanned candidate. The email
+		    -- component reflects validation state AS OF this completion; re_enriched_at
+		    -- gates eligibility, so a row is re-scored at most once if validation
+		    -- marks an acceptable email later.
+		    IF biz_id IS NOT NULL THEN
+		      UPDATE business_listings bl SET completeness_score = (
+		          CASE WHEN EXISTS(
+		            SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id
+		            WHERE be.business_id = bl.id AND (e.is_acceptable = true OR e.score >= 0.7)
+		          ) THEN 40 ELSE 0 END
+		        + CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
+		              OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0) THEN 20 ELSE 0 END
+		        + CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
+		              AND (bl.category IS NOT NULL AND bl.category != '') THEN 15 ELSE 0 END
+		        + CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
+		              OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != '')) THEN 15 ELSE 0 END
+		        + CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb THEN 10 ELSE 0 END
+		      ) WHERE bl.id = biz_id;
 		    END IF;
 
 		    -- 3. Queue contact pages if serp_result with no emails found
@@ -1540,4 +1571,71 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("db: migration failed: %w", err)
 	}
 	return runMigrations(db)
+}
+
+// completenessBackfillVersion gates the one-time completeness_score backfill.
+const completenessBackfillVersion = "2026_06_02_completeness_score_backfill"
+
+// BackfillCompletenessScore populates business_listings.completeness_score for
+// existing un-reenriched rows ONCE (version-gated). Runs in the BACKGROUND
+// (manager only) so it never blocks the fleet boot — the reenrich worker just
+// picks up rows as they get scored, and a NULL score is treated as not-yet-
+// eligible. Scoped to re_enriched_at IS NULL (the only rows the eligibility
+// query reads), so it touches ~the reenrich pool, not all of business_listings.
+// Set-based: the acceptable-email semi-join is evaluated once. Uses the same
+// 0-100 rubric as trg_normalize_enrichment so backfilled and trigger-maintained
+// scores stay consistent.
+func BackfillCompletenessScore(ctx context.Context, db *sql.DB) {
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`,
+		completenessBackfillVersion,
+	).Scan(&done); err != nil {
+		slog.Warn("db: completeness backfill version check failed", "error", err)
+		return
+	}
+	if done {
+		return
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		slog.Warn("db: completeness backfill: acquire conn failed", "error", err)
+		return
+	}
+	defer conn.Close()
+	// Long timeout — a one-time scoped UPDATE run in the background.
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '900s'`); err != nil {
+		slog.Warn("db: completeness backfill: set timeout failed", "error", err)
+		return
+	}
+
+	slog.Info("db: completeness_score backfill starting (background, one-time)")
+	res, err := conn.ExecContext(ctx, `
+		UPDATE business_listings bl SET completeness_score =
+		    (CASE WHEN bl.id IN (
+		       SELECT be.business_id FROM business_emails be JOIN emails e ON e.id = be.email_id
+		       WHERE e.is_acceptable = true OR e.score >= 0.7
+		     ) THEN 40 ELSE 0 END)
+		  + CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
+		        OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0) THEN 20 ELSE 0 END
+		  + CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
+		        AND (bl.category IS NOT NULL AND bl.category != '') THEN 15 ELSE 0 END
+		  + CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
+		        OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != '')) THEN 15 ELSE 0 END
+		  + CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb THEN 10 ELSE 0 END
+		WHERE bl.completeness_score IS NULL AND bl.re_enriched_at IS NULL
+	`)
+	if err != nil {
+		slog.Warn("db: completeness_score backfill failed — reenrich eligibility limited until a later boot retries", "error", err)
+		return
+	}
+	n, _ := res.RowsAffected()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+		completenessBackfillVersion, "backfill business_listings.completeness_score for reenrich eligibility",
+	); err != nil {
+		slog.Warn("db: completeness backfill: version record failed", "error", err)
+	}
+	slog.Info("db: completeness_score backfill done", "rows_scored", n)
 }

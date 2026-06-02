@@ -232,6 +232,7 @@ func TestEligibilityQuery_NoOrderByRandom(t *testing.T) {
 	}{
 		{"re_enriched_at IS NULL", "candidate set must be unprocessed rows only"},
 		{"COALESCE(bl.re_enrich_attempts, 0) < $3", "retry cap stops genuinely-broken sites from cycling"},
+		{"bl.completeness_score < $1", "eligibility must filter on the PRECOMPUTED indexed score, not a per-candidate correlated EXISTS (2026-06-02 eligibility-storm fix)"},
 		{"LIMIT $2", "bounds the batch and lets the index scan short-circuit"},
 		{"FOR UPDATE OF bl SKIP LOCKED", "multi-worker safety + distributes work without random ordering"},
 	}
@@ -239,6 +240,19 @@ func TestEligibilityQuery_NoOrderByRandom(t *testing.T) {
 		if !strings.Contains(eligibilityQuery, c.clause) {
 			t.Errorf("eligibilityQuery missing clause %q — %s", c.clause, c.why)
 		}
+	}
+
+	// Guard the 2026-06-02 fix: the WHERE clause must NOT re-introduce the
+	// per-candidate "has acceptable email" EXISTS — that correlated subquery,
+	// evaluated for every re_enriched_at IS NULL candidate under 16-worker
+	// contention, blew the statement_timeout. It now lives ONCE in the enrich
+	// trigger (trg_normalize_enrichment), feeding completeness_score.
+	whereClause := eligibilityQuery
+	if idx := strings.Index(whereClause, "RETURNING"); idx >= 0 {
+		whereClause = whereClause[:idx] // RETURNING still has a cheap LIMIT-bounded email COUNT; only guard the WHERE/CTE
+	}
+	if strings.Contains(whereClause, "is_acceptable") {
+		t.Error("eligibilityQuery WHERE still references is_acceptable — the per-candidate email EXISTS must be replaced by the precomputed completeness_score column")
 	}
 }
 

@@ -108,6 +108,10 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		projReconciler := reconciler.New(database, dd.Client())
 		go projReconciler.Run(ctx)
 
+		// One-time, background backfill of business_listings.completeness_score so
+		// the reenrich eligibility query filters on the indexed column. Manager-only,
+		// non-blocking (does not delay boot); version-gated → no-op after first run.
+		go db.BackfillCompletenessScore(ctx, database)
 	}
 
 	// Start pipeline stages in background (skip for "none" — API only mode).

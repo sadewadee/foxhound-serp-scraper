@@ -4,15 +4,15 @@
 # 500 → docker retries forever). Proven push path instead — NO ROUTE FROM THE MAC,
 # EVER (zero image bytes may transit the local machine); save to a FILE then scp
 # DIRECTLY kurama→hachibi by bare hostname (NOT a Tailscale IP):
-#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.8-niche | gzip -1 > /tmp/v0.8.8-niche.tgz
-#   kurama:  scp -o BatchMode=yes /tmp/v0.8.8-niche.tgz hachibi:/tmp/v0.8.8-niche.tgz
-#   hachibi: docker load < /tmp/v0.8.8-niche.tgz
-#   hachibi: docker tag …:v0.8.8-niche localhost:32769/foxhound-serp-scraper:v0.8.8-niche
+#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.9-niche | gzip -1 > /tmp/v0.8.9-niche.tgz
+#   kurama:  scp -o BatchMode=yes /tmp/v0.8.9-niche.tgz hachibi:/tmp/v0.8.9-niche.tgz
+#   hachibi: docker load < /tmp/v0.8.9-niche.tgz
+#   hachibi: docker tag …:v0.8.9-niche localhost:32769/foxhound-serp-scraper:v0.8.9-niche
 #          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.8-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.9-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -30,15 +30,23 @@
 #   unit fix) + Phase 5 (idx_bl_created_at/updated_at/category, idx_be_email_id,
 #   email_provider→e.domain, category/source filters, v1 N+1 kill) + Phase 7
 #   (UTF-8 sanitize before reenrich upsert).
+# v0.8.9-niche = v0.8.8 + Phase 1D PROPER fix: precomputed business_listings
+#   .completeness_score (maintained by trg_normalize_enrichment + a one-time
+#   background backfill) so the reenrich eligibility query filters on the indexed
+#   idx_bl_reenrich_score instead of a per-candidate correlated EXISTS (the
+#   2026-06-02 eligibility timeout storm). Also declares idx_bl_category_offniche
+#   + idx_be_source (already applied live) for fresh-deploy parity.
+#   NOTE: first manager boot runs the completeness backfill in the BACKGROUND
+#   (non-blocking); reenrich eligibility ramps up as rows get scored.
 #
-# Deploy: set IMAGE_TAG=v0.8.8-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.8.9-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.8-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.9-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]

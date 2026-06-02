@@ -288,29 +288,14 @@ const eligibilityQuery = `
 			  AND (re_enrich_locked_at IS NULL
 			       OR re_enrich_locked_at < NOW() - INTERVAL '15 minutes')
 			  AND COALESCE(bl.re_enrich_attempts, 0) < $3
-			  AND (
-				CASE WHEN EXISTS(
-					SELECT 1 FROM business_emails be
-					JOIN emails e ON e.id = be.email_id
-					WHERE be.business_id = bl.id
-					  AND (e.is_acceptable = true OR e.score >= 0.7)
-				) THEN 40 ELSE 0 END
-				+
-				CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
-					OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0)
-				THEN 20 ELSE 0 END
-				+
-				CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
-					AND (bl.category IS NOT NULL AND bl.category != '')
-				THEN 15 ELSE 0 END
-				+
-				CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
-					OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != ''))
-				THEN 15 ELSE 0 END
-				+
-				CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb
-				THEN 10 ELSE 0 END
-			  ) < $1
+			  -- Eligibility filters on the PRECOMPUTED completeness_score column
+			  -- (0-100, maintained by trg_normalize_enrichment + a one-time backfill)
+			  -- instead of the old per-candidate correlated EXISTS completeness CASE,
+			  -- which re-scanned business_emails+emails for EVERY re_enriched_at IS NULL
+			  -- candidate and blew the 5s statement_timeout under 16-worker contention
+			  -- (the 2026-06-02 eligibility storm). Backed by idx_bl_reenrich_score.
+			  -- A NULL score (not yet scored) is excluded until the backfill sets it.
+			  AND bl.completeness_score < $1
 			-- Deliberately NOT randomly ordered: a random sort over the whole
 			-- eligible pool forced a full index scan + sort of every
 			-- re_enriched_at IS NULL row (~340K), so the SELECT blew the 5s
