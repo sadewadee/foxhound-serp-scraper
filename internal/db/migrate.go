@@ -347,6 +347,11 @@ func runMigrations(db *sql.DB) error {
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_created_at ON business_listings (created_at DESC)`,
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_updated_at ON business_listings (updated_at DESC)`,
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category ON business_listings (category) WHERE category IS NOT NULL`,
+		// Composite for ?category= + the default id_desc sort: serves
+		// WHERE category=X ORDER BY bl.id DESC LIMIT N without a separate sort
+		// over the (high-cardinality) filtered set, e.g. category=yogaalliance
+		// has ~77K rows and timed out the plain category+PK-backward-scan path.
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category_id ON business_listings (category, id DESC) WHERE category IS NOT NULL`,
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_email_id ON business_emails (email_id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
