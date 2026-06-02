@@ -4,15 +4,15 @@
 # 500 → docker retries forever). Proven push path instead — NO ROUTE FROM THE MAC,
 # EVER (zero image bytes may transit the local machine); save to a FILE then scp
 # DIRECTLY kurama→hachibi by bare hostname (NOT a Tailscale IP):
-#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.9-niche | gzip -1 > /tmp/v0.8.9-niche.tgz
-#   kurama:  scp -o BatchMode=yes /tmp/v0.8.9-niche.tgz hachibi:/tmp/v0.8.9-niche.tgz
-#   hachibi: docker load < /tmp/v0.8.9-niche.tgz
-#   hachibi: docker tag …:v0.8.9-niche localhost:32769/foxhound-serp-scraper:v0.8.9-niche
+#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.0-niche | gzip -1 > /tmp/v0.9.0-niche.tgz
+#   kurama:  scp -o BatchMode=yes /tmp/v0.9.0-niche.tgz hachibi:/tmp/v0.9.0-niche.tgz
+#   hachibi: docker load < /tmp/v0.9.0-niche.tgz
+#   hachibi: docker tag …:v0.9.0-niche localhost:32769/foxhound-serp-scraper:v0.9.0-niche
 #          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.9-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.0-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -38,15 +38,31 @@
 #   + idx_be_source (already applied live) for fresh-deploy parity.
 #   NOTE: first manager boot runs the completeness backfill in the BACKGROUND
 #   (non-blocking); reenrich eligibility ramps up as rows get scored.
+# v0.9.0-niche = v0.8.9 + category-quality + backfill-hardening:
+#   • schema.org @type denylist — trg_normalize_enrichment now flags off_niche
+#     for content/junk @types (Article, FAQPage, WPHeader, …) always, and for
+#     generic/blank business @types (Organization, LocalBusiness, " ", …) only
+#     when the keyword classifier found nothing (niche_category IS NULL), so the
+#     category dimension stops surfacing schema.org noise. Existing rows cleaned
+#     by BackfillSchemaTypeDenylist (background, backup-first to
+#     business_listings_schematype_backup_20260602, batched, version-gated).
+#   • BackfillCompletenessScore rewritten batched + correlated-EXISTS (the v0.8.9
+#     monolith hash-joined all business_emails⋈emails and ran 766s, starving IO
+#     + the API + reenrich eligibility — root cause of the 2026-06-02 churn).
+#   • Aggressive per-table autovacuum on business_listings (storage params,
+#     online) keeps the visibility map fresh so the index-only ?category= COUNT
+#     stays ~100ms (was degrading to ~72K heap fetches → 6–16s/500s).
+#   Already applied LIVE before this build: rebuilt invalid idx_bl_reenrich_score,
+#   VACUUM business_listings, autovacuum params.
 #
-# Deploy: set IMAGE_TAG=v0.8.9-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.9.0-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.8.9-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.0-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]

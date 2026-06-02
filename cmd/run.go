@@ -112,6 +112,12 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		// the reenrich eligibility query filters on the indexed column. Manager-only,
 		// non-blocking (does not delay boot); version-gated → no-op after first run.
 		go db.BackfillCompletenessScore(ctx, database)
+
+		// One-time, background cleanup that flags off_niche for schema.org
+		// content/junk + niche-less generic @type categories (Article, FAQPage,
+		// WPHeader, Organization-without-niche, …). Backup-first, batched,
+		// version-gated → no-op after first run. Manager-only, non-blocking.
+		go db.BackfillSchemaTypeDenylist(ctx, database)
 	}
 
 	// Start pipeline stages in background (skip for "none" — API only mode).

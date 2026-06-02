@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 )
 
 const schema = `
@@ -268,6 +269,21 @@ func runMigrations(db *sql.DB) error {
 		// filters on an indexed column instead of a per-candidate correlated EXISTS
 		// (the 2026-06-02 eligibility timeout storm). NULL = not yet scored.
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS completeness_score SMALLINT`,
+		// business_listings is read-hot (the v2 results API counts/filters it)
+		// and write-hot (enrich upserts continuously). Default autovacuum
+		// (scale_factor 0.2 → ~220K dead/inserted tuples before a vacuum) lets the
+		// visibility map go stale, so the index-only COUNT(*) for ?category=
+		// degrades to ~72K heap fetches and times out (the 2026-06-02 category
+		// fetch 500s — VACUUM gave temporary relief). Aggressive per-table
+		// autovacuum keeps the VM fresh → index-only counts stay ~100ms. Storage
+		// params only: online, no restart, no table rewrite. (Distinct from the
+		// gated global Phase 6 tuning, which needs a Postgres restart.)
+		`ALTER TABLE business_listings SET (
+		    autovacuum_vacuum_scale_factor = 0.02,
+		    autovacuum_analyze_scale_factor = 0.02,
+		    autovacuum_vacuum_insert_scale_factor = 0.02,
+		    autovacuum_vacuum_cost_delay = 2
+		)`,
 		// idx_bl_niche_active + idx_bl_off_niche_false are created BELOW with
 		// CONCURRENTLY (auditor P1 fix): plain CREATE INDEX takes ShareLock on
 		// business_listings (779K rows), and with 7 deploy containers racing
@@ -460,6 +476,33 @@ func runMigrations(db *sql.DB) error {
 		            'RoofingContractor','HomeAndConstructionBusiness',
 		            'MedicalClinic','MedicalBusiness','HealthAndBeautyBusiness'
 		          ) THEN TRUE
+		          -- 2026-06: schema.org content/media/app/page-structure @type
+		          -- values — never a wellness business lead. Always off_niche
+		          -- (category-pollution cleanup; kept in sync with the backfill).
+		          WHEN NEW.raw_category IN (
+		            'Article','BlogPosting','NewsArticle','TechArticle','MedicalWebPage',
+		            'FAQPage','QAPage','Recipe','HowTo','VideoObject','Movie','Book','Dataset',
+		            'Review','AggregateRating','DefinedTerm','CreativeWork','CreativeWorkSeries',
+		            'DiscussionForumPosting','Course','JobPosting','Blog','Website','website',
+		            'SoftwareApplication','WebApplication','MobileApplication','VideoGame',
+		            'Product','product','ProductGroup','CollectionPage','ProfilePage',
+		            'AboutPage','ContactPage','SearchResultsPage','SiteNavigationElement',
+		            'ImageGallery','WPHeader','WPFooter','WPSidebar','Person','Place',
+		            'contao:Page'
+		          ) THEN TRUE
+		          -- 2026-06: generic business @types + blank category carry no
+		          -- niche signal on their own — off_niche ONLY when the keyword
+		          -- classifier (same union as the niche_category CASE below)
+		          -- matched nothing, so a real wellness business whose page had a
+		          -- generic/empty @type but a niche name/title is still kept.
+		          WHEN NEW.raw_category IN (
+		            'Organization','organization','LocalBusiness','Corporation','Store',
+		            'OnlineStore','Service','ProfessionalService','EducationalOrganization',
+		            'NewsMediaOrganization','GovernmentOrganization','FinancialService',
+		            'FoodEstablishment','RadioStation',' ',''
+		          ) AND LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
+		                      COALESCE(NEW.raw_page_title,'') || ' ' ||
+		                      COALESCE(NEW.raw_description,'')) !~ '\myoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti|pilates|reformer|crossfit|bootcamp|hiit|barre|spin|gym|fitness|meditation|mindfulness|breathwork|reiki|sound healing|energy healing|healing|ayurved|spa|massage|thermal|wellness|holistic\M' THEN TRUE
 		          ELSE FALSE
 		        END,
 		        -- niche_category
@@ -1604,38 +1647,180 @@ func BackfillCompletenessScore(ctx context.Context, db *sql.DB) {
 		return
 	}
 	defer conn.Close()
-	// Long timeout — a one-time scoped UPDATE run in the background.
-	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '900s'`); err != nil {
+	// Per-batch timeout — the work is chunked (LIMIT 2000) so no single
+	// statement runs long. The v0.8.9 monolith (one 60K-row UPDATE whose
+	// non-correlated `id IN (SELECT … business_emails ⋈ emails …)` hash-joined
+	// all of business_emails⋈emails up front) ran 766s, saturating disk IO and
+	// starving the API + reenrich eligibility. Batched + correlated EXISTS (a
+	// business_emails PK lookup per row) instead.
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '60s'`); err != nil {
 		slog.Warn("db: completeness backfill: set timeout failed", "error", err)
 		return
 	}
 
-	slog.Info("db: completeness_score backfill starting (background, one-time)")
-	res, err := conn.ExecContext(ctx, `
-		UPDATE business_listings bl SET completeness_score =
-		    (CASE WHEN bl.id IN (
-		       SELECT be.business_id FROM business_emails be JOIN emails e ON e.id = be.email_id
-		       WHERE e.is_acceptable = true OR e.score >= 0.7
-		     ) THEN 40 ELSE 0 END)
-		  + CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
-		        OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0) THEN 20 ELSE 0 END
-		  + CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
-		        AND (bl.category IS NOT NULL AND bl.category != '') THEN 15 ELSE 0 END
-		  + CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
-		        OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != '')) THEN 15 ELSE 0 END
-		  + CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb THEN 10 ELSE 0 END
-		WHERE bl.completeness_score IS NULL AND bl.re_enriched_at IS NULL
-	`)
-	if err != nil {
-		slog.Warn("db: completeness_score backfill failed — reenrich eligibility limited until a later boot retries", "error", err)
-		return
+	slog.Info("db: completeness_score backfill starting (background, batched)")
+	var total int64
+	for i := 0; i < 5000; i++ { // cap: 5000×2000 = 10M rows, far above the scope
+		res, err := conn.ExecContext(ctx, `
+			UPDATE business_listings bl SET completeness_score =
+			    (CASE WHEN EXISTS (
+			       SELECT 1 FROM business_emails be JOIN emails e ON e.id = be.email_id
+			       WHERE be.business_id = bl.id AND (e.is_acceptable = true OR e.score >= 0.7)
+			     ) THEN 40 ELSE 0 END)
+			  + CASE WHEN (bl.phone IS NOT NULL AND bl.phone != '')
+			        OR (bl.phones IS NOT NULL AND array_length(bl.phones, 1) > 0) THEN 20 ELSE 0 END
+			  + CASE WHEN (bl.business_name IS NOT NULL AND bl.business_name != '')
+			        AND (bl.category IS NOT NULL AND bl.category != '') THEN 15 ELSE 0 END
+			  + CASE WHEN (bl.address IS NOT NULL AND bl.address != '')
+			        OR ((bl.city IS NOT NULL AND bl.city != '') AND (bl.country IS NOT NULL AND bl.country != '')) THEN 15 ELSE 0 END
+			  + CASE WHEN bl.social_links IS NOT NULL AND bl.social_links != '{}'::jsonb THEN 10 ELSE 0 END
+			WHERE bl.id IN (
+				SELECT id FROM business_listings
+				WHERE completeness_score IS NULL AND re_enriched_at IS NULL
+				LIMIT 2000
+			)
+		`)
+		if err != nil {
+			slog.Warn("db: completeness_score backfill batch failed — reenrich eligibility limited until a later boot retries", "error", err, "scored_so_far", total)
+			return
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			slog.Info("db: completeness_score backfill interrupted (resumes on a later boot)", "scored_so_far", total)
+			return
+		case <-time.After(150 * time.Millisecond): // gentle pacing between batches
+		}
 	}
-	n, _ := res.RowsAffected()
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
 		completenessBackfillVersion, "backfill business_listings.completeness_score for reenrich eligibility",
 	); err != nil {
 		slog.Warn("db: completeness backfill: version record failed", "error", err)
 	}
-	slog.Info("db: completeness_score backfill done", "rows_scored", n)
+	slog.Info("db: completeness_score backfill done", "rows_scored", total)
+}
+
+// schemaTypeDenylistVersion gates the one-time schema.org @type cleanup.
+const schemaTypeDenylistVersion = "2026_06_02_schema_type_denylist"
+
+// BackfillSchemaTypeDenylist flags off_niche for existing business_listings
+// rows whose category is schema.org content/junk noise (Article, FAQPage,
+// WPHeader, …) or a generic/blank business @type (Organization, LocalBusiness,
+// " ", …) that carries no wellness/fitness signal (niche_category IS NULL).
+// Forward-going rows are handled by the trg_normalize_enrichment CASE; this is
+// the one-time existing-row cleanup. Background goroutine (NOT inside Migrate)
+// so the batched UPDATE never holds the migrate advisory lock and re-triggers
+// the boot DDL herd. Backup-first (business_listings_schematype_backup_20260602
+// — reversible), batched (Invariant #2), version-gated + resumable.
+func BackfillSchemaTypeDenylist(ctx context.Context, db *sql.DB) {
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`,
+		schemaTypeDenylistVersion,
+	).Scan(&done); err != nil {
+		slog.Warn("db: schema-type denylist version check failed", "error", err)
+		return
+	}
+	if done {
+		return
+	}
+
+	// Content/media/app/page-structure @types — never a business. Kept in sync
+	// with the trg_normalize_enrichment off_niche CASE.
+	const nonBusinessTypes = `'Article','BlogPosting','NewsArticle','TechArticle','MedicalWebPage',
+		'FAQPage','QAPage','Recipe','HowTo','VideoObject','Movie','Book','Dataset',
+		'Review','AggregateRating','DefinedTerm','CreativeWork','CreativeWorkSeries',
+		'DiscussionForumPosting','Course','JobPosting','Blog','Website','website',
+		'SoftwareApplication','WebApplication','MobileApplication','VideoGame',
+		'Product','product','ProductGroup','CollectionPage','ProfilePage',
+		'AboutPage','ContactPage','SearchResultsPage','SiteNavigationElement',
+		'ImageGallery','WPHeader','WPFooter','WPSidebar','Person','Place',
+		'contao:Page'`
+	// Generic business @types + blank category — off_niche only when the keyword
+	// classifier found nothing (niche_category IS NULL).
+	const genericBusinessTypes = `'Organization','organization','LocalBusiness','Corporation','Store',
+		'OnlineStore','Service','ProfessionalService','EducationalOrganization',
+		'NewsMediaOrganization','GovernmentOrganization','FinancialService',
+		'FoodEstablishment','RadioStation',' ',''`
+
+	denylistWhere := `off_niche IS NOT TRUE AND (
+		category IN (` + nonBusinessTypes + `)
+		OR (category IN (` + genericBusinessTypes + `) AND niche_category IS NULL)
+	)`
+
+	// PRE-COUNT (bounded, advisory).
+	var toFlag int
+	if preTx, ptxErr := db.BeginTx(ctx, nil); ptxErr != nil {
+		slog.Warn("db: schema-type denylist pre-count tx begin failed", "error", ptxErr)
+	} else {
+		preTx.ExecContext(ctx, `SET LOCAL statement_timeout = '8000'`) //nolint:errcheck — advisory
+		_ = preTx.QueryRowContext(ctx, `SELECT COUNT(*) FROM business_listings WHERE `+denylistWhere).Scan(&toFlag)
+		preTx.Rollback() //nolint:errcheck — read-only
+	}
+	slog.Info("db: schema-type denylist starting (background, batched)", "rows_to_flag", toFlag)
+
+	// BACKUP first — integrity gate; reversible restore source.
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS business_listings_schematype_backup_20260602 AS
+		SELECT id, category, off_niche, niche_category, updated_at
+		FROM business_listings WHERE `+denylistWhere); err != nil {
+		slog.Warn("db: schema-type denylist backup failed — aborting for safety", "error", err)
+		return
+	}
+	var backupCount int
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM business_listings_schematype_backup_20260602`).Scan(&backupCount)
+	if backupCount == 0 && toFlag > 0 {
+		slog.Warn("db: schema-type denylist backup integrity FAILED — backup empty, aborting")
+		return
+	}
+	slog.Info("db: schema-type denylist backup created", "backup_rows", backupCount)
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		slog.Warn("db: schema-type denylist: acquire conn failed", "error", err)
+		return
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '30s'`); err != nil {
+		slog.Warn("db: schema-type denylist: set timeout failed", "error", err)
+		return
+	}
+
+	// FLAG — batched (5000/iter). off_niche=TRUE removes each row from the set,
+	// so the loop converges; cap is a runaway backstop.
+	var totalFlagged int64
+	for i := 0; i < 4000; i++ { // cap: 4000×5000 = 20M rows, far above the scope
+		res, err := conn.ExecContext(ctx, `
+			UPDATE business_listings SET off_niche = TRUE, updated_at = NOW()
+			WHERE id IN (
+				SELECT id FROM business_listings WHERE `+denylistWhere+` LIMIT 5000
+			)`)
+		if err != nil {
+			slog.Warn("db: schema-type denylist FLAG batch failed — resumes on a later boot", "error", err, "flagged_so_far", totalFlagged)
+			return
+		}
+		n, _ := res.RowsAffected()
+		totalFlagged += n
+		if n == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			slog.Info("db: schema-type denylist interrupted (resumes on a later boot)", "flagged_so_far", totalFlagged)
+			return
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+		schemaTypeDenylistVersion, "flag off_niche for schema.org content/junk @types + niche-less generic/blank @types",
+	); err != nil {
+		slog.Warn("db: schema-type denylist: version record failed", "error", err)
+	}
+	slog.Info("db: schema-type denylist done", "rows_flagged", totalFlagged)
 }
