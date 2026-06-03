@@ -681,12 +681,16 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			locked_by = NULL, completed_at = NOW(), updated_at = NOW()
 		WHERE url_hash = $18`,
 			pq.Array(emails), pq.Array(phones), socialJSON,
-			nullIfEmpty(cd.BusinessName), nullIfEmpty(cd.BusinessCategory), nullIfEmpty(cd.Address),
-			nullIfEmpty(cd.PageTitle),
-			nullIfEmpty(cd.Description), nullIfEmpty(cd.Location), nullIfEmpty(cd.Country),
-			nullIfEmpty(cd.City), nullIfEmpty(cd.ContactName),
-			nullIfEmpty(cd.OpeningHours), nullIfEmpty(cd.Rating),
-			nullIfEmpty(cd.TikTok), nullIfEmpty(cd.YouTube), nullIfEmpty(cd.Telegram),
+			// sanitizeUTF8 on every scraped text field — a single invalid byte
+			// (Latin-1 / mojibake from a mislabeled page) made the whole UPDATE
+			// fail with 'invalid byte sequence for encoding UTF8', stranding a
+			// fully-extracted page. reenrich.go already does this; enrich didn't.
+			nullIfEmpty(sanitizeUTF8(cd.BusinessName)), nullIfEmpty(sanitizeUTF8(cd.BusinessCategory)), nullIfEmpty(sanitizeUTF8(cd.Address)),
+			nullIfEmpty(sanitizeUTF8(cd.PageTitle)),
+			nullIfEmpty(sanitizeUTF8(cd.Description)), nullIfEmpty(sanitizeUTF8(cd.Location)), nullIfEmpty(sanitizeUTF8(cd.Country)),
+			nullIfEmpty(sanitizeUTF8(cd.City)), nullIfEmpty(sanitizeUTF8(cd.ContactName)),
+			nullIfEmpty(sanitizeUTF8(cd.OpeningHours)), nullIfEmpty(sanitizeUTF8(cd.Rating)),
+			nullIfEmpty(sanitizeUTF8(cd.TikTok)), nullIfEmpty(sanitizeUTF8(cd.YouTube)), nullIfEmpty(sanitizeUTF8(cd.Telegram)),
 			urlHash)
 		if updErr != nil {
 			// Don't leave the job in 'processing' — reconciler would re-fetch
@@ -694,8 +698,18 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			// the resurrection logic governs retries with attempt_count cap.
 			slog.Error("enrich: completion UPDATE failed, marking job failed",
 				"url_hash", urlHash, "url", pageURL, "error", updErr)
-			c.db.Exec(`UPDATE enrichment_jobs SET status = 'failed',
-				error_msg = $1, locked_by = NULL, updated_at = NOW()
+			// Mirror the transient-error path: increment attempt_count and set
+			// next_attempt_at so the reconciler's resurrection query (which
+			// requires next_attempt_at IS NOT NULL AND <= NOW()) can pick it up.
+			// The old form left next_attempt_at NULL → the job was invisible to
+			// resurrection forever (permanent stranding).
+			c.db.Exec(`UPDATE enrichment_jobs SET
+				attempt_count = attempt_count + 1,
+				error_msg = $1,
+				status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'dead' ELSE 'failed' END,
+				next_attempt_at = CASE WHEN attempt_count + 1 >= max_attempts THEN NULL
+					ELSE NOW() + interval '1 minute' END,
+				locked_by = NULL, picked_at = NULL, updated_at = NOW()
 			WHERE url_hash = $2`, "completion-update-failed: "+updErr.Error(), urlHash)
 		}
 

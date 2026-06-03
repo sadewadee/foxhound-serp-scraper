@@ -4,15 +4,15 @@
 # 500 → docker retries forever). Proven push path instead — NO ROUTE FROM THE MAC,
 # EVER (zero image bytes may transit the local machine); save to a FILE then scp
 # DIRECTLY kurama→hachibi by bare hostname (NOT a Tailscale IP):
-#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.0-niche | gzip -1 > /tmp/v0.9.0-niche.tgz
-#   kurama:  scp -o BatchMode=yes /tmp/v0.9.0-niche.tgz hachibi:/tmp/v0.9.0-niche.tgz
-#   hachibi: docker load < /tmp/v0.9.0-niche.tgz
-#   hachibi: docker tag …:v0.9.0-niche localhost:32769/foxhound-serp-scraper:v0.9.0-niche
+#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.1-niche | gzip -1 > /tmp/v0.9.1-niche.tgz
+#   kurama:  scp -o BatchMode=yes /tmp/v0.9.1-niche.tgz hachibi:/tmp/v0.9.1-niche.tgz
+#   hachibi: docker load < /tmp/v0.9.1-niche.tgz
+#   hachibi: docker tag …:v0.9.1-niche localhost:32769/foxhound-serp-scraper:v0.9.1-niche
 #          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.0-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.1-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -54,15 +54,26 @@
 #     stays ~100ms (was degrading to ~72K heap fetches → 6–16s/500s).
 #   Already applied LIVE before this build: rebuilt invalid idx_bl_reenrich_score,
 #   VACUUM business_listings, autovacuum params.
+# v0.9.1-niche = v0.9.0 + enrich completion-error stranding fix (dev-squad evolve #1):
+#   • enrich.go completion UPDATE now sanitizeUTF8()-wraps every scraped text field
+#     (reenrich.go already did; enrich didn't) — a single invalid byte no longer
+#     fails the whole write and strands a fully-extracted page (~18k UTF-8 failures).
+#   • enrich.go completion-error fallback now increments attempt_count + sets
+#     next_attempt_at (caps to 'dead' at max_attempts) so the reconciler's
+#     resurrection query (next_attempt_at IS NOT NULL AND <= NOW()) can pick it up;
+#     the old form left next_attempt_at NULL → ~19,948 jobs permanently stranded.
+#   POST-DEPLOY: one-time online re-queue of the existing stranded jobs
+#     (status='failed', next_attempt_at NULL, completion-update-failed) so they
+#     re-write cleanly through the new sanitized path.
 #
-# Deploy: set IMAGE_TAG=v0.9.0-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.9.1-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.0-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.1-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
