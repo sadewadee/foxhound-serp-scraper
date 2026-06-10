@@ -4,15 +4,15 @@
 # 500 → docker retries forever). Proven push path instead — NO ROUTE FROM THE MAC,
 # EVER (zero image bytes may transit the local machine); save to a FILE then scp
 # DIRECTLY kurama→hachibi by bare hostname (NOT a Tailscale IP):
-#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.1-niche | gzip -1 > /tmp/v0.9.1-niche.tgz
-#   kurama:  scp -o BatchMode=yes /tmp/v0.9.1-niche.tgz hachibi:/tmp/v0.9.1-niche.tgz
-#   hachibi: docker load < /tmp/v0.9.1-niche.tgz
-#   hachibi: docker tag …:v0.9.1-niche localhost:32769/foxhound-serp-scraper:v0.9.1-niche
+#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.2-niche | gzip -1 > /tmp/v0.9.2-niche.tgz
+#   kurama:  scp -o BatchMode=yes /tmp/v0.9.2-niche.tgz hachibi:/tmp/v0.9.2-niche.tgz
+#   hachibi: docker load < /tmp/v0.9.2-niche.tgz
+#   hachibi: docker tag …:v0.9.2-niche localhost:32769/foxhound-serp-scraper:v0.9.2-niche
 #          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.1-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.2-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -65,15 +65,26 @@
 #   POST-DEPLOY: one-time online re-queue of the existing stranded jobs
 #     (status='failed', next_attempt_at NULL, completion-update-failed) so they
 #     re-write cleanly through the new sanitized path.
+# v0.9.2-niche = v0.9.1 + category_stats matview (fix /api/v2/results/categories
+#   500 @ 5.3s): per-category business+email counts are precomputed into a
+#   materialized view (created WITH NO DATA so boot DDL stays instant) and
+#   refreshed every 10min off the request path by a manager-only background loop
+#   (RefreshCategoryStatsLoop). The handler reads top-100 from it instead of the
+#   live 5.7s aggregation (business_listings ⋈ business_emails, GROUP BY 136K
+#   free-text categories, 2× COUNT(DISTINCT)) that blew the 5s API
+#   statement_timeout (Invariant #2). First refresh seeds via a plain REFRESH,
+#   then REFRESH … CONCURRENTLY so API reads never block.
+#   NOTE: on first boot the endpoint returns an empty list (200) for the few
+#   seconds until the seed completes — it is NOT a 500.
 #
-# Deploy: set IMAGE_TAG=v0.9.1-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.9.2-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.1-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.2-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]

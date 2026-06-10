@@ -3,10 +3,14 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
+
+	pq "github.com/lib/pq"
 )
 
 const schema = `
@@ -161,6 +165,29 @@ CREATE TABLE IF NOT EXISTS workers (
     last_heartbeat  TIMESTAMPTZ DEFAULT NOW(),
     started_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- category_stats precomputes per-category business + email counts for
+-- /api/v2/results/categories. The live aggregation — business_listings ⋈
+-- business_emails, GROUP BY 130K+ free-text categories with 2× COUNT(DISTINCT) —
+-- exceeds the API's 5s statement_timeout at current scale (Invariant #2), so it is
+-- materialized and read top-N. Created WITH NO DATA so boot DDL stays instant
+-- (no heavy query under the migrate advisory lock); the manager's
+-- RefreshCategoryStatsLoop seeds and refreshes it off the request path.
+CREATE MATERIALIZED VIEW IF NOT EXISTS category_stats AS
+    SELECT bl.category AS category,
+           COUNT(DISTINCT bl.id) AS biz_count,
+           COUNT(DISTINCT be.email_id) AS email_count
+    FROM business_listings bl
+    LEFT JOIN business_emails be ON be.business_id = bl.id
+    WHERE bl.category IS NOT NULL AND bl.category != ''
+    GROUP BY bl.category
+WITH NO DATA;
+
+-- Unique index is REQUIRED for REFRESH MATERIALIZED VIEW CONCURRENTLY (so API
+-- reads never block during refresh). Instant to build while the matview is empty.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_category_stats_category ON category_stats (category);
+-- Serves the handler's ORDER BY biz_count DESC LIMIT 100.
+CREATE INDEX IF NOT EXISTS idx_category_stats_biz_count ON category_stats (biz_count DESC);
 `
 
 // runMigrations applies incremental schema changes that are safe to re-run.
@@ -1614,6 +1641,84 @@ func Migrate(db *sql.DB) error {
 		return fmt.Errorf("db: migration failed: %w", err)
 	}
 	return runMigrations(db)
+}
+
+// categoryStatsRefreshInterval controls how often category_stats is rebuilt. The
+// category browse list tolerates minutes of staleness; a longer cadence keeps the
+// refresh (which holds one of the manager's 2 pool connections for its duration)
+// from contending with the API/reconciler too often.
+const categoryStatsRefreshInterval = 10 * time.Minute
+
+// RefreshCategoryStatsLoop keeps the category_stats materialized view fresh in the
+// BACKGROUND (manager only). The live per-category aggregation exceeds the API's
+// 5s statement_timeout at current scale (Invariant #2), so
+// /api/v2/results/categories reads precomputed rows from this matview instead.
+// Non-blocking: seeds immediately on boot, then refreshes on a ticker until ctx
+// is cancelled.
+func RefreshCategoryStatsLoop(ctx context.Context, db *sql.DB) {
+	refreshCategoryStats(ctx, db) // seed on boot so the endpoint warms up fast
+	ticker := time.NewTicker(categoryStatsRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshCategoryStats(ctx, db)
+		}
+	}
+}
+
+// refreshCategoryStats rebuilds category_stats once. The matview is created WITH
+// NO DATA (schema), so the FIRST refresh must be non-concurrent to populate it;
+// every refresh after that uses CONCURRENTLY so API reads never block on an
+// ACCESS EXCLUSIVE lock.
+func refreshCategoryStats(ctx context.Context, db *sql.DB) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		slog.Warn("db: category_stats refresh: acquire conn failed", "error", err)
+		return
+	}
+	defer conn.Close()
+	// This runs the heavy aggregation; it must NOT inherit the 5s API budget.
+	// Generous cap, off the request path. Scoped to this conn only.
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '180s'`); err != nil {
+		slog.Warn("db: category_stats refresh: set timeout failed", "error", err)
+		return
+	}
+	start := time.Now()
+	_, err = conn.ExecContext(ctx, `REFRESH MATERIALIZED VIEW CONCURRENTLY category_stats`)
+	if err != nil {
+		if isMatviewNotPopulated(err) {
+			// First run: seed with a plain (locking) refresh. The matview is empty
+			// and unqueried at this point, so the brief ACCESS EXCLUSIVE lock is a
+			// no-op for readers (the handler returns an empty list until now).
+			if _, seedErr := conn.ExecContext(ctx, `REFRESH MATERIALIZED VIEW category_stats`); seedErr != nil {
+				slog.Warn("db: category_stats initial refresh failed", "error", seedErr)
+				return
+			}
+			slog.Info("db: category_stats populated (initial seed)", "took", time.Since(start))
+			return
+		}
+		slog.Warn("db: category_stats refresh failed", "error", err)
+		return
+	}
+	slog.Debug("db: category_stats refreshed", "took", time.Since(start))
+}
+
+// isMatviewNotPopulated reports whether err is Postgres' "materialized view has
+// not been populated" / "CONCURRENTLY cannot be used when ... not populated"
+// condition (SQLSTATE 55000). category_stats is created WITH NO DATA, so the first
+// CONCURRENTLY refresh hits this until a plain REFRESH seeds it.
+func isMatviewNotPopulated(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "55000" && strings.Contains(pqErr.Message, "populated")
+	}
+	return strings.Contains(err.Error(), "not populated") || strings.Contains(err.Error(), "not been populated")
 }
 
 // completenessBackfillVersion gates the one-time completeness_score backfill.

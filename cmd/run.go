@@ -118,6 +118,12 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		// WPHeader, Organization-without-niche, …). Backup-first, batched,
 		// version-gated → no-op after first run. Manager-only, non-blocking.
 		go db.BackfillSchemaTypeDenylist(ctx, database)
+
+		// Keep the category_stats matview fresh so /api/v2/results/categories reads
+		// precomputed counts instead of the live aggregation that blew the 5s API
+		// budget at scale. Manager-only, non-blocking (seeds on boot, refreshes on
+		// a ticker).
+		go db.RefreshCategoryStatsLoop(ctx, database)
 	}
 
 	// Start pipeline stages in background (skip for "none" — API only mode).

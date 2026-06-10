@@ -183,6 +183,22 @@ func isStatementTimeout(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "statement timeout")
 }
 
+// isMatviewNotPopulated reports whether err is Postgres' "materialized view has
+// not been populated" condition (SQLSTATE 55000, object_not_in_prerequisite_state).
+// category_stats is created WITH NO DATA, so reads return this until the manager's
+// first REFRESH seeds it. The categories handler treats it as "warming up" and
+// returns an empty list instead of a 500.
+func isMatviewNotPopulated(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "55000" && strings.Contains(pqErr.Message, "populated")
+	}
+	return strings.Contains(err.Error(), "not populated") || strings.Contains(err.Error(), "not been populated")
+}
+
 // handleV2ListResults returns paginated business listings with full email info.
 // Two-query strategy: listings first, then batch email fetch.
 func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
@@ -533,17 +549,26 @@ func (s *Server) handleV2Categories(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 	tx.ExecContext(ctx, "SET LOCAL statement_timeout = '5000'")
 
+	// Read precomputed counts from the category_stats materialized view (refreshed
+	// off the request path by the manager's RefreshCategoryStatsLoop). The live
+	// aggregation — business_listings (1.2M) ⋈ business_emails (4.3M), GROUP BY
+	// 130K+ free-text categories with 2× COUNT(DISTINCT) — blew past the 5s budget
+	// and returned 500s (Invariant #2).
 	rows, err := tx.QueryContext(ctx, `
-		SELECT bl.category, COUNT(DISTINCT bl.id) AS biz_count,
-		       COUNT(DISTINCT be.email_id) AS email_count
-		FROM business_listings bl
-		LEFT JOIN business_emails be ON be.business_id = bl.id
-		WHERE bl.category IS NOT NULL AND bl.category != ''
-		GROUP BY bl.category
+		SELECT category, biz_count, email_count
+		FROM category_stats
 		ORDER BY biz_count DESC
 		LIMIT 100
 	`)
 	if err != nil {
+		// Before the first background refresh the matview is unpopulated (WITH NO
+		// DATA → SQLSTATE 55000). That's a transient warm-up state, not a failure:
+		// return an empty list with 200 so the dashboard renders cleanly.
+		if isMatviewNotPopulated(err) {
+			_ = tx.Rollback()
+			writeV2Single(w, []V2CategoryStats{})
+			return
+		}
 		slog.Error("v2: categories error", "error", err)
 		writeV2Error(w, http.StatusInternalServerError, "internal_error", "failed to fetch categories")
 		return
