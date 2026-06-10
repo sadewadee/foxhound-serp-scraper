@@ -587,6 +587,11 @@ func runMigrations(db *sql.DB) error {
 		        -- off_niche
 		        CASE
 		          WHEN NEW.raw_category IS NOT NULL AND LENGTH(NEW.raw_category) > 100 THEN TRUE
+		          -- 2026-06-11 (v0.9.8 broad-wellness scope): off-target beauty/grooming
+		          -- (nail, barber, esthetician, …) is ALWAYS off_niche, even if the page
+		          -- also mentions a wellness keyword. Kept in sync with niche.go
+		          -- beautyOffNichePattern + BackfillNicheTaxonomyV2.
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(nail salon|manicure|pedicure|esthetic|aesthetic|beautician|cosmetolog|barber|hairdress|hair salon|makeup|make-up|eyelash|lash extension|eyebrow|microblad|waxing salon|tattoo)' THEN TRUE
 		          WHEN NEW.raw_category IN (
 		            'AutoDealer','Hotel','Restaurant','Dentist','Physician',
 		            'RealEstateAgent','LegalService','HairSalon','BeautySalon',
@@ -620,7 +625,7 @@ func runMigrations(db *sql.DB) error {
 		            'FoodEstablishment','RadioStation',' ',''
 		          ) AND LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
 		                      COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                      COALESCE(NEW.raw_description,'')) !~ '\myoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti|pilates|reformer|crossfit|bootcamp|hiit|barre|spin|gym|fitness|meditation|mindfulness|breathwork|reiki|sound healing|energy healing|healing|ayurved|spa|massage|thermal|wellness|holistic\M' THEN TRUE
+		                      COALESCE(NEW.raw_description,'')) !~ '\myoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti|pilates|reformer|crossfit|bootcamp|hiit|barre|spin|gym|fitness|meditation|mindfulness|breathwork|reiki|sound healing|energy healing|healing|ayurved|spa|massage|thermal|personal train|strength coach|conditioning coach|functional train|kickbox|boxing|martial art|swimming|zumba|pole danc|pole fit|pole instructor|dance|osteopath|physiotherap|physical therap|chiropract|acupunctur|craniosacral|reflexolog|kinesiolog|hypnotherap|psychotherap|counsel|dietit|dietician|nutrition|naturopath|herbal|homeopath|homoeopath|life coach|health coach|mindset coach|wellness|holistic\M' THEN TRUE
 		          ELSE FALSE
 		        END,
 		        -- niche_category
@@ -637,6 +642,7 @@ func runMigrations(db *sql.DB) error {
 		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
 		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
 		                     COALESCE(NEW.raw_description,'')) ~ '\m(gym|fitness)\M' THEN 'fitness'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(personal train|strength coach|conditioning coach|functional train|kickbox|boxing|martial art|swimming|zumba|pole danc|pole fit|pole instructor|dance)' THEN 'fitness'
 		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
 		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
 		                     COALESCE(NEW.raw_description,'')) ~ '\mmeditation|mindfulness|breathwork\M' THEN 'meditation'
@@ -652,6 +658,13 @@ func runMigrations(db *sql.DB) error {
 		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
 		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
 		                     COALESCE(NEW.raw_description,'')) ~ '\m(wellness|holistic)\M' THEN 'wellness'
+		          -- 2026-06-11 (v0.9.8 broad-wellness scope) — health-adjacent buckets.
+		          -- Kept in lockstep with niche.go nicheBuckets + the test.
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(osteopath|physiotherap|physical therap|chiropract|acupunctur|craniosacral|reflexolog|kinesiolog)' THEN 'bodywork'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(hypnotherap|psychotherap|counsel)' THEN 'therapy'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(dietit|dietician|nutrition)' THEN 'nutrition'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(naturopath|herbal|homeopath|homoeopath)' THEN 'naturopathy'
+		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(life coach|health coach|mindset coach)' THEN 'coaching'
 		          ELSE NULL
 		        END,
 		        -- country_code (v4 FK-ready ISO-2): page extraction resolved via the

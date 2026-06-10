@@ -150,6 +150,10 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 			// Niche lineage: fill niche_category for active page-unclassified
 			// listings from their source query text (same buckets as the trigger).
 			db.BackfillListingNicheInherit(ctx, database)
+			// v0.9.8 broad-wellness taxonomy: off_niche off-target beauty, and
+			// bucket the expanded health/fitness niches (bodywork/therapy/nutrition/
+			// naturopathy/coaching) for rows the first pass left NULL.
+			db.BackfillNicheTaxonomyV2(ctx, database)
 		}()
 	}
 

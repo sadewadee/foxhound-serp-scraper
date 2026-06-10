@@ -44,11 +44,27 @@ func TestNicheInherit_ClassifiesQueryText(t *testing.T) {
 		{"holistic wellness center sedona", "wellness"},
 		// Precedence: yoga checked before everything else.
 		{"yoga and pilates studio bali", "yoga"},
-		// PersonalNiches with no bucket → NULL (left for the product decision).
-		{"hypnotherapist london contact", ""},
-		{"personal trainer manchester email", ""},
-		{"health coach sydney \"@gmail.com\"", ""},
-		{"life coach toronto contact", ""},
+		// v0.9.8 broad-wellness buckets (health-adjacent + broadened fitness).
+		{"osteopath clinic berlin contact", "bodywork"},
+		{"physiotherapist san diego instagram", "bodywork"},
+		{"acupuncturist mombasa email", "bodywork"},
+		{"craniosacral therapist bucharest reviews", "bodywork"},
+		{"hypnotherapist london contact", "therapy"},
+		{"psychotherapist dublin email", "therapy"},
+		{"dietitian antalya instagram email", "nutrition"},
+		{"nutritionist sydney \"@gmail.com\"", "nutrition"},
+		{"naturopath vancouver contact", "naturopathy"},
+		{"herbalist fremantle best rated", "naturopathy"},
+		{"homeopath incheon reviews", "naturopathy"},
+		{"life coach toronto contact", "coaching"},
+		{"health coach sydney \"@gmail.com\"", "coaching"},
+		{"personal trainer manchester email", "fitness"},
+		{"conditioning coach palawan", "fitness"},
+		{"kickboxing instructor lodz", "fitness"},
+		{"zumba instructor belfast instagram", "fitness"},
+		// Genuinely bucket-less long tail still resolves to NULL.
+		{"doula portland contact", ""},
+		{"midwife galway email", ""},
 		// Defensive: pure city/operator with no niche resolves to NULL.
 		{"contact email jakarta", ""},
 	}
@@ -70,13 +86,43 @@ func TestNicheInherit_AyurvedaPrefixMatches(t *testing.T) {
 	}
 }
 
+func TestBeautyOffNichePattern(t *testing.T) {
+	// Translate Postgres \m → Go \b for the test (mirror of the SQL ~ usage).
+	goPat := `(?i)` + strings.ReplaceAll(beautyOffNichePattern, `\m`, `\b`)
+	r := regexp.MustCompile(goPat)
+	offTarget := []string{
+		"nail salon in fort lauderdale reviews",
+		"esthetician the hague contact classes",
+		"barbershop near sydney contact",
+		"hairdresser glasgow email",
+		"makeup artist dubai instagram",
+		"microblading studio austin",
+		"tattoo parlour berlin",
+	}
+	for _, s := range offTarget {
+		if !r.MatchString(strings.ToLower(s)) {
+			t.Errorf("expected %q to match beauty off-niche pattern", s)
+		}
+		// Off-target rows must NOT land in a niche bucket (they get off_niche'd).
+		if got := classifyNicheGo(s); got != "" {
+			t.Errorf("beauty %q unexpectedly bucketed as %q", s, got)
+		}
+	}
+	// In-niche must NOT trip the beauty filter.
+	for _, s := range []string{"yoga studio jakarta", "naturopath vancouver", "day spa phuket"} {
+		if r.MatchString(strings.ToLower(s)) {
+			t.Errorf("in-niche %q wrongly matched beauty pattern", s)
+		}
+	}
+}
+
 func TestBuildNicheCaseSQL_ShapeAndCoverage(t *testing.T) {
 	sql := buildNicheCaseSQL("LOWER(q.text)")
 	if !strings.HasPrefix(sql, "CASE") || !strings.HasSuffix(sql, "ELSE NULL END") {
 		t.Fatalf("unexpected CASE shape: %q", sql)
 	}
 	// Every distinct bucket label must appear as a THEN target.
-	for _, want := range []string{"yoga", "pilates", "fitness", "meditation", "healing", "ayurveda", "spa", "wellness"} {
+	for _, want := range []string{"yoga", "pilates", "fitness", "meditation", "healing", "ayurveda", "spa", "wellness", "bodywork", "therapy", "nutrition", "naturopathy", "coaching"} {
 		if !strings.Contains(sql, "THEN '"+want+"'") {
 			t.Errorf("CASE missing bucket %q: %s", want, sql)
 		}
