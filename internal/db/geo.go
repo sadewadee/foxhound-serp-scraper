@@ -286,6 +286,18 @@ func BackfillListingGeoInherit(ctx context.Context, db *sql.DB) {
 		}
 		return
 	}
+	// Gate on the queries backfill having completed a CLEAN pass — inheriting
+	// from partially-filled queries and recording done would permanently skip
+	// the listings whose queries got geo later (exactly what happened on the
+	// v0.9.5 boot: the queries pass died at window 3.35M, inherit still ran and
+	// recorded; the version row had to be cleared by hand to re-run it).
+	var queriesDone bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, queryGeoBackfillVersion,
+	).Scan(&queriesDone); err != nil || !queriesDone {
+		slog.Info("db: listing geo inherit deferred — query geo backfill not complete yet (runs next boot)")
+		return
+	}
 
 	var minID, maxID sql.NullInt64
 	if err := db.QueryRowContext(ctx, `SELECT MIN(id), MAX(id) FROM business_listings`).Scan(&minID, &maxID); err != nil || !maxID.Valid {
