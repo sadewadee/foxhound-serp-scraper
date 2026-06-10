@@ -146,9 +146,12 @@ func (a *Auth) AuthenticateByKey(apiKey string) (*User, error) {
 // Supports: Bearer token, x-api-key header.
 func (a *Auth) AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health check and login.
+		// Skip auth for health check, login, and the API docs (the spec holds
+		// no secrets; the Swagger UI "Authorize" button is how operators supply
+		// credentials for try-it-out calls).
 		if r.URL.Path == "/api/health" || r.URL.Path == "/api/v2/health" ||
-			r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/v2/auth/login" {
+			r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/v2/auth/login" ||
+			r.URL.Path == "/api/docs" || r.URL.Path == "/api/openapi.yaml" {
 			next.ServeHTTP(w, r)
 			return
 		}

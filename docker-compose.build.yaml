@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.5-niche localhost:32769/foxhound-serp-scraper:v0.9.5-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.5-niche
+#   hachibi: docker tag …:v0.9.6-niche localhost:32769/foxhound-serp-scraper:v0.9.6-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.6-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.5-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.6-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -122,15 +122,30 @@
 #     BOTH the full name (Indonesia) and ISO-2 (ID).
 #   All trigger/insert SQL pre-validated against prod PG15 via session-scoped
 #   pg_temp objects (zero footprint).
+# v0.9.6-niche = v0.9.5 + Swagger docs + geo-backfill hardening:
+#   • NEW GET /api/docs (Swagger UI) + GET /api/openapi.yaml (OpenAPI 3.0 spec,
+#     embedded at build time so served docs always match the binary). Both
+#     public (auth-skip alongside /api/health); spec covers v1+v2 surfaces,
+#     both auth schemes, all /api/v2/results filters, and the v0.9.5 geo
+#     fields (country_code, geo_source).
+#   • Geo backfills now RETRY transient lock conflicts (40P01/40001/55P03,
+#     3 attempts, linear backoff) and CONTINUE past a persistently failed
+#     window instead of aborting the pass; version recorded only on a clean
+#     pass so skipped windows re-walk next boot. (v0.9.5 first pass died at
+#     window 3.35M on a deadlock with 1.48M/3.45M queries filled — this boot
+#     resumes and completes it.)
+#   • Removed the superseded one-shot "geo_recovery_listings_country"
+#     unbatched boot-path migration (already recorded as a no-op in prod;
+#     BackfillListingGeoInherit is the real implementation).
 #
-# Deploy: set IMAGE_TAG=v0.9.5-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.9.6-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.5-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.6-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]

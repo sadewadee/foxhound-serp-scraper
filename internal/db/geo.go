@@ -29,13 +29,53 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	pq "github.com/lib/pq"
 )
+
+// isRetryableLockErr reports whether err is a transient lock-conflict error
+// worth retrying: deadlock (40P01), serialization failure (40001), or
+// lock-not-available (55P03). queries/business_listings are write-hot, so a
+// backfill UPDATE can lose a lock race with worker status updates — the
+// v0.9.5 first pass died at window lo=3.35M on a 40P01 after 1.48M rows.
+func isRetryableLockErr(err error) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "40P01" || pqErr.Code == "40001" || pqErr.Code == "55P03"
+	}
+	return false
+}
+
+// execWindowRetry executes one id-window statement, retrying transient lock
+// conflicts up to 3 times with linear backoff. Returns rows affected.
+func execWindowRetry(ctx context.Context, conn *sql.Conn, query string, args ...any) (int64, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		res, err := conn.ExecContext(ctx, query, args...)
+		if err == nil {
+			n, _ := res.RowsAffected()
+			return n, nil
+		}
+		lastErr = err
+		if !isRetryableLockErr(err) || ctx.Err() != nil {
+			return 0, err
+		}
+		slog.Warn("db: geo backfill window lock conflict — retrying", "attempt", attempt, "error", err)
+		select {
+		case <-ctx.Done():
+			return 0, err
+		case <-time.After(time.Duration(attempt) * 2 * time.Second):
+		}
+	}
+	return 0, lastErr
+}
 
 // Country is one row of the countries lookup (ISO-3166-1 alpha-2).
 type Country struct {
@@ -184,8 +224,9 @@ func BackfillQueryGeo(ctx context.Context, db *sql.DB, rows []GeoCity) {
 	slog.Info("db: query geo backfill starting (background, id-windowed)",
 		"min_id", minID.Int64, "max_id", maxID.Int64, "window", window)
 	var total int64
+	var failedWindows int
 	for lo := minID.Int64 - 1; lo < maxID.Int64; lo += window {
-		res, err := conn.ExecContext(ctx, `
+		n, err := execWindowRetry(ctx, conn, `
 			UPDATE queries q
 			SET country = g.country_code, city = g.city, updated_at = NOW()
 			FROM geo_cities g
@@ -194,10 +235,16 @@ func BackfillQueryGeo(ctx context.Context, db *sql.DB, rows []GeoCity) {
 			  AND g.city_lower = (regexp_match(lower(q.text), $3))[1]
 		`, lo, lo+window, alternation)
 		if err != nil {
-			slog.Warn("db: query geo backfill window failed — resumes next boot", "lo", lo, "error", err, "filled_so_far", total)
-			return
+			// Skip this window, keep going — the pass is only recorded as done
+			// when every window succeeded, so skipped windows are re-walked on
+			// the next boot (cheap: country='' rows only).
+			failedWindows++
+			slog.Warn("db: query geo backfill window failed after retries — continuing", "lo", lo, "error", err, "filled_so_far", total)
+			if ctx.Err() != nil {
+				return
+			}
+			continue
 		}
-		n, _ := res.RowsAffected()
 		total += n
 		select {
 		case <-ctx.Done():
@@ -205,6 +252,11 @@ func BackfillQueryGeo(ctx context.Context, db *sql.DB, rows []GeoCity) {
 			return
 		case <-time.After(100 * time.Millisecond): // gentle pacing between windows
 		}
+	}
+	if failedWindows > 0 {
+		slog.Warn("db: query geo backfill pass partial — version NOT recorded, re-walks next boot",
+			"failed_windows", failedWindows, "filled_this_pass", total)
+		return
 	}
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
@@ -256,8 +308,9 @@ func BackfillListingGeoInherit(ctx context.Context, db *sql.DB) {
 	slog.Info("db: listing geo inherit starting (background, id-windowed)",
 		"min_id", minID.Int64, "max_id", maxID.Int64, "window", window)
 	var total int64
+	var failedWindows int
 	for lo := minID.Int64 - 1; lo < maxID.Int64; lo += window {
-		res, err := conn.ExecContext(ctx, `
+		n, err := execWindowRetry(ctx, conn, `
 			UPDATE business_listings bl
 			SET country      = c.name,
 			    country_code = q.country,
@@ -272,10 +325,13 @@ func BackfillListingGeoInherit(ctx context.Context, db *sql.DB) {
 			  AND COALESCE(q.country, '') <> ''
 		`, lo, lo+window)
 		if err != nil {
-			slog.Warn("db: listing geo inherit window failed — resumes next boot", "lo", lo, "error", err, "filled_so_far", total)
-			return
+			failedWindows++
+			slog.Warn("db: listing geo inherit window failed after retries — continuing", "lo", lo, "error", err, "filled_so_far", total)
+			if ctx.Err() != nil {
+				return
+			}
+			continue
 		}
-		n, _ := res.RowsAffected()
 		total += n
 		select {
 		case <-ctx.Done():
@@ -283,6 +339,11 @@ func BackfillListingGeoInherit(ctx context.Context, db *sql.DB) {
 			return
 		case <-time.After(100 * time.Millisecond):
 		}
+	}
+	if failedWindows > 0 {
+		slog.Warn("db: listing geo inherit pass partial — version NOT recorded, re-walks next boot",
+			"failed_windows", failedWindows, "filled_this_pass", total)
+		return
 	}
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
@@ -331,8 +392,9 @@ func BackfillListingCountryCode(ctx context.Context, db *sql.DB) {
 
 	const window = int64(50000)
 	var total int64
+	var failedWindows int
 	for lo := minID.Int64 - 1; lo < maxID.Int64; lo += window {
-		res, err := conn.ExecContext(ctx, `
+		n, err := execWindowRetry(ctx, conn, `
 			UPDATE business_listings bl
 			SET country_code = c.code
 			FROM countries c
@@ -342,10 +404,13 @@ func BackfillListingCountryCode(ctx context.Context, db *sql.DB) {
 			  AND LOWER(c.name) = LOWER(bl.country)
 		`, lo, lo+window)
 		if err != nil {
-			slog.Warn("db: listing country_code backfill window failed — resumes next boot", "lo", lo, "error", err, "filled_so_far", total)
-			return
+			failedWindows++
+			slog.Warn("db: listing country_code backfill window failed after retries — continuing", "lo", lo, "error", err, "filled_so_far", total)
+			if ctx.Err() != nil {
+				return
+			}
+			continue
 		}
-		n, _ := res.RowsAffected()
 		total += n
 		select {
 		case <-ctx.Done():
@@ -353,6 +418,11 @@ func BackfillListingCountryCode(ctx context.Context, db *sql.DB) {
 			return
 		case <-time.After(100 * time.Millisecond):
 		}
+	}
+	if failedWindows > 0 {
+		slog.Warn("db: listing country_code backfill pass partial — version NOT recorded, re-walks next boot",
+			"failed_windows", failedWindows, "filled_this_pass", total)
+		return
 	}
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,

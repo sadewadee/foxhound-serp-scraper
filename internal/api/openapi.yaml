@@ -1,0 +1,743 @@
+openapi: 3.0.3
+info:
+  title: Foxhound SERP Scraper API
+  description: |
+    REST API for the distributed SERP scraping + business-contact enrichment pipeline.
+
+    Two parallel surfaces:
+    - **v1** (`/api/*`) — bare-shape responses: `{...}` on success, `{"error":"message"}` on failure.
+    - **v2** (`/api/v2/*`) — envelope responses: `{"data": ...}` on success, `{"error":{"code":"…","message":"…"}}` on failure.
+
+    **Roles**: `admin` (full mutations) and `viewer` (GET-only). Authenticate with
+    `Authorization: Bearer <token>` (from the login endpoints) or a static `x-api-key` header.
+
+    **Geo conventions (v0.9.5+)**: listing `country` carries the legacy full name
+    ("Indonesia"); `country_code` is ISO-3166-1 alpha-2 ("ID"); `geo_source` is empty for
+    page-extracted geo and `query_inference` when inherited from the originating search query.
+  version: 0.9.6
+servers:
+  - url: https://serpina.kremlit.dev
+    description: Production (manager)
+  - url: http://localhost:8080
+    description: Local
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+tags:
+  - name: auth
+    description: Login + token refresh (v1 and v2)
+  - name: results-v2
+    description: Enriched business listings (v2 envelope)
+  - name: queries-v2
+    description: Search-query seeding and management (v2 envelope)
+  - name: stats-v2
+    description: Dashboard statistics (v2 envelope)
+  - name: contacts-v1
+    description: Legacy v1 contact endpoints (bare shapes)
+  - name: queries-v1
+    description: Legacy v1 query endpoints (bare shapes)
+  - name: pipeline-v1
+    description: Pipeline operations and debugging (v1)
+  - name: health
+    description: Liveness/readiness (no auth)
+
+paths:
+  /api/health:
+    get:
+      tags: [health]
+      summary: v1 health check
+      security: []
+      responses:
+        "200":
+          description: Component status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  postgres: { type: string, example: ok }
+                  redis: { type: string, example: ok }
+
+  /api/v2/health:
+    get:
+      tags: [health]
+      summary: v2 health check
+      security: []
+      responses:
+        "200":
+          description: Component status (v2 envelope)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      status: { type: string, example: ok }
+                      postgres: { type: string, example: ok }
+                      redis: { type: string, example: ok }
+
+  /api/auth/login:
+    post:
+      tags: [auth]
+      summary: v1 login — exchange username + api key for a bearer token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Token pair
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "401": { $ref: "#/components/responses/V1Error" }
+
+  /api/auth/refresh:
+    post:
+      tags: [auth]
+      summary: v1 token refresh
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "401": { $ref: "#/components/responses/V1Error" }
+
+  /api/v2/auth/login:
+    post:
+      tags: [auth]
+      summary: v2 login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Token pair (v2 envelope)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/TokenResponse" }
+        "401": { $ref: "#/components/responses/V2Error" }
+
+  /api/v2/auth/refresh:
+    post:
+      tags: [auth]
+      summary: v2 token refresh
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: New token pair (v2 envelope)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/TokenResponse" }
+        "401": { $ref: "#/components/responses/V2Error" }
+
+  /api/v2/results:
+    get:
+      tags: [results-v2]
+      summary: List enriched business listings (paginated, filterable)
+      description: |
+        Two pagination modes: classic `page`/`per_page` OFFSET, or keyset via the opaque
+        `cursor` returned as `next_cursor` (only emitted for the default `id_desc` ordering).
+        Deep OFFSET pages that would blow the statement timeout return `400 offset_too_deep` —
+        switch to the cursor. `off_niche` rows are excluded unless `include_off_niche=true`.
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+        - { name: cursor, in: query, schema: { type: string }, description: "Opaque keyset cursor from next_cursor (id_desc only)" }
+        - { name: sort, in: query, schema: { type: string, enum: [id_desc, id_asc, updated_desc, updated_asc, created_desc, created_asc] } }
+        - { name: domain, in: query, schema: { type: string }, description: Exact domain match }
+        - { name: search, in: query, schema: { type: string }, description: business_name ILIKE substring }
+        - { name: has_email, in: query, schema: { type: boolean } }
+        - { name: email, in: query, schema: { type: string }, description: Exact email match }
+        - { name: email_provider, in: query, schema: { type: string, example: gmail.com }, description: After-@ domain of any linked email }
+        - { name: email_status, in: query, schema: { type: string }, description: Validation status of any linked email }
+        - { name: country, in: query, schema: { type: string }, description: "Full name (Indonesia) OR ISO-2 (ID), case-insensitive" }
+        - { name: city, in: query, schema: { type: string }, description: Prefix match, case-insensitive }
+        - { name: has_phone, in: query, schema: { type: boolean } }
+        - { name: has_social, in: query, schema: { type: boolean } }
+        - { name: include_off_niche, in: query, schema: { type: boolean, default: false } }
+        - { name: niche, in: query, schema: { type: string, enum: [yoga, pilates, fitness, meditation, healing, ayurveda, spa, wellness] } }
+        - { name: category, in: query, schema: { type: string }, description: Exact raw-category match }
+        - { name: source, in: query, schema: { type: string, example: enrichment }, description: Email source label }
+      responses:
+        "200":
+          description: Page of listings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/BusinessListing" }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+        "400": { $ref: "#/components/responses/V2Error" }
+        "500": { $ref: "#/components/responses/V2Error" }
+    delete:
+      tags: [results-v2]
+      summary: Delete listings (admin)
+      description: Admin-only bulk delete with filters mirroring the list endpoint.
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      deleted: { type: integer }
+        "403": { $ref: "#/components/responses/V2Error" }
+
+  /api/v2/results/stats:
+    get:
+      tags: [results-v2]
+      summary: Aggregate stats over (filtered) listings
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, additionalProperties: true }
+
+  /api/v2/results/count:
+    get:
+      tags: [results-v2]
+      summary: Filtered count (cached 60s)
+      responses:
+        "200":
+          description: Count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      count: { type: integer }
+
+  /api/v2/results/categories:
+    get:
+      tags: [results-v2]
+      summary: Top-100 effective categories with business + email counts
+      description: |
+        Reads the precomputed `category_stats` materialized view (refreshed ~10 min by the
+        manager — not a live aggregation). `category` is the EFFECTIVE category:
+        `niche_category` (classifier bucket) when present, else the raw category.
+        `off_niche` rows are excluded. During first-boot warm-up returns an empty list (200).
+      responses:
+        "200":
+          description: Categories ranked by business_count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/CategoryStats" }
+        "500": { $ref: "#/components/responses/V2Error" }
+
+  /api/v2/results/domains:
+    get:
+      tags: [results-v2]
+      summary: Top domains by email count
+      responses:
+        "200":
+          description: Domains
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        domain: { type: string }
+                        email_count: { type: integer }
+
+  /api/v2/results/download:
+    get:
+      tags: [results-v2]
+      summary: Stream filtered listings as JSON or CSV
+      parameters:
+        - { name: format, in: query, required: true, schema: { type: string, enum: [json, csv] } }
+      responses:
+        "200":
+          description: |
+            `json` → streaming array of BusinessListing; `csv` → header
+            `id,business_name,category,domain,website,address,location,phone,emails,email_count,valid_email_count,created_at`
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/BusinessListing" }
+            text/csv:
+              schema: { type: string }
+
+  /api/v2/stats:
+    get:
+      tags: [stats-v2]
+      summary: Dashboard statistics
+      responses:
+        "200":
+          description: Dashboard aggregate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object, additionalProperties: true }
+
+  /api/v2/queries:
+    get:
+      tags: [queries-v2]
+      summary: List search queries
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, default: 20 } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, processing, completed, error] } }
+        - { name: search, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Page of queries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Query" }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+    post:
+      tags: [queries-v2]
+      summary: Create queries (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                queries:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Insert result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      inserted: { type: integer }
+                      duplicates: { type: integer }
+        "403": { $ref: "#/components/responses/V2Error" }
+    delete:
+      tags: [queries-v2]
+      summary: Delete queries by ids (admin)
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      deleted: { type: integer }
+        "403": { $ref: "#/components/responses/V2Error" }
+
+  /api/v2/queries/generate:
+    post:
+      tags: [queries-v2]
+      summary: Generate wellness keyword queries (admin)
+      description: Country-targeted generation from the built-in niche × city × template matrix.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                country: { type: string, example: Indonesia, description: "Cities-map country name or \"all\"" }
+                niche: { type: string, example: yoga }
+      responses:
+        "200":
+          description: Generation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      generated: { type: integer }
+                      inserted: { type: integer }
+        "403": { $ref: "#/components/responses/V2Error" }
+
+  /api/v2/queries/retry:
+    post:
+      tags: [queries-v2]
+      summary: Retry errored queries (admin)
+      responses:
+        "200":
+          description: Retry result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      retried: { type: integer }
+        "403": { $ref: "#/components/responses/V2Error" }
+
+  /api/contacts:
+    get:
+      tags: [contacts-v1]
+      summary: List contacts (v1 bare shape)
+      parameters:
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: per_page, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: "List shape: {data, total, page, per_page}"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { type: object, additionalProperties: true } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  per_page: { type: integer }
+    delete:
+      tags: [contacts-v1]
+      summary: Delete contacts (admin)
+      responses:
+        "200": { description: Deletion result }
+        "403": { $ref: "#/components/responses/V1Error" }
+
+  /api/contacts/export:
+    get:
+      tags: [contacts-v1]
+      summary: Export contacts as CSV
+      responses:
+        "200":
+          description: CSV stream
+          content:
+            text/csv:
+              schema: { type: string }
+
+  /api/contacts/stats:
+    get:
+      tags: [contacts-v1]
+      summary: Contact statistics
+      responses:
+        "200":
+          description: Stats object
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /api/domains:
+    get:
+      tags: [contacts-v1]
+      summary: List domains (v1 — bare array)
+      responses:
+        "200":
+          description: Array of domains
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+
+  /api/categories:
+    get:
+      tags: [contacts-v1]
+      summary: List categories (v1 — bare array)
+      responses:
+        "200":
+          description: Array of categories
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+
+  /api/queries:
+    get:
+      tags: [queries-v1]
+      summary: List queries (v1)
+      responses:
+        "200": { description: "List shape: {data, total, page, per_page}" }
+    post:
+      tags: [queries-v1]
+      summary: Create queries (admin, v1)
+      responses:
+        "200": { description: Insert result }
+        "403": { $ref: "#/components/responses/V1Error" }
+    delete:
+      tags: [queries-v1]
+      summary: Delete queries (admin, v1)
+      responses:
+        "200": { description: Deletion result }
+        "403": { $ref: "#/components/responses/V1Error" }
+
+  /api/queries/generate:
+    post:
+      tags: [queries-v1]
+      summary: Generate keyword queries (admin, v1)
+      responses:
+        "200": { description: Generation result }
+        "403": { $ref: "#/components/responses/V1Error" }
+
+  /api/queries/retry:
+    post:
+      tags: [queries-v1]
+      summary: Retry errored queries (admin, v1)
+      responses:
+        "200": { description: Retry result }
+        "403": { $ref: "#/components/responses/V1Error" }
+
+  /api/queries/stats:
+    get:
+      tags: [queries-v1]
+      summary: Query statistics (v1)
+      responses:
+        "200":
+          description: Stats object
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /api/pipeline/stats:
+    get:
+      tags: [pipeline-v1]
+      summary: Pipeline statistics
+      responses:
+        "200":
+          description: Stats object
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /api/pipeline/reset:
+    post:
+      tags: [pipeline-v1]
+      summary: Reset pipeline state (admin)
+      responses:
+        "200": { description: Reset result }
+        "403": { $ref: "#/components/responses/V1Error" }
+
+  /api/dashboard:
+    get:
+      tags: [pipeline-v1]
+      summary: v1 dashboard aggregate
+      responses:
+        "200":
+          description: Dashboard object
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /api/debug/serp-jobs:
+    get:
+      tags: [pipeline-v1]
+      summary: Inspect recent serp_jobs (debug)
+      responses:
+        "200":
+          description: Array of jobs
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+
+  /api/debug/enrich-jobs:
+    get:
+      tags: [pipeline-v1]
+      summary: Inspect recent enrichment_jobs (debug)
+      responses:
+        "200":
+          description: Array of jobs
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Token from /api/auth/login or /api/v2/auth/login
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+
+  responses:
+    V1Error:
+      description: v1 bare error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+    V2Error:
+      description: v2 envelope error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  code: { type: string, example: internal_error }
+                  message: { type: string }
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, api_key]
+      properties:
+        username: { type: string }
+        api_key: { type: string }
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    TokenResponse:
+      type: object
+      properties:
+        token: { type: string }
+        refresh_token: { type: string }
+        expires_at: { type: string, format: date-time }
+        role: { type: string, enum: [admin, viewer] }
+
+    PageMeta:
+      type: object
+      properties:
+        total: { type: integer, description: "-1 when the filtered count timed out" }
+        page: { type: integer }
+        per_page: { type: integer }
+        next_cursor: { type: string, description: Opaque keyset cursor (id_desc ordering only) }
+
+    Query:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        text: { type: string }
+        status: { type: string, enum: [pending, processing, completed, error] }
+        country: { type: string, description: "ISO-3166-1 alpha-2 resolved from the city token (v0.9.5+)", example: ID }
+        city: { type: string, example: Jakarta }
+        result_count: { type: integer }
+        error_msg: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CategoryStats:
+      type: object
+      properties:
+        category: { type: string, example: yoga }
+        business_count: { type: integer }
+        email_count: { type: integer }
+
+    EmailInfo:
+      type: object
+      properties:
+        email: { type: string }
+        domain: { type: string, example: gmail.com }
+        local_part: { type: string }
+        validation_status: { type: string }
+        mx_valid: { type: boolean, nullable: true }
+        deliverable: { type: boolean, nullable: true }
+        disposable: { type: boolean, nullable: true }
+        role_account: { type: boolean, nullable: true }
+        free_email: { type: boolean, nullable: true }
+        catch_all: { type: boolean, nullable: true }
+        reason: { type: string }
+        score: { type: number, nullable: true }
+        is_acceptable: { type: boolean, nullable: true }
+        validated_at: { type: string, format: date-time, nullable: true }
+
+    BusinessListing:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        domain: { type: string }
+        url: { type: string }
+        business_name: { type: string }
+        category: { type: string, description: Raw category (may be a schema.org @type) }
+        niche_category: { type: string, enum: ["", yoga, pilates, fitness, meditation, healing, ayurveda, spa, wellness] }
+        off_niche: { type: boolean }
+        description: { type: string }
+        address: { type: string }
+        location: { type: string }
+        city: { type: string }
+        country: { type: string, description: Full country name (legacy convention), example: Indonesia }
+        country_code: { type: string, description: ISO-3166-1 alpha-2 (v0.9.5+), example: ID }
+        geo_source:
+          type: string
+          description: Empty/absent = page-extracted geo; query_inference = inherited from the source query
+          enum: ["", query_inference]
+        contact_name: { type: string }
+        phone: { type: string }
+        phones: { type: array, items: { type: string } }
+        website: { type: string }
+        page_title: { type: string }
+        social_links: { type: object, additionalProperties: { type: string } }
+        tiktok: { type: string }
+        youtube: { type: string }
+        telegram: { type: string }
+        opening_hours: { type: string }
+        rating: { type: string }
+        source_query_id: { type: integer, format: int64, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        emails: { type: array, items: { type: string } }
+        emails_with_info: { type: array, items: { $ref: "#/components/schemas/EmailInfo" } }
+        total_email_count: { type: integer }
+        valid_email_count: { type: integer }

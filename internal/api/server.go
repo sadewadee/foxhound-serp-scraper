@@ -71,6 +71,10 @@ func (s *Server) registerRoutes() {
 	// Health.
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
 
+	// API documentation (public, like health — see docs.go).
+	s.mux.HandleFunc("GET /api/docs", s.handleSwaggerUI)
+	s.mux.HandleFunc("GET /api/openapi.yaml", s.handleOpenAPISpec)
+
 	// V2 API.
 	s.registerV2Routes()
 }

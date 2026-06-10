@@ -1890,36 +1890,14 @@ func runMigrations(db *sql.DB) error {
 	}
 
 	// -------------------------------------------------------------------------
-	// 2026-06-10 v0.9.5 — Geo-recovery Phase 2: inherit country from source query
-	// to business_listings via source_query_id lineage.
-	//
-	// Now that queries.country is populated, we can fill empty business_listings.country
-	// by joining on source_query_id. This recovers ~581K rows (ceiling).
-	// -------------------------------------------------------------------------
-	const geoRecoveryListingsCountryVersion = "2026_06_10_geo_recovery_listings_country"
-	var geoListingsDone bool
-	if err := db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, geoRecoveryListingsCountryVersion,
-	).Scan(&geoListingsDone); err == nil && !geoListingsDone {
-		res, err := db.Exec(`
-			UPDATE business_listings bl
-			SET country = q.country, updated_at = NOW()
-			FROM queries q
-			WHERE bl.source_query_id = q.id
-			  AND (bl.country IS NULL OR bl.country = '')
-			  AND q.country IS NOT NULL
-			  AND q.country != ''
-		`)
-		if err != nil {
-			slog.Warn("db: geo-recovery listings country inherit failed", "error", err)
-		} else {
-			n, _ := res.RowsAffected()
-			slog.Info("db: geo-recovery listings country inherited", "rows_updated", n)
-			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
-				geoRecoveryListingsCountryVersion,
-				"inherit country to business_listings from source_query via source_query_id lineage (~581K rows)")
-		}
-	}
+	// NOTE (2026-06-10): an earlier draft migration here
+	// ("2026_06_10_geo_recovery_listings_country") inherited bl.country from
+	// queries in ONE unbatched boot-path UPDATE. It is superseded by the
+	// background, id-windowed BackfillListingGeoInherit in geo.go (which also
+	// sets country_code + geo_source and writes the full-name convention). The
+	// version is already recorded in prod (it ran as a no-op before
+	// queries.country was populated), so the block was removed rather than
+	// shipped to fresh deploys.
 
 	return nil
 }
