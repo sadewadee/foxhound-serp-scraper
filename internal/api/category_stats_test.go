@@ -26,6 +26,11 @@ func TestIsMatviewNotPopulated(t *testing.T) {
 	if isMatviewNotPopulated(&pq.Error{Code: "0A000", Message: "some other unsupported feature"}) {
 		t.Error("an unrelated 0A000 without 'populated' must NOT classify as not-populated")
 	}
+	// During the versioned DROP+recreate migration the matview briefly doesn't
+	// exist — the handler must treat that window as warm-up, not a 500.
+	if !isMatviewNotPopulated(&pq.Error{Code: "42P01", Message: `relation "category_stats" does not exist`}) {
+		t.Error("pq 42P01 (undefined_table) should classify as not-populated (migration window)")
+	}
 	if isMatviewNotPopulated(&pq.Error{Code: "57014"}) {
 		t.Error("statement timeout (57014) must NOT classify as not-populated")
 	}

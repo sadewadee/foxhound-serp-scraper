@@ -199,6 +199,11 @@ func isMatviewNotPopulated(err error) bool {
 	}
 	var pqErr *pq.Error
 	if errors.As(err, &pqErr) {
+		// 42P01 (undefined_table): the matview briefly doesn't exist while a
+		// versioned migration DROPs + recreates it — same warm-up semantics.
+		if pqErr.Code == "42P01" {
+			return true
+		}
 		return (pqErr.Code == "55000" || pqErr.Code == "0A000") && strings.Contains(pqErr.Message, "populated")
 	}
 	return strings.Contains(err.Error(), "not populated") || strings.Contains(err.Error(), "not been populated")

@@ -13,6 +13,32 @@ import (
 	pq "github.com/lib/pq"
 )
 
+// categoryStatsSelect is the SINGLE source of truth for the category_stats
+// materialized view body — referenced by BOTH the boot schema (fresh deploys)
+// and the versioned redefinition migration in runMigrations (existing deploys),
+// so the two definitions can never drift (the 2026-05-25 trigger-vs-backfill
+// drift class).
+//
+// Semantics: the consumer-facing category browse list.
+//   - effective category = COALESCE(niche_category, category): the keyword
+//     classifier's bucket (yoga/pilates/fitness/spa/...) when it matched,
+//     else the raw category (real text from directory sources like
+//     "yoga studio", "bikram yoga" — or a schema.org @type for rows the
+//     classifier couldn't bucket).
+//   - off_niche rows are EXCLUDED — schema.org content junk (Article,
+//     FAQPage, ...) and known off-niche business types (Hotel, AutoDealer,
+//     ...) never reach the list; the trigger + backfills maintain the flag.
+const categoryStatsSelect = `
+    SELECT COALESCE(NULLIF(bl.niche_category, ''), bl.category) AS category,
+           COUNT(DISTINCT bl.id) AS biz_count,
+           COUNT(DISTINCT be.email_id) AS email_count
+    FROM business_listings bl
+    LEFT JOIN business_emails be ON be.business_id = bl.id
+    WHERE bl.off_niche IS NOT TRUE
+      AND COALESCE(NULLIF(bl.niche_category, ''), bl.category) IS NOT NULL
+      AND COALESCE(NULLIF(bl.niche_category, ''), bl.category) != ''
+    GROUP BY 1`
+
 const schema = `
 CREATE TABLE IF NOT EXISTS queries (
     id              BIGSERIAL PRIMARY KEY,
@@ -173,14 +199,9 @@ CREATE TABLE IF NOT EXISTS workers (
 -- materialized and read top-N. Created WITH NO DATA so boot DDL stays instant
 -- (no heavy query under the migrate advisory lock); the manager's
 -- RefreshCategoryStatsLoop seeds and refreshes it off the request path.
-CREATE MATERIALIZED VIEW IF NOT EXISTS category_stats AS
-    SELECT bl.category AS category,
-           COUNT(DISTINCT bl.id) AS biz_count,
-           COUNT(DISTINCT be.email_id) AS email_count
-    FROM business_listings bl
-    LEFT JOIN business_emails be ON be.business_id = bl.id
-    WHERE bl.category IS NOT NULL AND bl.category != ''
-    GROUP BY bl.category
+-- Definition body lives in categoryStatsSelect (shared with the redefinition
+-- migration — keep using the const, never inline a second copy).
+CREATE MATERIALIZED VIEW IF NOT EXISTS category_stats AS` + categoryStatsSelect + `
 WITH NO DATA;
 
 -- Unique index is REQUIRED for REFRESH MATERIALIZED VIEW CONCURRENTLY (so API
@@ -1585,6 +1606,106 @@ func runMigrations(db *sql.DB) error {
 			"flag off_niche from category blacklist + meta-keyword-soup, then classify niche_category from name/title/description",
 		); err != nil {
 			slog.Warn("db: off-niche cleanup version record failed", "error", err)
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-06-10 — heal off_niche drift for the SPECIFIC business-type denylist.
+	// The trigger flags raw_category IN (Hotel, AutoDealer, MedicalBusiness, ...)
+	// unconditionally, but 6,959 active rows created 2026-04/05 predate full
+	// trigger/backfill coverage (the 2026-05-22 one-shot ran before some types
+	// were added — the HealthAndBeautyBusiness drift gotcha — and upsert
+	// COALESCE preserves the old category without re-evaluating the flag).
+	// Verified historical-only: zero drifted rows created after 2026-06-01, so
+	// this one-shot + the existing trigger close the gap completely.
+	// Backup-first per convention; flag-only (off_niche never unset).
+	const offNicheDriftHealVersion = "2026_06_10_offniche_specific_drift_heal"
+	var driftHealDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, offNicheDriftHealVersion,
+	).Scan(&driftHealDone); err == nil && !driftHealDone {
+		// MUST stay in sync with the trigger's first (unconditional) CASE list.
+		const specificOffNicheTypes = `
+			'AutoDealer','Hotel','Restaurant','Dentist','Physician',
+			'RealEstateAgent','LegalService','HairSalon','BeautySalon',
+			'TravelAgency','LodgingBusiness','GeneralContractor',
+			'RoofingContractor','HomeAndConstructionBusiness',
+			'MedicalClinic','MedicalBusiness','HealthAndBeautyBusiness'`
+
+		var toFlag int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM business_listings
+			 WHERE off_niche IS NOT TRUE AND category IN (` + specificOffNicheTypes + `)`,
+		).Scan(&toFlag); err != nil {
+			slog.Warn("db: offniche drift heal pre-count failed — skipping (retries next boot)", "error", err)
+		} else {
+			slog.Info("db: offniche drift heal pre-count", "rows_to_flag", toFlag)
+			if _, err := db.Exec(`
+				CREATE TABLE IF NOT EXISTS business_listings_offniche_drift_backup_20260610 AS
+				SELECT id, category, off_niche, niche_category, updated_at
+				FROM business_listings
+				WHERE off_niche IS NOT TRUE AND category IN (` + specificOffNicheTypes + `)
+			`); err != nil {
+				slog.Warn("db: offniche drift heal backup failed — aborting for safety", "error", err)
+			} else {
+				var backupCount int
+				_ = db.QueryRow(`SELECT COUNT(*) FROM business_listings_offniche_drift_backup_20260610`).Scan(&backupCount)
+				if toFlag > 0 && backupCount == 0 {
+					slog.Warn("db: offniche drift heal backup integrity FAILED — empty backup, aborting")
+				} else {
+					res, err := db.Exec(`
+						UPDATE business_listings SET off_niche = TRUE, updated_at = NOW()
+						WHERE off_niche IS NOT TRUE AND category IN (` + specificOffNicheTypes + `)
+					`)
+					if err != nil {
+						slog.Warn("db: offniche drift heal UPDATE failed — retries next boot", "error", err)
+					} else {
+						n, _ := res.RowsAffected()
+						slog.Info("db: offniche drift heal applied", "flagged", n, "backup_rows", backupCount)
+						db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+							offNicheDriftHealVersion,
+							"flag off_niche=TRUE for active rows with specific off-niche business @types (Hotel, AutoDealer, ...) that predate trigger/backfill coverage")
+					}
+				}
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-06-10 — redefine category_stats with niche-aware consumer semantics
+	// (effective category = COALESCE(niche_category, category), off_niche rows
+	// excluded — see categoryStatsSelect). The v0.9.2 definition aggregated raw
+	// category over ALL rows, so the categories endpoint surfaced schema.org
+	// @type noise (Organization, FAQPage, Article, ...).
+	// DROP here is safe despite the never-DROP rule: a matview is DERIVED,
+	// recomputable data — no source rows are touched, no backup needed. It is
+	// recreated WITH NO DATA (instant under the migrate advisory lock); the
+	// manager's RefreshCategoryStatsLoop re-seeds it within seconds of boot.
+	// The API handler returns an empty 200 (warm-up) for the brief gap.
+	const categoryStatsNicheVersion = "2026_06_10_category_stats_niche_v2"
+	var catStatsV2Done bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, categoryStatsNicheVersion,
+	).Scan(&catStatsV2Done); err == nil && !catStatsV2Done {
+		stmts := []string{
+			`DROP MATERIALIZED VIEW IF EXISTS category_stats`,
+			`CREATE MATERIALIZED VIEW category_stats AS` + categoryStatsSelect + ` WITH NO DATA`,
+			`CREATE UNIQUE INDEX idx_category_stats_category ON category_stats (category)`,
+			`CREATE INDEX idx_category_stats_biz_count ON category_stats (biz_count DESC)`,
+		}
+		migOK := true
+		for _, s := range stmts {
+			if _, err := db.Exec(s); err != nil {
+				slog.Warn("db: category_stats niche redefinition failed", "error", err)
+				migOK = false
+				break
+			}
+		}
+		if migOK {
+			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+				categoryStatsNicheVersion,
+				"redefine category_stats: COALESCE(niche_category, category), exclude off_niche — kill schema.org @type noise in /api/v2/results/categories")
+			slog.Info("db: category_stats niche redefinition applied (matview re-seeds on manager boot)")
 		}
 	}
 

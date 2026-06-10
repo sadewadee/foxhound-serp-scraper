@@ -373,8 +373,13 @@ Query (semua optional, kecuali pagination):
 ### `GET /api/v2/results/categories`
 
 ```json
-{"data":[{"category":"Wellness","business_count":5421,"email_count":3200}]}
+{"data":[{"category":"yoga","business_count":84650,"email_count":173945}]}
 ```
+
+- Sumber: materialized view `category_stats` (precomputed, refresh tiap ~10 menit oleh manager — bukan agregasi live). Top-100 by `business_count`.
+- `category` = kategori EFEKTIF: `niche_category` (bucket classifier: yoga/pilates/fitness/spa/wellness/healing/meditation/ayurveda) kalau ada, fallback ke raw `category` (mis. "yoga studio", "bikram yoga" dari directory source).
+- Baris `off_niche` di-exclude — schema.org @type noise (Organization, FAQPage, Article, Hotel, ...) tidak muncul lagi (v0.9.4).
+- Saat warm-up (boot pertama / migrasi redefinisi) bisa balas `{"data":[]}` 200 sebentar sampai seed refresh selesai — bukan error.
 
 ### `GET /api/v2/results/domains`
 
