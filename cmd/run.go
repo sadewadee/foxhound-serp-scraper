@@ -19,6 +19,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/monitor"
 	"github.com/sadewadee/serp-scraper/internal/pipeline"
+	"github.com/sadewadee/serp-scraper/internal/query"
 	"github.com/sadewadee/serp-scraper/internal/reconciler"
 	"github.com/sadewadee/serp-scraper/internal/telegram"
 	"github.com/sadewadee/serp-scraper/internal/validate"
@@ -124,6 +125,22 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		// budget at scale. Manager-only, non-blocking (seeds on boot, refreshes on
 		// a ticker).
 		go db.RefreshCategoryStatsLoop(ctx, database)
+
+		// Geo lineage (v4 schema direction): seed the countries + geo_cities
+		// reference tables, then run the one-time geo backfills IN ORDER —
+		// queries first (city token in text → ISO-2 country + city), then
+		// listing inheritance from the source query (geo_source =
+		// 'query_inference'), then the legacy full-name → ISO-2 country_code
+		// map. Sequential by design: inheritance reads queries.country.
+		// Manager-only, background, version-gated → no-op after first run.
+		go func() {
+			geoCities := query.GeoCityRows()
+			db.SeedCountries(ctx, database, query.CountryRows())
+			db.SeedGeoCities(ctx, database, geoCities)
+			db.BackfillQueryGeo(ctx, database, geoCities)
+			db.BackfillListingGeoInherit(ctx, database)
+			db.BackfillListingCountryCode(ctx, database)
+		}()
 	}
 
 	// Start pipeline stages in background (skip for "none" — API only mode).

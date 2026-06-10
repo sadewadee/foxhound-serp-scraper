@@ -19,6 +19,8 @@ type V2BusinessListing struct {
 	Location        string          `json:"location"`
 	City            string          `json:"city"`
 	Country         string          `json:"country"`
+	CountryCode     string          `json:"country_code"`
+	GeoSource       string          `json:"geo_source,omitempty"`
 	ContactName     string          `json:"contact_name"`
 	Phone           string          `json:"phone"`
 	Phones          []string        `json:"phones"`

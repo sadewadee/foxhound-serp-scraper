@@ -4,7 +4,11 @@ package query
 
 import (
 	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
+
+	"github.com/sadewadee/serp-scraper/internal/db"
 )
 
 // Niches — yoga/wellness/fitness core + on-target expansions.
@@ -596,4 +600,169 @@ func CountryList() []string {
 		countries = append(countries, c)
 	}
 	return countries
+}
+
+// CountryISO maps every Cities key to its ISO 3166-1 alpha-2 code. Single
+// source of truth for the countries lookup table (v4 normalized schema) —
+// a test asserts every Cities key has an entry.
+var CountryISO = map[string]string{
+	"Indonesia":      "ID",
+	"United States":  "US",
+	"Canada":         "CA",
+	"Australia":      "AU",
+	"New Zealand":    "NZ",
+	"United Kingdom": "GB",
+	"Ireland":        "IE",
+	"Germany":        "DE",
+	"Austria":        "AT",
+	"Switzerland":    "CH",
+	"France":         "FR",
+	"Spain":          "ES",
+	"Netherlands":    "NL",
+	"Belgium":        "BE",
+	"Italy":          "IT",
+	"Portugal":       "PT",
+	"Sweden":         "SE",
+	"Denmark":        "DK",
+	"Norway":         "NO",
+	"Finland":        "FI",
+	"Poland":         "PL",
+	"Czech Republic": "CZ",
+	"Hungary":        "HU",
+	"Romania":        "RO",
+	"Croatia":        "HR",
+	"Greece":         "GR",
+	"Turkey":         "TR",
+	"Thailand":       "TH",
+	"Vietnam":        "VN",
+	"Philippines":    "PH",
+	"Malaysia":       "MY",
+	"Singapore":      "SG",
+	"Cambodia":       "KH",
+	"Myanmar":        "MM",
+	"India":          "IN",
+	"Sri Lanka":      "LK",
+	"Nepal":          "NP",
+	"UAE":            "AE",
+	"Qatar":          "QA",
+	"Saudi Arabia":   "SA",
+	"Bahrain":        "BH",
+	"Japan":          "JP",
+	"South Korea":    "KR",
+	"Taiwan":         "TW",
+	"Hong Kong":      "HK",
+	"South Africa":   "ZA",
+	"Kenya":          "KE",
+	"Nigeria":        "NG",
+	"Morocco":        "MA",
+	"Egypt":          "EG",
+	"Mexico":         "MX",
+	"Brazil":         "BR",
+	"Colombia":       "CO",
+	"Argentina":      "AR",
+	"Chile":          "CL",
+	"Peru":           "PE",
+	"Costa Rica":     "CR",
+	"Panama":         "PA",
+}
+
+// CityToCountryISO2 builds a reverse map from city name (case-insensitive) to
+// ISO 3166-1 alpha-2 country code. Used for geo-recovery: backfilling
+// queries.country from city tokens embedded in search keywords.
+// The map keys are lowercased for case-insensitive lookup.
+func CityToCountryISO2() map[string]string {
+	result := make(map[string]string)
+	for country, iso2 := range CountryISO {
+		if cities, ok := Cities[country]; ok {
+			for _, city := range cities {
+				// Store lowercase key for case-insensitive lookup.
+				result[strings.ToLower(city)] = iso2
+			}
+		}
+	}
+	return result
+}
+
+// CountryRows returns the countries-lookup seed rows (sorted by code) for
+// db.SeedCountries.
+func CountryRows() []db.Country {
+	rows := make([]db.Country, 0, len(CountryISO))
+	for name, code := range CountryISO {
+		rows = append(rows, db.Country{Code: code, Name: name})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Code < rows[j].Code })
+	return rows
+}
+
+// nicheVocabulary returns the set of every whitespace-delimited word that can
+// appear in generated query text OUTSIDE the city slot (niches + template
+// operators). Used to drop ambiguous city tokens from geo matching: a city
+// whose name collides with niche/operator vocabulary (e.g. a city literally
+// named "Spa" or "Yoga") would mis-attribute geo on every query containing
+// that word.
+func nicheVocabulary() map[string]bool {
+	vocab := make(map[string]bool)
+	addPhrase := func(p string) {
+		for _, w := range strings.Fields(strings.ToLower(p)) {
+			vocab[strings.Trim(w, `"@.%s:`)] = true
+		}
+	}
+	for _, n := range Niches {
+		addPhrase(n)
+	}
+	for _, n := range PersonalNiches {
+		addPhrase(n)
+	}
+	for _, tmpl := range WellnessTemplates {
+		addPhrase(strings.ReplaceAll(tmpl, "%s", " "))
+	}
+	for _, tmpl := range PersonalTemplates {
+		addPhrase(strings.ReplaceAll(tmpl, "%s", " "))
+	}
+	for _, tmpl := range SiteTemplates {
+		addPhrase(strings.ReplaceAll(tmpl, "%s", " "))
+	}
+	return vocab
+}
+
+// GeoCityRows returns the geo_cities seed rows for db.SeedGeoCities: one row
+// per (lowercased) city token with its proper-case form and ISO-2 country.
+// Cities whose token collides with niche/template vocabulary are skipped (see
+// nicheVocabulary). On duplicate city names across countries the first country
+// in sorted order wins — acceptable for inference-grade geo (marked
+// geo_source='query_inference' downstream).
+func GeoCityRows() []db.GeoCity {
+	vocab := nicheVocabulary()
+	countries := make([]string, 0, len(Cities))
+	for c := range Cities {
+		countries = append(countries, c)
+	}
+	sort.Strings(countries)
+
+	seen := make(map[string]bool)
+	var rows []db.GeoCity
+	var skipped []string
+	for _, country := range countries {
+		code, ok := CountryISO[country]
+		if !ok {
+			continue // guarded by test — every Cities key must have an ISO code
+		}
+		for _, city := range Cities[country] {
+			lower := strings.ToLower(strings.TrimSpace(city))
+			if lower == "" || seen[lower] {
+				continue
+			}
+			if vocab[lower] {
+				skipped = append(skipped, lower)
+				continue
+			}
+			seen[lower] = true
+			rows = append(rows, db.GeoCity{CityLower: lower, City: city, CountryCode: code})
+		}
+	}
+	if len(skipped) > 0 {
+		slog.Warn("query: geo city tokens skipped (collide with niche vocabulary)", "tokens", strings.Join(skipped, ","))
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CityLower < rows[j].CityLower })
+	return rows
 }

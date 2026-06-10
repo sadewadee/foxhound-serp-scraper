@@ -43,9 +43,23 @@ func (r *Repository) InsertBatch(queries []string) (int, error) {
 	}
 	defer tx.Rollback()
 
+	// Geo lineage (v4 schema direction): resolve the targeted city + ISO-2
+	// country at INSERT time by matching the longest city token from the
+	// geo_cities reference against the query text. Single point of resolution —
+	// covers every caller (generate, import, telegram, API, auto-expansion), so
+	// query→listing geo inheritance never loses lineage again. geo_cities is
+	// tiny (~600 rows); the lateral scan is sub-ms per insert.
 	stmt, err := tx.Prepare(`
-		INSERT INTO queries (text, text_hash, status, created_at, updated_at)
-		VALUES ($1, $2, 'pending', NOW(), NOW())
+		INSERT INTO queries (text, text_hash, status, country, city, created_at, updated_at)
+		SELECT $1, $2, 'pending', COALESCE(g.country_code, ''), COALESCE(g.city, ''), NOW(), NOW()
+		FROM (VALUES (1)) AS one
+		LEFT JOIN LATERAL (
+			SELECT gc.country_code, gc.city
+			FROM geo_cities gc
+			WHERE (' ' || lower($1) || ' ') LIKE ('% ' || gc.city_lower || ' %')
+			ORDER BY length(gc.city_lower) DESC
+			LIMIT 1
+		) g ON TRUE
 		ON CONFLICT (text_hash) DO NOTHING
 		RETURNING id, text
 	`)
@@ -97,6 +111,63 @@ func (r *Repository) pushQueryToQueue(ctx context.Context, queryID int64, text s
 	})
 	score := float64(time.Now().UnixMicro())
 	r.redis.ZAdd(ctx, QueueKey, redis.Z{Score: score, Member: string(data)})
+}
+
+// InsertBatchWithCountry bulk-inserts queries with a specific country, skipping duplicates by text_hash.
+// If Redis is configured, newly inserted queries are pushed to the query queue.
+// Returns the number of new queries inserted.
+// Used by wellness generator for country-specific query generation (v0.9.5 geo-recovery).
+func (r *Repository) InsertBatchWithCountry(queries []string, country string) (int, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("query: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO queries (text, text_hash, country, status, created_at, updated_at)
+		VALUES ($1, $2, $3, 'pending', NOW(), NOW())
+		ON CONFLICT (text_hash) DO NOTHING
+		RETURNING id, text
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("query: prepare insert with country: %w", err)
+	}
+	defer stmt.Close()
+
+	type inserted struct {
+		ID   int64
+		Text string
+	}
+	var newQueries []inserted
+
+	for _, q := range queries {
+		hash := dedup.HashQuery(q)
+		var id int64
+		var text string
+		err := stmt.QueryRow(q, hash, country).Scan(&id, &text)
+		if err == sql.ErrNoRows {
+			continue // duplicate, skipped
+		}
+		if err != nil {
+			return len(newQueries), fmt.Errorf("query: insert with country %q: %w", q, err)
+		}
+		newQueries = append(newQueries, inserted{ID: id, Text: text})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("query: commit: %w", err)
+	}
+
+	// Push newly inserted queries to Redis queue for workers to consume.
+	if r.redis != nil && len(newQueries) > 0 {
+		ctx := context.Background()
+		for _, q := range newQueries {
+			r.pushQueryToQueue(ctx, q.ID, q.Text)
+		}
+	}
+
+	return len(newQueries), nil
 }
 
 // GetPending returns all queries with status='pending'.

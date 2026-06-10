@@ -63,9 +63,10 @@ func buildResultsFilter(q url.Values) (string, []any, int) {
 		argIdx++
 	}
 	if country := q.Get("country"); country != "" {
-		// Stored values are ISO alpha-2 ("ID", "DE", ...) — accept any case
-		// from the caller and normalize via UPPER on both sides.
-		where += fmt.Sprintf(" AND UPPER(bl.country) = UPPER($%d)", argIdx)
+		// Accept BOTH conventions: bl.country stores legacy full names
+		// ("Indonesia") while bl.country_code is the v4 ISO-2 ("ID") — so
+		// ?country=ID and ?country=Indonesia both work. Case-insensitive.
+		where += fmt.Sprintf(" AND (UPPER(bl.country) = UPPER($%d) OR UPPER(bl.country_code) = UPPER($%d))", argIdx, argIdx)
 		args = append(args, country)
 		argIdx++
 	}
@@ -281,7 +282,8 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(bl.description,''), COALESCE(bl.website,''),
 		       bl.domain, bl.url, COALESCE(bl.social_links,'{}'),
 		       COALESCE(bl.address,''), COALESCE(bl.location,''),
-		       COALESCE(bl.city,''), COALESCE(bl.country,''), COALESCE(bl.contact_name,''),
+		       COALESCE(bl.city,''), COALESCE(bl.country,''), COALESCE(bl.country_code,''),
+		       COALESCE(bl.geo_source,''), COALESCE(bl.contact_name,''),
 		       COALESCE(bl.opening_hours,''), COALESCE(bl.rating,''),
 		       COALESCE(bl.page_title,''), COALESCE(bl.phone,''), COALESCE(bl.phones,'{}'),
 		       COALESCE(bl.tiktok,''), COALESCE(bl.youtube,''), COALESCE(bl.telegram,''),
@@ -326,7 +328,8 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 			&l.NicheCategory, &l.OffNiche,
 			&l.Description, &l.Website,
 			&l.Domain, &l.URL, &socialLinksJSON,
-			&l.Address, &l.Location, &l.City, &l.Country, &l.ContactName,
+			&l.Address, &l.Location, &l.City, &l.Country, &l.CountryCode,
+			&l.GeoSource, &l.ContactName,
 			&l.OpeningHours, &l.Rating,
 			&l.PageTitle, &phone, &phones,
 			&l.TikTok, &l.YouTube, &l.Telegram,
@@ -682,7 +685,8 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 			       COALESCE(bl.description,''), COALESCE(bl.website,''),
 			       bl.domain, bl.url, COALESCE(bl.social_links,'{}'),
 			       COALESCE(bl.address,''), COALESCE(bl.location,''),
-			       COALESCE(bl.city,''), COALESCE(bl.country,''), COALESCE(bl.contact_name,''),
+			       COALESCE(bl.city,''), COALESCE(bl.country,''), COALESCE(bl.country_code,''),
+			       COALESCE(bl.geo_source,''), COALESCE(bl.contact_name,''),
 			       COALESCE(bl.opening_hours,''), COALESCE(bl.rating,''),
 			       COALESCE(bl.page_title,''), COALESCE(bl.phone,''), COALESCE(bl.phones,'{}'),
 			       COALESCE(bl.tiktok,''), COALESCE(bl.youtube,''), COALESCE(bl.telegram,''),
@@ -709,7 +713,8 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 				&l.NicheCategory, &l.OffNiche,
 				&l.Description, &l.Website,
 				&l.Domain, &l.URL, &socialLinksJSON,
-				&l.Address, &l.Location, &l.City, &l.Country, &l.ContactName,
+				&l.Address, &l.Location, &l.City, &l.Country, &l.CountryCode,
+				&l.GeoSource, &l.ContactName,
 				&l.OpeningHours, &l.Rating,
 				&l.PageTitle, &phone, &phones,
 				&l.TikTok, &l.YouTube, &l.Telegram,

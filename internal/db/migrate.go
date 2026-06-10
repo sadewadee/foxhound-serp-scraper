@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS queries (
     text_hash       TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
     country         TEXT DEFAULT '',
+    city            TEXT DEFAULT '',
     result_count    INTEGER DEFAULT 0,
     error_msg       TEXT,
     expanded_at     TIMESTAMPTZ,
@@ -55,6 +56,27 @@ CREATE TABLE IF NOT EXISTS queries (
 );
 CREATE INDEX IF NOT EXISTS idx_queries_status ON queries(status);
 CREATE INDEX IF NOT EXISTS idx_queries_expand ON queries(status, expanded_at) WHERE status = 'completed' AND expanded_at IS NULL;
+
+-- countries: ISO-3166-1 alpha-2 lookup (v4 normalized schema — see
+-- docs/foxhound-schema-normalized.md). Seeded idempotently by the manager at
+-- boot from internal/query wellness.go. enabled gates future per-country
+-- targeting at the DB level instead of app-side whitelists.
+CREATE TABLE IF NOT EXISTS countries (
+    code    CHAR(2) PRIMARY KEY,
+    name    TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- geo_cities: city→country reference (normalized out of internal/query
+-- wellness.go Cities — seeded idempotently by the manager at boot, v4
+-- direction). Drives geo resolution at query INSERT time, query-lineage
+-- inheritance in trg_normalize_enrichment, and the one-time geo backfills.
+-- city_lower is the token as it appears in lowercased query text.
+CREATE TABLE IF NOT EXISTS geo_cities (
+    city_lower   TEXT PRIMARY KEY,
+    city         TEXT NOT NULL,
+    country_code CHAR(2) NOT NULL REFERENCES countries(code)
+);
 
 CREATE TABLE IF NOT EXISTS serp_jobs (
     id              TEXT PRIMARY KEY,
@@ -317,6 +339,18 @@ func runMigrations(db *sql.DB) error {
 		// filters on an indexed column instead of a per-candidate correlated EXISTS
 		// (the 2026-06-02 eligibility timeout storm). NULL = not yet scored.
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS completeness_score SMALLINT`,
+		// Geo lineage (2026-06-10): queries carry the targeted city alongside
+		// country; listings record where their geo came from (NULL = page
+		// extraction, 'query_inference' = inherited from the source query).
+		// MUST run before the trg_normalize_enrichment CREATE OR REPLACE below
+		// — the new function body references both columns, and live enrich
+		// completions fire it the moment it is replaced.
+		`ALTER TABLE queries ADD COLUMN IF NOT EXISTS city TEXT DEFAULT ''`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS geo_source TEXT`,
+		// country_code: the v4 FK-ready ISO-2 column, populated alongside the
+		// legacy full-name country text (drop-legacy-last per the v4 migration
+		// notes). No FK constraint yet — added once legacy values are migrated.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country_code CHAR(2)`,
 		// business_listings is read-hot (the v2 results API counts/filters it)
 		// and write-hot (enrich upserts continuously). Default autovacuum
 		// (scale_factor 0.2 → ~220K dead/inserted tuples before a vacuum) lets the
@@ -487,8 +521,35 @@ func runMigrations(db *sql.DB) error {
 		  biz_id BIGINT;
 		  email_id BIGINT;
 		  e TEXT;
+		  q_country_code TEXT := '';
+		  q_country_name TEXT := '';
+		  q_city TEXT := '';
+		  raw_country_code TEXT := NULL;
 		BEGIN
 		  IF NEW.status = 'completed' AND (OLD.status IS NULL OR OLD.status != 'completed') THEN
+		    -- Geo lineage (2026-06-10, v4 schema direction): the source query
+		    -- carries the targeted city + ISO-2 country (resolved at INSERT time
+		    -- from geo_cities). When the page itself yields no geo, inherit the
+		    -- query's — marked geo_source='query_inference' so inference never
+		    -- masquerades as extraction. The countries lookup maps code <-> name
+		    -- (business_listings.country keeps the legacy full-name convention;
+		    -- country_code is the v4 FK-ready column).
+		    IF NEW.parent_query_id IS NOT NULL THEN
+		      SELECT COALESCE(q.country, ''), COALESCE(q.city, '')
+		        INTO q_country_code, q_city
+		        FROM queries q WHERE q.id = NEW.parent_query_id;
+		      q_country_code := COALESCE(q_country_code, '');
+		      q_city := COALESCE(q_city, '');
+		      IF q_country_code <> '' THEN
+		        SELECT c.name INTO q_country_name FROM countries c WHERE c.code = q_country_code;
+		        q_country_name := COALESCE(q_country_name, '');
+		      END IF;
+		    END IF;
+		    IF NEW.raw_country IS NOT NULL AND NEW.raw_country <> '' THEN
+		      SELECT c.code INTO raw_country_code FROM countries c
+		      WHERE LOWER(c.name) = LOWER(NEW.raw_country) OR c.code = UPPER(NEW.raw_country)
+		      LIMIT 1;
+		    END IF;
 		    -- 1. Upsert business_listings.
 		    --    Forward every raw_* the extractor populates. Previously
 		    --    description and location were hardcoded NULL here, and
@@ -508,9 +569,12 @@ func runMigrations(db *sql.DB) error {
 		        address, location, country, city, contact_name,
 		        phone, phones, website, page_title, social_links,
 		        opening_hours, rating, tiktok, youtube, telegram, source_query_id,
-		        off_niche, niche_category)
+		        off_niche, niche_category, country_code, geo_source)
 		    VALUES (NEW.domain, NEW.url, NEW.raw_business_name, NEW.raw_category, NEW.raw_description,
-		        NEW.raw_address, NEW.raw_location, NEW.raw_country, NEW.raw_city, NEW.raw_contact_name,
+		        NEW.raw_address, NEW.raw_location,
+		        COALESCE(NULLIF(NEW.raw_country, ''), NULLIF(q_country_name, '')),
+		        COALESCE(NULLIF(NEW.raw_city, ''), NULLIF(q_city, '')),
+		        NEW.raw_contact_name,
 		        NEW.raw_phones[1], COALESCE(NEW.raw_phones, '{}'), NEW.url, NEW.raw_page_title, NEW.raw_social,
 		        NEW.raw_opening_hours, NEW.raw_rating, NEW.raw_tiktok, NEW.raw_youtube, NEW.raw_telegram,
 		        NEW.parent_query_id,
@@ -583,6 +647,18 @@ func runMigrations(db *sql.DB) error {
 		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
 		                     COALESCE(NEW.raw_description,'')) ~ '\m(wellness|holistic)\M' THEN 'wellness'
 		          ELSE NULL
+		        END,
+		        -- country_code (v4 FK-ready ISO-2): page extraction resolved via the
+		        -- countries lookup; falls back to the source query's code.
+		        CASE
+		          WHEN NEW.raw_country IS NOT NULL AND NEW.raw_country <> '' THEN raw_country_code
+		          WHEN q_country_code <> '' THEN q_country_code
+		          ELSE NULL
+		        END,
+		        -- geo_source: NULL = page extraction; query_inference = inherited.
+		        CASE
+		          WHEN (NEW.raw_country IS NULL OR NEW.raw_country = '') AND q_country_name <> '' THEN 'query_inference'
+		          ELSE NULL
 		        END
 		    )
 		    ON CONFLICT (domain) DO UPDATE SET
@@ -591,8 +667,29 @@ func runMigrations(db *sql.DB) error {
 		        description   = COALESCE(EXCLUDED.description, business_listings.description),
 		        address       = COALESCE(EXCLUDED.address, business_listings.address),
 		        location      = COALESCE(EXCLUDED.location, business_listings.location),
-		        country       = COALESCE(EXCLUDED.country, business_listings.country),
-		        city          = COALESCE(EXCLUDED.city, business_listings.city),
+		        -- Geo precedence: fresh page extraction (geo_source NULL + non-empty
+		        -- country) always wins; otherwise only fill when currently empty —
+		        -- inference NEVER overwrites extracted (or previously set) geo.
+		        country       = CASE
+		                          WHEN EXCLUDED.geo_source IS NULL AND EXCLUDED.country IS NOT NULL AND EXCLUDED.country <> '' THEN EXCLUDED.country
+		                          WHEN business_listings.country IS NULL OR business_listings.country = '' THEN COALESCE(NULLIF(EXCLUDED.country, ''), business_listings.country)
+		                          ELSE business_listings.country
+		                        END,
+		        country_code  = CASE
+		                          WHEN EXCLUDED.geo_source IS NULL AND EXCLUDED.country_code IS NOT NULL THEN EXCLUDED.country_code
+		                          WHEN business_listings.country_code IS NULL THEN EXCLUDED.country_code
+		                          ELSE business_listings.country_code
+		                        END,
+		        city          = CASE
+		                          WHEN EXCLUDED.geo_source IS NULL AND EXCLUDED.city IS NOT NULL AND EXCLUDED.city <> '' THEN EXCLUDED.city
+		                          WHEN business_listings.city IS NULL OR business_listings.city = '' THEN COALESCE(NULLIF(EXCLUDED.city, ''), business_listings.city)
+		                          ELSE business_listings.city
+		                        END,
+		        geo_source    = CASE
+		                          WHEN EXCLUDED.geo_source IS NULL AND EXCLUDED.country IS NOT NULL AND EXCLUDED.country <> '' THEN NULL
+		                          WHEN (business_listings.country IS NULL OR business_listings.country = '') AND NULLIF(EXCLUDED.country, '') IS NOT NULL THEN EXCLUDED.geo_source
+		                          ELSE business_listings.geo_source
+		                        END,
 		        contact_name  = COALESCE(EXCLUDED.contact_name, business_listings.contact_name),
 		        phone         = COALESCE(EXCLUDED.phone, business_listings.phone),
 		        -- Phones array: union + dedup. Re-enrichment that captured 1
@@ -1706,6 +1803,121 @@ func runMigrations(db *sql.DB) error {
 				categoryStatsNicheVersion,
 				"redefine category_stats: COALESCE(niche_category, category), exclude off_niche — kill schema.org @type noise in /api/v2/results/categories")
 			slog.Info("db: category_stats niche redefinition applied (matview re-seeds on manager boot)")
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-06-10 v0.9.5 — Geo-recovery Phase 1: backfill queries.country from
+	// city tokens in query text.
+	//
+	// Background: the wellness generator creates ~3.45M queries with city tokens
+	// (e.g. "yoga instructor jakarta contact") but never fills the queries.country
+	// field, so geographic lineage is lost. The city→country map exists in
+	// wellness.go (Cities map keyed by country) but is never used during INSERT.
+	// This migration extracts city tokens from each query text by searching for
+	// known city names (case-insensitive) and backfills queries.country with the
+	// corresponding ISO 3166-1 alpha-2 code.
+	// -------------------------------------------------------------------------
+	const geoRecoveryQueriesCountryVersion = "2026_06_10_geo_recovery_queries_country"
+	var geoQueriesDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, geoRecoveryQueriesCountryVersion,
+	).Scan(&geoQueriesDone); err == nil && !geoQueriesDone {
+		// Build the city→country ISO-2 map in Go from wellness.Cities.
+		cityMap := make(map[string]string)
+		iso2ByCountry := map[string]string{
+			"Indonesia": "ID", "United States": "US", "Canada": "CA",
+			"Australia": "AU", "New Zealand": "NZ", "United Kingdom": "GB",
+			"Ireland": "IE", "Germany": "DE", "Austria": "AT",
+			"Switzerland": "CH", "France": "FR", "Spain": "ES",
+			"Netherlands": "NL", "Belgium": "BE", "Italy": "IT",
+			"Portugal": "PT", "Sweden": "SE", "Denmark": "DK",
+			"Norway": "NO", "Finland": "FI", "Poland": "PL",
+			"Czech Republic": "CZ", "Hungary": "HU", "Romania": "RO",
+			"Croatia": "HR", "Greece": "GR", "Turkey": "TR",
+			"Thailand": "TH", "Vietnam": "VN", "Philippines": "PH",
+			"Malaysia": "MY", "Singapore": "SG", "Cambodia": "KH",
+			"Myanmar": "MM", "India": "IN", "Sri Lanka": "LK",
+			"Nepal": "NP", "UAE": "AE", "Qatar": "QA",
+			"Saudi Arabia": "SA", "Bahrain": "BH", "Japan": "JP",
+			"South Korea": "KR", "Taiwan": "TW", "Hong Kong": "HK",
+			"South Africa": "ZA", "Kenya": "KE", "Nigeria": "NG",
+			"Morocco": "MA", "Egypt": "EG", "Mexico": "MX",
+			"Brazil": "BR", "Colombia": "CO", "Argentina": "AR",
+			"Chile": "CL", "Peru": "PE", "Costa Rica": "CR",
+			"Panama": "PA",
+		}
+		// Populate cityMap with all known city→ISO mappings from wellness.query.Cities.
+		// This duplicates the city list from query/wellness.go to avoid circular dependency.
+		// The mapping is hardcoded here; if Cities changes in wellness.go, this must be updated.
+		citiesByCountry := map[string][]string{
+			"Indonesia":     {"Jakarta", "Surabaya", "Bandung", "Medan", "Semarang", "Makassar", "Palembang", "Tangerang", "Depok", "Bekasi", "Tangerang Selatan", "Bogor", "Serang", "Cilegon", "Denpasar", "Bali", "Ubud", "Canggu", "Seminyak", "Sanur", "Kuta", "Nusa Dua", "Uluwatu", "Jimbaran", "Pererenan", "Berawa", "Kerobokan", "Umalas", "Sidemen", "Amed", "Lovina", "Munduk", "Tabanan", "Gianyar", "Yogyakarta", "Malang", "Solo", "Surakarta", "Cirebon", "Purwokerto", "Kediri", "Madiun", "Probolinggo", "Balikpapan", "Manado", "Batam", "Samarinda", "Pontianak", "Banjarmasin", "Pekanbaru", "Padang", "Jambi", "Bengkulu", "Lombok", "Senggigi", "Kuta Lombok", "Gili Trawangan", "Kemang", "Senopati", "Menteng", "Kelapa Gading", "PIK Jakarta", "Sudirman", "Kuningan", "Pondok Indah", "Cipete", "Tebet", "Cilandak", "Pasar Minggu", "Kebayoran", "SCBD", "BSD", "Alam Sutera", "Gading Serpong"},
+			"United States": {"New York", "Los Angeles", "Chicago", "Houston", "Phoenix", "San Antonio", "San Diego", "Dallas", "San Jose", "Austin", "Jacksonville", "Fort Worth", "Columbus", "Indianapolis", "Charlotte", "San Francisco", "Seattle", "Denver", "Washington DC", "Boston", "El Paso", "Nashville", "Detroit", "Oklahoma City", "Portland", "Las Vegas", "Memphis", "Louisville", "Baltimore", "Milwaukee", "Albuquerque", "Tucson", "Fresno", "Sacramento", "Kansas City", "Mesa", "Atlanta", "Omaha", "Colorado Springs", "Miami", "Raleigh", "Long Beach", "Virginia Beach", "Oakland", "Minneapolis", "Tulsa", "Arlington", "Tampa", "New Orleans", "Cleveland", "Scottsdale", "Boulder", "Santa Monica", "Sedona", "Asheville", "Park City", "Aspen", "Palm Springs", "Ojai", "Big Sur", "Carmel", "Napa", "Sonoma", "Jackson Hole", "Vail", "Taos", "Santa Fe", "Telluride", "Marfa", "Key West", "Martha's Vineyard", "Honolulu", "Maui", "Oahu", "Kauai", "Big Island", "Lahaina", "Kihei", "Wailea", "Paia", "Hanalei", "Brooklyn", "Manhattan", "Queens", "Bronx", "Williamsburg", "Park Slope", "Upper East Side", "Upper West Side", "SoHo", "Tribeca", "Harlem", "DUMBO", "Greenpoint", "Bushwick", "Long Island City", "Astoria", "Chelsea", "West Village", "East Village", "NoHo", "Gramercy", "Flatiron", "Venice Beach", "Silver Lake", "West Hollywood", "Beverly Hills", "Pasadena", "Glendale", "Culver City", "Los Feliz", "Echo Park", "Highland Park", "Malibu", "Marina del Rey", "Manhattan Beach", "Hermosa Beach", "Redondo Beach", "Topanga", "Studio City", "Sherman Oaks", "Oakland", "Berkeley", "Palo Alto", "Mountain View", "Fremont", "San Mateo", "Redwood City", "Menlo Park", "Marin", "Mill Valley", "Sausalito", "Tiburon", "Tampa", "Orlando", "Fort Lauderdale", "West Palm Beach", "Boca Raton", "Delray Beach", "Sarasota", "Naples", "Fort Myers", "Destin", "St Petersburg", "Clearwater", "Plano", "Frisco", "Irving", "McKinney", "Round Rock", "Sugar Land", "The Woodlands", "Katy", "Tempe", "Chandler", "Gilbert", "Flagstaff", "Durham", "Chapel Hill", "Richmond", "Charleston", "Savannah", "Tallahassee", "Salt Lake City", "Boise", "Missoula", "Bozeman", "Pittsburgh", "Philadelphia", "Hartford", "Providence", "Princeton", "Hoboken", "Jersey City", "Stamford", "New Haven", "Arlington VA", "Alexandria"},
+			"Canada":        {"Toronto", "Vancouver", "Montreal", "Calgary", "Edmonton", "Ottawa", "Winnipeg", "Quebec City", "Halifax", "Victoria", "Whistler", "Kelowna", "Saskatoon", "Regina", "Mississauga", "Brampton", "Hamilton", "London Ontario", "Surrey BC", "Burnaby", "Richmond BC", "Langley", "Kitchener", "Waterloo", "Oakville", "Burlington", "Markham", "Vaughan", "Richmond Hill", "Oshawa", "Gatineau", "Sherbrooke", "Trois-Rivieres", "Laval", "North Vancouver", "West Vancouver", "Squamish", "Banff", "Canmore", "Jasper", "Tofino", "Ucluelet", "Niagara Falls", "Kingston", "Guelph"},
+		}
+		for country, cities := range citiesByCountry {
+			iso2 := iso2ByCountry[country]
+			if iso2 == "" {
+				continue
+			}
+			for _, city := range cities {
+				cityMap[strings.ToLower(city)] = iso2
+			}
+		}
+
+		var caseBuilder strings.Builder
+		caseBuilder.WriteString(`CASE LOWER(text)`)
+		for city, iso2 := range cityMap {
+			caseBuilder.WriteString(fmt.Sprintf(` WHEN text ILIKE '%%' || '%s' || '%%' THEN '%s'`, city, iso2))
+		}
+		caseBuilder.WriteString(` ELSE NULL END`)
+
+		updateSQL := fmt.Sprintf(`
+			UPDATE queries SET country = %s, updated_at = NOW()
+			WHERE (country IS NULL OR country = '') AND %s IS NOT NULL
+		`, caseBuilder.String(), caseBuilder.String())
+
+		res, err := db.Exec(updateSQL)
+		if err != nil {
+			slog.Warn("db: geo-recovery queries country backfill failed", "error", err)
+		} else {
+			n, _ := res.RowsAffected()
+			slog.Info("db: geo-recovery queries country backfilled", "rows_updated", n)
+			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+				geoRecoveryQueriesCountryVersion,
+				"backfill queries.country from city tokens (~3.45M queries)")
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// 2026-06-10 v0.9.5 — Geo-recovery Phase 2: inherit country from source query
+	// to business_listings via source_query_id lineage.
+	//
+	// Now that queries.country is populated, we can fill empty business_listings.country
+	// by joining on source_query_id. This recovers ~581K rows (ceiling).
+	// -------------------------------------------------------------------------
+	const geoRecoveryListingsCountryVersion = "2026_06_10_geo_recovery_listings_country"
+	var geoListingsDone bool
+	if err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, geoRecoveryListingsCountryVersion,
+	).Scan(&geoListingsDone); err == nil && !geoListingsDone {
+		res, err := db.Exec(`
+			UPDATE business_listings bl
+			SET country = q.country, updated_at = NOW()
+			FROM queries q
+			WHERE bl.source_query_id = q.id
+			  AND (bl.country IS NULL OR bl.country = '')
+			  AND q.country IS NOT NULL
+			  AND q.country != ''
+		`)
+		if err != nil {
+			slog.Warn("db: geo-recovery listings country inherit failed", "error", err)
+		} else {
+			n, _ := res.RowsAffected()
+			slog.Info("db: geo-recovery listings country inherited", "rows_updated", n)
+			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+				geoRecoveryListingsCountryVersion,
+				"inherit country to business_listings from source_query via source_query_id lineage (~581K rows)")
 		}
 	}
 
