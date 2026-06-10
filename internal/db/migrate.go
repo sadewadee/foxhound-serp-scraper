@@ -347,6 +347,12 @@ func runMigrations(db *sql.DB) error {
 		// completions fire it the moment it is replaced.
 		`ALTER TABLE queries ADD COLUMN IF NOT EXISTS city TEXT DEFAULT ''`,
 		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS geo_source TEXT`,
+		// niche_source: provenance for niche_category — NULL = page extraction
+		// (the trigger classifier), 'query_inference' = inherited from the source
+		// query text (BackfillListingNicheInherit). Lets a later re-enrich that
+		// finds a real page keyword supersede an inferred bucket (precedence in the
+		// ON CONFLICT below), exactly like geo_source does for country/city.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_source TEXT`,
 		// country_code: the v4 FK-ready ISO-2 column, populated alongside the
 		// legacy full-name country text (drop-legacy-last per the v4 migration
 		// notes). No FK constraint yet — added once legacy values are migrated.
@@ -639,7 +645,7 @@ func runMigrations(db *sql.DB) error {
 		                     COALESCE(NEW.raw_description,'')) ~ '\mreiki|sound healing|energy healing|healing\M' THEN 'healing'
 		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
 		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\mayurved\M' THEN 'ayurveda'
+		                     COALESCE(NEW.raw_description,'')) ~ '\mayurved' THEN 'ayurveda'
 		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
 		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
 		                     COALESCE(NEW.raw_description,'')) ~ '\m(spa|massage|thermal)\M' THEN 'spa'
@@ -707,10 +713,23 @@ func runMigrations(db *sql.DB) error {
 		        telegram      = COALESCE(EXCLUDED.telegram, business_listings.telegram),
 		        -- Niche fields: only promote a TRUE off_niche so a re-enrichment
 		        -- of a previously-tagged off-niche row never silently flips back
-		        -- to in-niche. niche_category COALESCEs in case re-enrich misses
-		        -- the keyword on a shorter page_title.
+		        -- to in-niche.
 		        off_niche      = (business_listings.off_niche OR EXCLUDED.off_niche),
-		        niche_category = COALESCE(business_listings.niche_category, EXCLUDED.niche_category),
+		        -- Niche precedence mirrors geo: a fresh page-extracted niche
+		        -- supersedes a query-inferred one (niche_source='query_inference');
+		        -- otherwise COALESCE keeps the existing bucket when re-enrich misses
+		        -- the keyword on a shorter page_title. Clearing niche_source on
+		        -- supersession marks the bucket page-authoritative.
+		        niche_category = CASE
+		                           WHEN business_listings.niche_source = 'query_inference' AND EXCLUDED.niche_category IS NOT NULL
+		                             THEN EXCLUDED.niche_category
+		                           ELSE COALESCE(business_listings.niche_category, EXCLUDED.niche_category)
+		                         END,
+		        niche_source   = CASE
+		                           WHEN business_listings.niche_source = 'query_inference' AND EXCLUDED.niche_category IS NOT NULL
+		                             THEN NULL
+		                           ELSE business_listings.niche_source
+		                         END,
 		        updated_at    = NOW();
 		    -- 2-step biz_id resolution. RETURNING id INTO biz_id was unreliable
 		    -- on the DO UPDATE path when all incoming values were NULL — the
@@ -1653,7 +1672,7 @@ func runMigrations(db *sql.DB) error {
 				             COALESCE(description,'')) ~ '\mreiki|sound healing|energy healing|healing\M' THEN 'healing'
 				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
 				             COALESCE(page_title,'') || ' ' ||
-				             COALESCE(description,'')) ~ '\mayurved\M' THEN 'ayurveda'
+				             COALESCE(description,'')) ~ '\mayurved' THEN 'ayurveda'
 				  WHEN LOWER(COALESCE(business_name,'') || ' ' ||
 				             COALESCE(page_title,'') || ' ' ||
 				             COALESCE(description,'')) ~ '\m(spa|massage|thermal)\M' THEN 'spa'

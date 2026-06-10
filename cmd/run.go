@@ -140,6 +140,16 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 			db.BackfillQueryGeo(ctx, database, geoCities)
 			db.BackfillListingGeoInherit(ctx, database)
 			db.BackfillListingCountryCode(ctx, database)
+			// Second-pass country_code map: the enriched countries lookup (full
+			// ISO names + China/Russia/… + AE→"United Arab Emirates") plus aliases
+			// resolves the ~5,698 rows the first pass left code-less.
+			db.BackfillListingCountryCodeAliases(ctx, database, query.CountryAliases())
+			// Normalize the display name of query-inferred rows to the canonical
+			// countries.name (fixes the AE "UAE"→"United Arab Emirates" drift).
+			db.BackfillCountryDisplayCanonical(ctx, database)
+			// Niche lineage: fill niche_category for active page-unclassified
+			// listings from their source query text (same buckets as the trigger).
+			db.BackfillListingNicheInherit(ctx, database)
 		}()
 	}
 

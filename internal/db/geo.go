@@ -445,3 +445,195 @@ func BackfillListingCountryCode(ctx context.Context, db *sql.DB) {
 	}
 	slog.Info("db: listing country_code backfill complete", "filled", total)
 }
+
+// listingCountryCodeAliasVersion gates the SECOND-pass country_code map. The
+// first pass (listingCountryCodeVersion) ran against a countries lookup that was
+// missing China/Russia/… and named AE "UAE" instead of "United Arab Emirates",
+// so ~5,698 rows with a page-extracted country name never resolved a code. After
+// enriching the lookup (query.CountryRows full ISO names + extras), this pass
+// re-walks those rows, now also resolving caller-supplied aliases. New version
+// string → runs once on deploy; the old version row is left untouched.
+const listingCountryCodeAliasVersion = "2026_06_10_listing_country_code_aliases"
+
+// BackfillListingCountryCodeAliases maps page-extracted full-name countries to
+// ISO-2 country_code via the (now-enriched) countries lookup UNIONed with a
+// caller-supplied alias map (lowercased country string → ISO-2 code, e.g.
+// "uae"→AE, "usa"→US). Touches only rows with a country but no code. Id-windowed
+// + resumable like the sibling geo backfills. The codes only ever come from the
+// curated countries table + the validated alias map (invariant #6: never a raw
+// regex capture). No-op if no rows remain — the enriched live trigger already
+// resolves full-name countries going forward.
+func BackfillListingCountryCodeAliases(ctx context.Context, db *sql.DB, aliases map[string]string) {
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, listingCountryCodeAliasVersion,
+	).Scan(&done); err != nil || done {
+		if err != nil {
+			slog.Warn("db: listing country_code alias backfill version check failed", "error", err)
+		}
+		return
+	}
+
+	// Resolver = canonical countries.name ∪ curated aliases. Both sides yield
+	// (lowercased-country-string, ISO-2 code). Alias literals are pq-quoted; the
+	// values are a small curated Go map, but quoting keeps the build injection-safe
+	// and matches the geo backfills' string-interpolation pattern.
+	resolver := `SELECT LOWER(name) AS k, code FROM countries`
+	if len(aliases) > 0 {
+		pairs := make([]string, 0, len(aliases))
+		for name, code := range aliases {
+			pairs = append(pairs, "("+pq.QuoteLiteral(strings.ToLower(name))+","+pq.QuoteLiteral(code)+")")
+		}
+		sort.Strings(pairs) // deterministic SQL across resumed passes
+		resolver += " UNION SELECT * FROM (VALUES " + strings.Join(pairs, ",") + ") AS a(k, code)"
+	}
+
+	var minID, maxID sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MIN(id), MAX(id) FROM business_listings`).Scan(&minID, &maxID); err != nil || !maxID.Valid {
+		slog.Warn("db: listing country_code alias backfill: id range failed", "error", err)
+		return
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		slog.Warn("db: listing country_code alias backfill: acquire conn failed", "error", err)
+		return
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '60s'`); err != nil {
+		slog.Warn("db: listing country_code alias backfill: set timeout failed", "error", err)
+		return
+	}
+
+	stmt := fmt.Sprintf(`
+		UPDATE business_listings bl
+		SET country_code = r.code
+		FROM (%s) r
+		WHERE bl.id > $1 AND bl.id <= $2
+		  AND bl.country_code IS NULL
+		  AND COALESCE(bl.country, '') <> ''
+		  AND LOWER(bl.country) = r.k
+	`, resolver)
+
+	const window = int64(50000)
+	slog.Info("db: listing country_code alias backfill starting (background, id-windowed)",
+		"min_id", minID.Int64, "max_id", maxID.Int64, "window", window)
+	var total int64
+	var failedWindows int
+	for lo := minID.Int64 - 1; lo < maxID.Int64; lo += window {
+		n, err := execWindowRetry(ctx, conn, stmt, lo, lo+window)
+		if err != nil {
+			failedWindows++
+			slog.Warn("db: listing country_code alias backfill window failed after retries — continuing", "lo", lo, "error", err, "filled_so_far", total)
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		total += n
+		select {
+		case <-ctx.Done():
+			slog.Info("db: listing country_code alias backfill interrupted (resumes next boot)", "filled_so_far", total)
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if failedWindows > 0 {
+		slog.Warn("db: listing country_code alias backfill pass partial — version NOT recorded, re-walks next boot",
+			"failed_windows", failedWindows, "filled_this_pass", total)
+		return
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+		listingCountryCodeAliasVersion, fmt.Sprintf("map full-name/alias business_listings.country to ISO-2 country_code via enriched countries lookup + aliases (%d rows)", total),
+	); err != nil {
+		slog.Warn("db: listing country_code alias backfill: version record failed", "error", err)
+		return
+	}
+	slog.Info("db: listing country_code alias backfill complete", "filled", total)
+}
+
+// countryDisplayCanonicalVersion gates the one-time inferred-display normalize.
+const countryDisplayCanonicalVersion = "2026_06_10_country_display_canonical"
+
+// BackfillCountryDisplayCanonical normalizes the legacy full-name display
+// (business_listings.country) of QUERY-INFERRED rows to the canonical
+// countries.name. Closes the cosmetic drift created when a lookup name changed
+// (AE "UAE" → "United Arab Emirates"): rows inherited before the rename kept the
+// stale label while country_code stayed correct, so new inherits and old ones
+// disagreed on the display string. SCOPED to geo_source='query_inference' so
+// page-extracted display strings are NEVER rewritten (extraction always wins,
+// never masqueraded). Id-windowed + resumable like the sibling geo backfills.
+func BackfillCountryDisplayCanonical(ctx context.Context, db *sql.DB) {
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, countryDisplayCanonicalVersion,
+	).Scan(&done); err != nil || done {
+		if err != nil {
+			slog.Warn("db: country display canonical backfill version check failed", "error", err)
+		}
+		return
+	}
+
+	var minID, maxID sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MIN(id), MAX(id) FROM business_listings`).Scan(&minID, &maxID); err != nil || !maxID.Valid {
+		slog.Warn("db: country display canonical backfill: id range failed", "error", err)
+		return
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		slog.Warn("db: country display canonical backfill: acquire conn failed", "error", err)
+		return
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SET statement_timeout = '60s'`); err != nil {
+		slog.Warn("db: country display canonical backfill: set timeout failed", "error", err)
+		return
+	}
+
+	const window = int64(50000)
+	slog.Info("db: country display canonical backfill starting (background, id-windowed)",
+		"min_id", minID.Int64, "max_id", maxID.Int64, "window", window)
+	var total int64
+	var failedWindows int
+	for lo := minID.Int64 - 1; lo < maxID.Int64; lo += window {
+		n, err := execWindowRetry(ctx, conn, `
+			UPDATE business_listings bl
+			SET country = c.name, updated_at = NOW()
+			FROM countries c
+			WHERE bl.id > $1 AND bl.id <= $2
+			  AND bl.geo_source = 'query_inference'
+			  AND bl.country_code = c.code
+			  AND bl.country IS DISTINCT FROM c.name
+		`, lo, lo+window)
+		if err != nil {
+			failedWindows++
+			slog.Warn("db: country display canonical backfill window failed after retries — continuing", "lo", lo, "error", err, "fixed_so_far", total)
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		total += n
+		select {
+		case <-ctx.Done():
+			slog.Info("db: country display canonical backfill interrupted (resumes next boot)", "fixed_so_far", total)
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if failedWindows > 0 {
+		slog.Warn("db: country display canonical backfill pass partial — version NOT recorded, re-walks next boot",
+			"failed_windows", failedWindows, "fixed_this_pass", total)
+		return
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+		countryDisplayCanonicalVersion, fmt.Sprintf("normalize query-inferred business_listings.country display to canonical countries.name (%d rows)", total),
+	); err != nil {
+		slog.Warn("db: country display canonical backfill: version record failed", "error", err)
+		return
+	}
+	slog.Info("db: country display canonical backfill complete", "fixed", total)
+}

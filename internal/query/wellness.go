@@ -683,12 +683,98 @@ func CityToCountryISO2() map[string]string {
 	return result
 }
 
+// countryLookupOverrides maps an ISO-2 code → the canonical full ISO-3166 name
+// to seed into the countries lookup, OVERRIDING the loose generation label in
+// CountryISO. Page extraction writes the full ISO name ("United Arab Emirates"),
+// so the lookup name MUST match it or the trigger + country_code backfill never
+// resolve a code — the AE/"UAE" mismatch that stranded 1,128 rows (2026-06-10).
+// Generation keeps using the CountryISO/Cities key ("UAE"); only the lookup name
+// changes.
+var countryLookupOverrides = map[string]string{
+	"AE": "United Arab Emirates",
+}
+
+// extraLookupCountries are countries that appear in page-extracted addresses but
+// have no generated cities (so they're absent from CountryISO). Without them the
+// trigger + country_code backfill can't map bl.country → ISO-2, leaving the row
+// code-less (China ×725, Russia, Ukraine, Slovakia, Bulgaria, Israel, Pakistan,
+// … — the 5,698-row gap, 2026-06-10). Lookup-only: no queries are generated for
+// them. Every code is ISO-3166-1 alpha-2 (guarded by TestCountryRows). None
+// collide with a CountryISO code.
+var extraLookupCountries = []db.Country{
+	{Code: "CN", Name: "China"},
+	{Code: "RU", Name: "Russia"},
+	{Code: "UA", Name: "Ukraine"},
+	{Code: "SK", Name: "Slovakia"},
+	{Code: "BG", Name: "Bulgaria"},
+	{Code: "IL", Name: "Israel"},
+	{Code: "PK", Name: "Pakistan"},
+	{Code: "SI", Name: "Slovenia"},
+	{Code: "RS", Name: "Serbia"},
+	{Code: "EE", Name: "Estonia"},
+	{Code: "LV", Name: "Latvia"},
+	{Code: "LT", Name: "Lithuania"},
+	{Code: "LU", Name: "Luxembourg"},
+	{Code: "IS", Name: "Iceland"},
+	{Code: "CY", Name: "Cyprus"},
+	{Code: "MT", Name: "Malta"},
+	{Code: "BD", Name: "Bangladesh"},
+	{Code: "KW", Name: "Kuwait"},
+	{Code: "OM", Name: "Oman"},
+	{Code: "JO", Name: "Jordan"},
+	{Code: "LB", Name: "Lebanon"},
+	{Code: "EC", Name: "Ecuador"},
+	{Code: "UY", Name: "Uruguay"},
+	{Code: "DO", Name: "Dominican Republic"},
+	{Code: "GT", Name: "Guatemala"},
+	{Code: "PR", Name: "Puerto Rico"},
+}
+
+// CountryAliases maps alternative country spellings (lowercased) that page
+// extraction emits → ISO-2 code, used by the country_code backfill to resolve
+// rows whose stored country string isn't the canonical countries.name. Kept
+// separate from the countries table (PK = one canonical name per code). Every
+// code is ISO-3166-1 alpha-2 AND has a countries row (guarded by
+// TestCountryAliasesValid → invariant #6: codes only ever come from the curated
+// lookup, never a raw regex capture).
+func CountryAliases() map[string]string {
+	return map[string]string{
+		"uae":                      "AE",
+		"u.a.e.":                   "AE",
+		"usa":                      "US",
+		"u.s.a.":                   "US",
+		"u.s.":                     "US",
+		"united states of america": "US",
+		"uk":                       "GB",
+		"u.k.":                     "GB",
+		"great britain":            "GB",
+		"czechia":                  "CZ",
+		"russian federation":       "RU",
+		"viet nam":                 "VN",
+		"republic of korea":        "KR",
+		"the netherlands":          "NL",
+	}
+}
+
 // CountryRows returns the countries-lookup seed rows (sorted by code) for
-// db.SeedCountries.
+// db.SeedCountries: every CountryISO code with its canonical full ISO name
+// (countryLookupOverrides applied) PLUS lookup-only countries that page
+// extraction produces but generation never targets (extraLookupCountries).
 func CountryRows() []db.Country {
-	rows := make([]db.Country, 0, len(CountryISO))
+	byCode := make(map[string]db.Country, len(CountryISO)+len(extraLookupCountries))
 	for name, code := range CountryISO {
-		rows = append(rows, db.Country{Code: code, Name: name})
+		n := name
+		if override, ok := countryLookupOverrides[code]; ok {
+			n = override
+		}
+		byCode[code] = db.Country{Code: code, Name: n}
+	}
+	for _, c := range extraLookupCountries {
+		byCode[c.Code] = c // extras never collide with CountryISO codes
+	}
+	rows := make([]db.Country, 0, len(byCode))
+	for _, c := range byCode {
+		rows = append(rows, c)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Code < rows[j].Code })
 	return rows
