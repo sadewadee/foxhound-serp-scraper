@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.6-niche localhost:32769/foxhound-serp-scraper:v0.9.6-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.6-niche
+#   hachibi: docker tag …:v0.9.7-niche localhost:32769/foxhound-serp-scraper:v0.9.7-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.7-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.6-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.7-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -138,14 +138,31 @@
 #     unbatched boot-path migration (already recorded as a no-op in prod;
 #     BackfillListingGeoInherit is the real implementation).
 #
-# Deploy: set IMAGE_TAG=v0.9.6-niche on the serp stack and redeploy.
+# v0.9.7-niche = v0.9.6 + niche lineage backfill + country ISO/alias completion:
+#   • BackfillListingNicheInherit — recovers ~338K active listings with NULL
+#     niche_category by applying the trigger's niche buckets to the source query
+#     text (lineage), id-windowed/resumable/version-gated, manager-only. Bucket-
+#     less PersonalNiches (hypnotherapist, personal trainer, …) left NULL — no
+#     new buckets (product decision).
+#   • countries lookup completed to full ISO names + 26 missing countries (China,
+#     Russia, Ukraine, … + AE "UAE"→"United Arab Emirates"); fixes the live
+#     trigger resolution too. CountryAliases + BackfillListingCountryCodeAliases
+#     re-maps ~5,698 code-less rows (validated vs ISO-3166 whitelist, invariant #6).
+#   • niche_source column + ON CONFLICT precedence: a fresh page-extracted niche
+#     supersedes a query-inferred one (mirrors geo_source), not COALESCE-sticky.
+#     ayurveda bucket regex fixed (\mayurved\M → \mayurved prefix; was dead).
+#   • BackfillCountryDisplayCanonical normalizes inferred display names to the
+#     canonical countries.name (the AE "UAE" drift); page-extracted untouched.
+#   All migrations version-gated + background → no boot blocking.
+#
+# Deploy: set IMAGE_TAG=v0.9.7-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.6-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.7-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
