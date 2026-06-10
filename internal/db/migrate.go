@@ -1706,17 +1706,18 @@ func refreshCategoryStats(ctx context.Context, db *sql.DB) {
 	slog.Debug("db: category_stats refreshed", "took", time.Since(start))
 }
 
-// isMatviewNotPopulated reports whether err is Postgres' "materialized view has
-// not been populated" / "CONCURRENTLY cannot be used when ... not populated"
-// condition (SQLSTATE 55000). category_stats is created WITH NO DATA, so the first
-// CONCURRENTLY refresh hits this until a plain REFRESH seeds it.
+// isMatviewNotPopulated reports whether err is Postgres' "materialized view not
+// populated" condition. category_stats is created WITH NO DATA, so the first
+// REFRESH ... CONCURRENTLY raises 0A000 (feature_not_supported, "CONCURRENTLY
+// cannot be used when ... not populated") and a SELECT raises 55000
+// (object_not_in_prerequisite_state) — both mean "do a plain REFRESH to seed it".
 func isMatviewNotPopulated(err error) bool {
 	if err == nil {
 		return false
 	}
 	var pqErr *pq.Error
 	if errors.As(err, &pqErr) {
-		return pqErr.Code == "55000" && strings.Contains(pqErr.Message, "populated")
+		return (pqErr.Code == "55000" || pqErr.Code == "0A000") && strings.Contains(pqErr.Message, "populated")
 	}
 	return strings.Contains(err.Error(), "not populated") || strings.Contains(err.Error(), "not been populated")
 }

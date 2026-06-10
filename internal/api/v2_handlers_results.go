@@ -183,18 +183,23 @@ func isStatementTimeout(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "statement timeout")
 }
 
-// isMatviewNotPopulated reports whether err is Postgres' "materialized view has
-// not been populated" condition (SQLSTATE 55000, object_not_in_prerequisite_state).
-// category_stats is created WITH NO DATA, so reads return this until the manager's
-// first REFRESH seeds it. The categories handler treats it as "warming up" and
-// returns an empty list instead of a 500.
+// isMatviewNotPopulated reports whether err is Postgres' "materialized view not
+// populated" condition. category_stats is created WITH NO DATA, so two distinct
+// SQLSTATEs can surface until it is first seeded:
+//   - 55000 (object_not_in_prerequisite_state): SELECT on an unpopulated matview
+//     ("materialized view ... has not been populated").
+//   - 0A000 (feature_not_supported): REFRESH ... CONCURRENTLY on an unpopulated
+//     matview ("CONCURRENTLY cannot be used when ... not populated").
+//
+// The categories handler treats it as "warming up" and returns an empty list
+// instead of a 500.
 func isMatviewNotPopulated(err error) bool {
 	if err == nil {
 		return false
 	}
 	var pqErr *pq.Error
 	if errors.As(err, &pqErr) {
-		return pqErr.Code == "55000" && strings.Contains(pqErr.Message, "populated")
+		return (pqErr.Code == "55000" || pqErr.Code == "0A000") && strings.Contains(pqErr.Message, "populated")
 	}
 	return strings.Contains(err.Error(), "not populated") || strings.Contains(err.Error(), "not been populated")
 }

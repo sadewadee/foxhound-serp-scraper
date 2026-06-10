@@ -1,18 +1,17 @@
-# Build-only compose for kurama. Builds the image and tags it for the kremlit
-# registry. The push is done MANUALLY (not here) because the Traefik ingress in
-# front of ghcr.mcpke.dev kills large blob uploads at ~60s ("client disconnected"
-# 500 → docker retries forever). Proven push path instead — NO ROUTE FROM THE MAC,
-# EVER (zero image bytes may transit the local machine); save to a FILE then scp
-# DIRECTLY kurama→hachibi by bare hostname (NOT a Tailscale IP):
-#   kurama:  docker save ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.2-niche | gzip -1 > /tmp/v0.9.2-niche.tgz
-#   kurama:  scp -o BatchMode=yes /tmp/v0.9.2-niche.tgz hachibi:/tmp/v0.9.2-niche.tgz
-#   hachibi: docker load < /tmp/v0.9.2-niche.tgz
-#   hachibi: docker tag …:v0.9.2-niche localhost:32769/foxhound-serp-scraper:v0.9.2-niche
-#          && docker push localhost:32769/…   (no Traefik, no auth, no timeout)
+# Build-only compose. Builds the image and tags it for the kremlit registry.
+# As of the 2026-06-08 kurama→hachibi migration, build + registry + runtime are
+# ALL on hachibi, so build directly there — NO cross-host image transfer, and
+# NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
+#   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
+#   hachibi: docker compose -f docker-compose.build.yaml build
+#   hachibi: docker tag …:v0.9.3-niche localhost:32769/foxhound-serp-scraper:v0.9.3-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.3-niche
+#          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
+# (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.2-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.3-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -76,15 +75,22 @@
 #   then REFRESH … CONCURRENTLY so API reads never block.
 #   NOTE: on first boot the endpoint returns an empty list (200) for the few
 #   seconds until the seed completes — it is NOT a 500.
+# v0.9.3-niche = v0.9.2 + category_stats seed-detection fix: REFRESH … CONCURRENTLY
+#   on an unpopulated matview raises SQLSTATE 0A000 (feature_not_supported), NOT
+#   55000 — so v0.9.2's isMatviewNotPopulated() missed it, the plain-REFRESH seed
+#   fallback was skipped, and category_stats stayed empty on a fresh deploy (the
+#   handler returned an empty 200 instead of data). Now matches 0A000 too, in both
+#   the api handler and the db refresh loop. (Live v0.9.2 prod was hot-fixed with a
+#   manual REFRESH; this makes a cold/fresh deploy self-seed correctly.)
 #
-# Deploy: set IMAGE_TAG=v0.9.2-niche on the serp stack and redeploy.
+# Deploy: set IMAGE_TAG=v0.9.3-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.2-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.3-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
