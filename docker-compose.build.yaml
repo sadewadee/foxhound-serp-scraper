@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.8-niche localhost:32769/foxhound-serp-scraper:v0.9.8-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.8-niche
+#   hachibi: docker tag …:v0.9.9-niche localhost:32769/foxhound-serp-scraper:v0.9.9-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.9-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.8-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.9-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -172,14 +172,36 @@
 #   FOLLOW-UP (separate): add the new niches to the wellness generator so future
 #   generation targets them consistently.
 #
-# Deploy: set IMAGE_TAG=v0.9.8-niche on the serp stack and redeploy.
+# v0.9.9-niche = v0.9.8 + niche classification integrity (#45, #46, #47):
+#   • #45 schema.org @type no longer overrides keyword niche evidence: extractor
+#     flattens JSON-LD @graph + array @type and picks the most specific business
+#     type (page/content/structural types never become category; meta-keywords
+#     fallback removed); trigger off_niche precedence = beauty → keyword bucket
+#     (FALSE) → hard off-niche @type → soup → content/generic @type; off_niche no
+#     longer sticky when fresh keyword evidence exists; \m(...)\M regex grouping
+#     fix (spin≠spinach, barre≠barrel). ReclassifyOffNicheByKeyword heals legacy
+#     rows — DRY-RUN by default (NICHE_RECLASSIFY_DRY_RUN unset/true logs
+#     would_change only; set =false on the manager to apply; backup table
+#     business_listings_offniche_backup_20260925 written first).
+#   • #46 fresh-DB Migrate() fixed (category_stats bootstrap after niche columns;
+#     idx_bl_reenrich_score self-heal), broken legacy geo-recovery queries-country
+#     backfill retired (superseded by BackfillQueryGeo), untagged go build fixed.
+#   • #47 trigger downgrade guard: trg_normalize_enrichment / trg_enqueue_enrichment
+#     carry a version marker (20260925); Migrate() never replaces a newer live
+#     trigger. ROOT CAUSE of prod misclassification: kurawa remote workers on
+#     v0.8.3-niche re-ran Migrate() every boot and reverted the trigger, so
+#     v0.9.0–v0.9.8 classifier logic never ran in prod.
+#   DEPLOY BOTH HOSTS: hachibi Dokploy stack AND kurawa /home/sadewa/serpscraper-remote
+#   (image hardcoded in that compose; move image compressed over ssh, never via Traefik).
+#
+# Deploy: set IMAGE_TAG=v0.9.9-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.8-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.9-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
