@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.12-niche localhost:32769/foxhound-serp-scraper:v0.9.12-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.12-niche
+#   hachibi: docker tag …:v0.9.13-niche localhost:32769/foxhound-serp-scraper:v0.9.13-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.13-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.12-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.13-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -229,14 +229,28 @@
 #   • #57 ReconcileProcessingQueries claims its batch FOR UPDATE SKIP LOCKED so
 #     hachibi + kurawa reconcile disjoint batches (fixes 57014 timeouts).
 #
-# Deploy: set IMAGE_TAG=v0.9.12-niche on the serp stack and redeploy.
+# v0.9.13-niche = v0.9.12 + heterogeneous-host engine routing (#60):
+#   • tabWorker resolves engines from the host's configured set (v0.9.12 rejected
+#     every searxng job as "unknown engine").
+#   • Redis serp:buffer sharded per engine (serp:buffer:<engine>); each host feeds and
+#     pops only its own engines; legacy serp:buffer drained last. Feeder no longer
+#     stalls on a saturated engine list.
+#   • A host never dead-letters another host's engine: lookup miss → release.
+#     Global retirement is explicit via SERP_RETIRED_ENGINES (default google);
+#     query completion counts every non-retired engine's jobs.
+#   error_msg changes: 'engine disabled in SERP_ENGINES' → 'engine retired globally
+#     (SERP_RETIRED_ENGINES)'; 'engine not in configured SERP_ENGINES' → 'engine not
+#     served by this host'.
+#   DEPLOY BOTH HOSTS; kurawa serp-worker was stopped as mitigation — restart it.
+#
+# Deploy: set IMAGE_TAG=v0.9.13-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.12-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.13-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
