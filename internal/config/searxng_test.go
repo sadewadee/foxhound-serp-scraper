@@ -5,6 +5,41 @@ import (
 	"testing"
 )
 
+// SERP_RETIRED_ENGINES must behave identically through the YAML path and the
+// env path (CLAUDE.md convention): the retired list is global retirement, not
+// "what this host cannot run" — it defaults to google.
+func TestRetiredEnginesDefault(t *testing.T) {
+	cfg, err := LoadFromString("serp:\n  engines: searxng,duckduckgo\n")
+	if err != nil {
+		t.Fatalf("LoadFromString: %v", err)
+	}
+	if cfg.SERP.RetiredEngines != "google" {
+		t.Errorf("RetiredEngines default = %q, want %q", cfg.SERP.RetiredEngines, "google")
+	}
+}
+
+func TestRetiredEnginesExplicit(t *testing.T) {
+	cfg, err := LoadFromString("serp:\n  engines: all\n  retired_engines: \"google, bing\"\n")
+	if err != nil {
+		t.Fatalf("LoadFromString: %v", err)
+	}
+	if cfg.SERP.RetiredEngines != "google, bing" {
+		t.Errorf("RetiredEngines = %q, want %q", cfg.SERP.RetiredEngines, "google, bing")
+	}
+}
+
+func TestRetiredEnginesFromEnv(t *testing.T) {
+	t.Setenv("SERP_RETIRED_ENGINES", "google")
+	t.Setenv("SERP_ENGINES", "all")
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatalf("LoadFromEnv: %v", err)
+	}
+	if cfg.SERP.RetiredEngines != "google" {
+		t.Errorf("RetiredEngines from env = %q, want %q", cfg.SERP.RetiredEngines, "google")
+	}
+}
+
 // SearXNG config must behave identically through the YAML path and the env
 // path (CLAUDE.md convention): field names, defaults, and values in sync.
 func TestSearXNGConfigDefaults(t *testing.T) {

@@ -37,7 +37,7 @@ func TestReconcileSQLShape(t *testing.T) {
 		"LIMIT 500",
 		"ORDER BY updated_at ASC",
 		"FOR UPDATE SKIP LOCKED",
-		"engine disabled in SERP_ENGINES",
+		"engine retired globally (SERP_RETIRED_ENGINES)",
 		"all serp jobs failed/dead with 0 results",
 	} {
 		if !strings.Contains(fn, want) {
@@ -49,6 +49,164 @@ func TestReconcileSQLShape(t *testing.T) {
 	}
 	if strings.Contains(fn, "pendingCount") {
 		t.Error("requeue still gated on the pending-count threshold")
+	}
+}
+
+func TestParseRetiredEngines(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"google", []string{"google"}},
+		{"google,bing", []string{"google", "bing"}},
+		{" Google , BING ", []string{"google", "bing"}},
+		{"", nil},
+		{",,", nil},
+		{"google,,duckduckgo", []string{"google", "duckduckgo"}},
+	}
+	for _, tt := range tests {
+		got := ParseRetiredEngines(tt.in)
+		if len(got) != len(tt.want) {
+			t.Errorf("ParseRetiredEngines(%q) = %v, want %v", tt.in, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("ParseRetiredEngines(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+			}
+		}
+	}
+}
+
+// TestReconcileProcessingQueries_HeterogeneousHosts is the regression test for
+// the production setup where hachibi (searxng,duckduckgo) and kurawa
+// (bing,duckduckgo) share the serp_jobs tables. A host's engine set only says
+// what that host can process — it never retires engines globally. So with the
+// same retired list, BOTH hosts must reach the same verdicts: engines merely
+// absent elsewhere are left alone, pending jobs of another host block
+// completion, and only truly retired engines are dead-lettered.
+func TestReconcileProcessingQueries_HeterogeneousHosts(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	db := startReconcilePostgres(t)
+	defer db.Close()
+	if _, err := db.Exec(reconcileTestSchema); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+
+	seed := []string{"h-mixed", "h-all-terminal", "h-google", "h-zombie"}
+	ids := map[string]int64{}
+	for _, text := range seed {
+		var id int64
+		if err := db.QueryRow(
+			`INSERT INTO queries (text, text_hash, status) VALUES ($1, $2, 'processing') RETURNING id`,
+			text, text).Scan(&id); err != nil {
+			t.Fatalf("seed query %s: %v", text, err)
+		}
+		ids[text] = id
+	}
+	jobs := []struct {
+		query   string
+		suffix  string
+		engine  string
+		status  string
+		results int
+	}{
+		{"h-mixed", "a", "searxng", "new", 0}, // pending on the other host — must block
+		{"h-mixed", "b", "bing", "completed", 4},
+		{"h-all-terminal", "a", "bing", "completed", 4},
+		{"h-all-terminal", "b", "duckduckgo", "completed", 2},
+		{"h-google", "a", "google", "new", 0}, // retired — must die
+		{"h-google", "b", "duckduckgo", "completed", 6},
+	}
+	for _, j := range jobs {
+		if _, err := db.Exec(
+			`INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, engine, status, result_count)
+			 VALUES ($1, $2, 'http://example/', 0, $3, $4, $5)`,
+			j.query+"-"+j.suffix, ids[j.query], j.engine, j.status, j.results,
+		); err != nil {
+			t.Fatalf("seed job %s-%s: %v", j.query, j.suffix, err)
+		}
+	}
+
+	retired := []string{"google"}
+
+	// Both hosts pass the same retired list — never their own engine set, so
+	// the reconcile outcome is host-agnostic by construction.
+	resA, err := ReconcileProcessingQueries(context.Background(), db, retired)
+	if err != nil {
+		t.Fatalf("host A reconcile: %v", err)
+	}
+	// h-mixed stays processing (searxng job pending on hachibi), h-all-terminal
+	// completes, h-google completes after its retired google job dies,
+	// h-zombie is requeued.
+	if resA.Completed != 2 || resA.Failed != 0 || resA.Requeued != 1 || resA.Active != 1 {
+		t.Errorf("host A result = %+v; want completed=2 failed=0 requeued=1 active=1", resA)
+	}
+	want := map[string]string{
+		"h-mixed":        "processing",
+		"h-all-terminal": "completed",
+		"h-google":       "completed",
+		"h-zombie":       "pending",
+	}
+	for text, status := range want {
+		var got string
+		if err := db.QueryRow(`SELECT status FROM queries WHERE id = $1`, ids[text]).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", text, err)
+		}
+		if got != status {
+			t.Errorf("%s status = %q, want %q", text, got, status)
+		}
+	}
+
+	// The searxng job must be untouched (status still 'new') — neither host
+	// may see it as dead even though they run different engine sets.
+	var sxStatus, sxErr string
+	if err := db.QueryRow(
+		`SELECT status, COALESCE(error_msg,'') FROM serp_jobs WHERE id = 'h-mixed-a'`).Scan(&sxStatus, &sxErr); err != nil {
+		t.Fatalf("read searxng job: %v", err)
+	}
+	if sxStatus != "new" || sxErr != "" {
+		t.Errorf("searxng job = %s/%q, want new/\"\" (must be untouched on both hosts)", sxStatus, sxErr)
+	}
+	// The bing job under h-mixed must also be untouched.
+	var bingStatus string
+	if err := db.QueryRow(`SELECT status FROM serp_jobs WHERE id = 'h-mixed-b'`).Scan(&bingStatus); err != nil {
+		t.Fatalf("read bing job: %v", err)
+	}
+	if bingStatus != "completed" {
+		t.Errorf("bing job under h-mixed = %q, want 'completed' (must be untouched)", bingStatus)
+	}
+	// The google job must be dead with the retired message.
+	var gStatus, gErr string
+	if err := db.QueryRow(
+		`SELECT status, COALESCE(error_msg,'') FROM serp_jobs WHERE id = 'h-google-a'`).Scan(&gStatus, &gErr); err != nil {
+		t.Fatalf("read google job: %v", err)
+	}
+	if gStatus != "dead" || gErr != "engine retired globally (SERP_RETIRED_ENGINES)" {
+		t.Errorf("google job = %s/%q, want dead/'engine retired globally (SERP_RETIRED_ENGINES)'", gStatus, gErr)
+	}
+
+	// Host B (kurawa) runs a pass over h-mixed, whose only live work is a
+	// searxng job that host B cannot serve. The query must stay processing and
+	// the job must survive: a host's engine set says what that host can run,
+	// never what is globally dead.
+	if _, err := ReconcileProcessingQueries(context.Background(), db, retired); err != nil {
+		t.Fatalf("host B reconcile: %v", err)
+	}
+	var mixedStatus string
+	if err := db.QueryRow(`SELECT status FROM queries WHERE id = $1`, ids["h-mixed"]).Scan(&mixedStatus); err != nil {
+		t.Fatalf("read h-mixed: %v", err)
+	}
+	if mixedStatus != "processing" {
+		t.Errorf("h-mixed = %q after host B, want 'processing' (searxng job still pending)", mixedStatus)
+	}
+	if err := db.QueryRow(`SELECT status FROM serp_jobs WHERE id = 'h-mixed-a'`).Scan(&sxStatus); err != nil {
+		t.Fatalf("read searxng job again: %v", err)
+	}
+	if sxStatus != "new" {
+		t.Errorf("searxng job = %q after host B, want 'new' (must never be dead-lettered by kurawa)", sxStatus)
 	}
 }
 
@@ -113,7 +271,7 @@ func TestReconcileProcessingQueries_Integration(t *testing.T) {
 		}
 	}
 
-	res, err := ReconcileProcessingQueries(context.Background(), db, []string{"bing", "duckduckgo"})
+	res, err := ReconcileProcessingQueries(context.Background(), db, []string{"google"})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -152,8 +310,8 @@ func TestReconcileProcessingQueries_Integration(t *testing.T) {
 		Scan(&googleStatus, &googleErr); err != nil {
 		t.Fatalf("read disabled-engine job: %v", err)
 	}
-	if googleStatus != "dead" || googleErr != "engine disabled in SERP_ENGINES" {
-		t.Errorf("disabled-engine job = %s/%q, want dead/'engine disabled in SERP_ENGINES'", googleStatus, googleErr)
+	if googleStatus != "dead" || googleErr != "engine retired globally (SERP_RETIRED_ENGINES)" {
+		t.Errorf("retired-engine job = %s/%q, want dead/'engine retired globally (SERP_RETIRED_ENGINES)'", googleStatus, googleErr)
 	}
 
 	var ddgStatus string
@@ -214,7 +372,7 @@ func TestReconcileProcessingQueries_ConcurrentCallers(t *testing.T) {
 		go func() {
 			<-start // release both goroutines at once
 			t0 := time.Now()
-			r, err := ReconcileProcessingQueries(context.Background(), db, []string{"bing", "duckduckgo"})
+			r, err := ReconcileProcessingQueries(context.Background(), db, []string{"google"})
 			out <- outcome{r, err, time.Since(t0)}
 		}()
 	}

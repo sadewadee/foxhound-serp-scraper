@@ -18,6 +18,30 @@ func hasEngine(engines []scraper.SearchEngine, name string) bool {
 	return false
 }
 
+// TestBufferKeysAreEngineScoped locks the per-host isolation of the Redis
+// buffer: hachibi and kurawa share one Redis, so a single global list let a
+// host consume (and then release) jobs of an engine it cannot run. Every key
+// returned must belong to an engine this stage actually serves.
+func TestBufferKeysAreEngineScoped(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SERP.Engines = "searxng,duckduckgo"
+	cfg.SERP.SearXNGURL = "http://searxng:8080"
+
+	s := &SERPStage{cfg: cfg, enginesByName: engineLookup(resolveEngines(cfg))}
+	s.engines = resolveEngines(cfg)
+
+	keys := s.bufferKeys()
+	if len(keys) != 2 {
+		t.Fatalf("bufferKeys() = %v, want one key per configured engine", keys)
+	}
+	want := map[string]bool{"serp:buffer:searxng": true, "serp:buffer:duckduckgo": true}
+	for _, k := range keys {
+		if !want[k] {
+			t.Errorf("bufferKeys() = %q, want one of the configured engines", k)
+		}
+	}
+}
+
 // TestTabWorkerLookupResolvesConfiguredSearxng is the regression test for the
 // prod incident where every searxng job was skipped: tabWorker resolved the
 // job engine through the static scraper.GetEngine registry, which never holds

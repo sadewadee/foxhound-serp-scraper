@@ -63,6 +63,7 @@ type SERPConfig struct {
 	Concurrency           int     `yaml:"concurrency"`        // number of tabs (goroutines)
 	SERPDelayMs           int     `yaml:"serp_delay_ms"`      // inter-page delay override (0 = use timing profile)
 	Engines               string  `yaml:"engines"`            // "all", "google", "bing", "duckduckgo" (default: "all")
+	RetiredEngines        string  `yaml:"retired_engines"`    // engines retired GLOBALLY (default: "google")
 	GoogleMaxPages        int     `yaml:"google_max_pages"`   // default 3
 	BingMaxPages          int     `yaml:"bing_max_pages"`     // default 5
 	DDGMaxPages           int     `yaml:"ddg_max_pages"`      // default 1
@@ -187,6 +188,7 @@ func LoadFromEnv() (*Config, error) {
 		SERP: SERPConfig{
 			SERPDelayMs:      parseEnvInt("SERP_DELAY_MS", 0),
 			Engines:          os.Getenv("SERP_ENGINES"),
+			RetiredEngines:   os.Getenv("SERP_RETIRED_ENGINES"),
 			GoogleMaxPages:   parseEnvInt("GOOGLE_MAX_PAGES", 0),
 			BingMaxPages:     parseEnvInt("BING_MAX_PAGES", 0),
 			DDGMaxPages:      parseEnvInt("DDG_MAX_PAGES", 0),
@@ -279,6 +281,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.SERP.Engines == "" {
 		cfg.SERP.Engines = "all"
+	}
+	if cfg.SERP.RetiredEngines == "" {
+		cfg.SERP.RetiredEngines = "google"
 	}
 	if cfg.SERP.GoogleMaxPages == 0 {
 		cfg.SERP.GoogleMaxPages = 1

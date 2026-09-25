@@ -15,6 +15,14 @@ const (
 	SERPBufferMaxLen = 200
 )
 
+// BufferKeyForEngine scopes the Redis LIST per engine: hachibi and kurawa
+// share one Redis but serve different engines, so a global list would let a
+// host consume jobs it cannot run. The feeder and the workers of one host
+// always use the same per-engine key.
+func BufferKeyForEngine(engine string) string {
+	return SERPBufferKey + ":" + engine
+}
+
 // SERPBufferItem is the JSON payload pushed to serp:buffer.
 type SERPBufferItem struct {
 	ID      string `json:"id"`
@@ -57,21 +65,21 @@ func (f *SERPFeeder) Run(ctx context.Context) {
 		default:
 		}
 
-		// Check buffer depth.
-		bufLen, err := f.redis.LLen(ctx, SERPBufferKey).Result()
+		// Check buffer depth across every engine list this host feeds.
+		engine := f.engines[engineIdx%len(f.engines)]
+		engineIdx++
+
+		bufLen, err := f.redis.LLen(ctx, BufferKeyForEngine(engine)).Result()
 		if err != nil {
-			slog.Warn("serp-feeder: LLEN failed", "error", err)
+			slog.Warn("serp-feeder: LLEN failed", "engine", engine, "error", err)
 			sleepCtx(ctx, 2*time.Second)
 			continue
 		}
 		if bufLen >= SERPBufferMaxLen {
 			sleepCtx(ctx, 1*time.Second)
+			engineIdx--
 			continue
 		}
-
-		// Round-robin: pick from one engine at a time.
-		engine := f.engines[engineIdx%len(f.engines)]
-		engineIdx++
 
 		items := f.claimJobs(ctx, engine)
 		if len(items) == 0 {
@@ -85,7 +93,7 @@ func (f *SERPFeeder) Run(ctx context.Context) {
 		// Push to buffer.
 		for _, item := range items {
 			data, _ := json.Marshal(item)
-			f.redis.RPush(ctx, SERPBufferKey, string(data))
+			f.redis.RPush(ctx, BufferKeyForEngine(engine), string(data))
 		}
 
 		slog.Info("serp-feeder: pushed to buffer", "engine", engine, "count", len(items))
