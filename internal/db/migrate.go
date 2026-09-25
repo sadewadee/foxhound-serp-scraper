@@ -101,8 +101,10 @@ CREATE TABLE IF NOT EXISTS serp_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_claim ON serp_jobs(parent_job_id, status, priority DESC, created_at) WHERE status = 'new';
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_parent ON serp_jobs(parent_job_id);
+CREATE INDEX IF NOT EXISTS idx_serp_jobs_parent_status ON serp_jobs(parent_job_id, status);
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_status ON serp_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_serp_engine ON serp_jobs(engine, status);
+CREATE INDEX IF NOT EXISTS idx_serp_claim_engine ON serp_jobs(engine, priority DESC, created_at) WHERE status = 'new';
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_updated_at ON serp_jobs(updated_at) WHERE status = 'completed';
 CREATE INDEX IF NOT EXISTS idx_serp_locked ON serp_jobs(locked_at) WHERE status = 'processing';
 -- idx_serp_feed and idx_serp_stale created in runMigrations (after ALTER ADD COLUMN picked_at).
@@ -961,6 +963,14 @@ func runMigrations(db *sql.DB) error {
 	// once the valid index exists.
 	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_queries_processing_updated ON queries (updated_at) WHERE status = 'processing'`); err != nil {
 		slog.Warn("db: idx_queries_processing_updated CONCURRENTLY failed — planner will use idx_queries_status fallback", "error", err)
+	}
+
+	// Indexes for stuck-query reconciliation and engine job claiming.
+	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_serp_jobs_parent_status ON serp_jobs (parent_job_id, status)`); err != nil {
+		slog.Warn("db: idx_serp_jobs_parent_status CONCURRENTLY failed", "error", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_serp_claim_engine ON serp_jobs (engine, priority DESC, created_at) WHERE status = 'new'`); err != nil {
+		slog.Warn("db: idx_serp_claim_engine CONCURRENTLY failed", "error", err)
 	}
 
 	// Backs the reenrich eligibility EXISTS subquery

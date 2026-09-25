@@ -209,15 +209,37 @@ func (r *Repository) UpdateStatus(id int64, status string, resultCount int, errM
 	return nil
 }
 
-// RequeueProcessing resets processing queries back to pending (for resume on restart).
-// Limited to 500 per call to avoid statement timeouts on large tables.
+// RequeueProcessing resets true zombie processing queries (queries with NO serp_jobs at all)
+// back to pending (for resume on restart). Queries with existing serp_jobs must NOT be
+// reset to pending, as that causes them to be re-scraped from scratch.
+// Limited to 500 per call and wrapped in statement_timeout (Invariant #2).
 func (r *Repository) RequeueProcessing() (int, error) {
-	res, err := r.db.Exec(`
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("query: requeue processing begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`SET LOCAL statement_timeout = '5000'`); err != nil {
+		_ = err
+	}
+
+	res, err := tx.Exec(`
 		UPDATE queries SET status = 'pending', updated_at = NOW()
-		WHERE id IN (SELECT id FROM queries WHERE status = 'processing' LIMIT 500)
+		WHERE id IN (
+			SELECT q.id FROM queries q
+			WHERE q.status = 'processing'
+			  AND NOT EXISTS (
+				SELECT 1 FROM serp_jobs s WHERE s.parent_job_id = q.id
+			  )
+			LIMIT 500
+		)
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("query: requeue processing: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("query: requeue processing commit: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil

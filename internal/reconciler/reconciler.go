@@ -259,7 +259,7 @@ func (r *ProjectReconciler) healZombieQueries(ctx context.Context, snap Snapshot
 			  AND q.updated_at < NOW() - INTERVAL '10 minutes'
 			  AND NOT EXISTS (
 				SELECT 1 FROM serp_jobs s
-				WHERE s.parent_job_id = q.id AND s.status IN ('new', 'processing')
+				WHERE s.parent_job_id = q.id
 			  )
 			LIMIT %d
 		)
