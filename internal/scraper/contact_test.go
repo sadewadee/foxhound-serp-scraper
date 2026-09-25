@@ -227,6 +227,245 @@ func TestTLDCountryHint(t *testing.T) {
 	}
 }
 
+// TestExtractContacts_JSONLD_GraphFlatten covers root cause #2 of the
+// 2026-09-25 schema.org-overrides-keyword incident: a Yoast/RankMath-style
+// "@graph" wrapper (WebSite + WebPage + Organization + Person + the real
+// business node) must be flattened so the specific business @type
+// (HealthClub) wins BusinessCategory instead of being invisible entirely.
+func TestExtractContacts_JSONLD_GraphFlatten(t *testing.T) {
+	html := `<html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {"@type": "WebSite", "name": "Example Site", "url": "https://example.com"},
+    {"@type": "WebPage", "name": "Contact Us"},
+    {"@type": "Organization", "name": "Example Org"},
+    {"@type": "Person", "name": "Jane Doe"},
+    {"@type": "HealthClub", "name": "Sunrise Health Club", "description": "Friendly neighborhood gym"}
+  ]
+}
+</script>
+</head><body></body></html>`
+
+	cd := ExtractContacts([]byte(html))
+	if cd.BusinessCategory != "HealthClub" {
+		t.Errorf("BusinessCategory = %q; want %q (the real business node inside @graph, not the WebSite/Organization/Person wrapper)", cd.BusinessCategory, "HealthClub")
+	}
+	if cd.BusinessName != "Sunrise Health Club" {
+		t.Errorf("BusinessName = %q; want %q (should prefer the node the chosen category came from)", cd.BusinessName, "Sunrise Health Club")
+	}
+}
+
+// TestExtractContacts_JSONLD_TypeArray covers root cause #2's other half:
+// "@type" as an array (a node belonging to multiple schema.org types at
+// once) must not be silently dropped by a `.(string)` type assertion — and
+// the MORE SPECIFIC member of the array (DaySpa) must win over the generic
+// one (LocalBusiness).
+func TestExtractContacts_JSONLD_TypeArray(t *testing.T) {
+	html := `<html><head>
+<script type="application/ld+json">
+{"@type": ["LocalBusiness", "DaySpa"], "name": "Zen Day Spa"}
+</script>
+</head><body></body></html>`
+
+	cd := ExtractContacts([]byte(html))
+	if cd.BusinessCategory != "DaySpa" {
+		t.Errorf("BusinessCategory = %q; want %q (specific type in the @type array should win over the generic LocalBusiness)", cd.BusinessCategory, "DaySpa")
+	}
+	if cd.BusinessName != "Zen Day Spa" {
+		t.Errorf("BusinessName = %q; want %q", cd.BusinessName, "Zen Day Spa")
+	}
+}
+
+// TestExtractContacts_JSONLD_ContentOnlyStaysEmpty covers root cause #1: a
+// page whose ONLY JSON-LD nodes are content/page-structure types (Article,
+// Person) must leave BusinessCategory empty rather than picking one of them
+// — "Article" and "Person" are never a business category.
+func TestExtractContacts_JSONLD_ContentOnlyStaysEmpty(t *testing.T) {
+	html := `<html><head>
+<script type="application/ld+json">
+{"@graph": [
+  {"@type": "Article", "headline": "5 Tips for Better Sleep"},
+  {"@type": "Person", "name": "John Smith"}
+]}
+</script>
+</head><body></body></html>`
+
+	cd := ExtractContacts([]byte(html))
+	if cd.BusinessCategory != "" {
+		t.Errorf("BusinessCategory = %q; want empty (Article/Person are content types, never a business category)", cd.BusinessCategory)
+	}
+	// NOTE: BusinessName is intentionally NOT asserted empty here. Neither
+	// node wins the category pick (both are tier-3/never), so the field
+	// scan falls back to unchanged pre-existing behavior: the first node
+	// with a "name" field wins, regardless of its @type. Person legitimately
+	// has "name": "John Smith", so it fills BusinessName — that is a
+	// pre-existing, separate concern from BusinessCategory (this fix's
+	// scope) and is not something this change regresses or improves.
+}
+
+// TestExtractContacts_MetaKeywordsNoLongerFillCategory covers the removed
+// fallback: <meta name="keywords"> is SEO keyword soup, not a category, and
+// must no longer land in BusinessCategory (it used to, and the trigger's
+// LENGTH(raw_category) > 100 rule then wrongly excluded real businesses).
+func TestExtractContacts_MetaKeywordsNoLongerFillCategory(t *testing.T) {
+	html := `<html><head>
+<meta name="keywords" content="yoga, pilates, wellness, spa, meditation, jakarta, bali, retreat">
+</head><body></body></html>`
+
+	cd := ExtractContacts([]byte(html))
+	if cd.BusinessCategory != "" {
+		t.Errorf("BusinessCategory = %q; want empty (meta keywords must not fill BusinessCategory)", cd.BusinessCategory)
+	}
+}
+
+// TestPickJSONLDCategory_SpecificityOverFirstWins is a focused unit test on
+// the picker itself: a generic wrapper appearing FIRST in document order
+// must lose to a more specific type appearing later — "first node wins" was
+// the bug (root cause #1); "most specific wins" is the fix.
+func TestPickJSONLDCategory_SpecificityOverFirstWins(t *testing.T) {
+	nodes := []map[string]any{
+		{"@type": "Organization", "name": "Wrapper Org"},
+		{"@type": "YogaStudio", "name": "Real Yoga Studio"},
+	}
+	pick := pickJSONLDCategory(nodes)
+	if pick == nil {
+		t.Fatal("pickJSONLDCategory returned nil; want a pick")
+	}
+	if pick.category != "YogaStudio" {
+		t.Errorf("category = %q; want %q (specific type must beat the generic Organization wrapper regardless of document order)", pick.category, "YogaStudio")
+	}
+	if pick.node["name"] != "Real Yoga Studio" {
+		t.Errorf("picked node name = %v; want %q", pick.node["name"], "Real Yoga Studio")
+	}
+}
+
+// TestPickJSONLDCategory_StructuralValueTypesNeverWin covers the 2026-09-25
+// review fix: categoryTier defaulted every UNRECOGNIZED @type to tier 1
+// (specific), so schema.org structural/value nodes that legitimately appear
+// as top-level @graph members (PostalAddress, GeoCoordinates, ContactPoint,
+// ...) or content families reachable only by suffix (DanceEvent, "Event")
+// would outrank a real business @type sitting right next to them.
+func TestPickJSONLDCategory_StructuralValueTypesNeverWin(t *testing.T) {
+	cases := []struct {
+		name  string
+		nodes []map[string]any
+		want  string
+	}{
+		{
+			"PostalAddress top-level graph member loses to LocalBusiness",
+			[]map[string]any{
+				{"@type": "PostalAddress", "streetAddress": "1 Main St"},
+				{"@type": "LocalBusiness", "name": "Acme"},
+			},
+			"LocalBusiness",
+		},
+		{
+			"DanceEvent (suffix rule: ends in Event) loses to Organization",
+			[]map[string]any{
+				{"@type": "Organization", "name": "Studio Co"},
+				{"@type": "DanceEvent", "name": "Friday Social"},
+			},
+			"Organization",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pick := pickJSONLDCategory(tc.nodes)
+			if pick == nil {
+				t.Fatalf("pickJSONLDCategory returned nil; want %q", tc.want)
+			}
+			if pick.category != tc.want {
+				t.Errorf("category = %q; want %q", pick.category, tc.want)
+			}
+		})
+	}
+}
+
+// TestExtractContacts_JSONLD_TypeArray_SpecificOverGeneric is a regression
+// guard for the array-@type path specifically (as opposed to the
+// multi-node @graph path above): a single node with @type
+// ["LocalBusiness","ExerciseGym"] must still pick the specific member
+// (ExerciseGym) even after the 2026-09-25 categoryTier review fix.
+func TestExtractContacts_JSONLD_TypeArray_SpecificOverGeneric(t *testing.T) {
+	html := `<html><head>
+<script type="application/ld+json">
+{"@type": ["LocalBusiness", "ExerciseGym"], "name": "Iron Works Gym"}
+</script>
+</head><body></body></html>`
+
+	cd := ExtractContacts([]byte(html))
+	if cd.BusinessCategory != "ExerciseGym" {
+		t.Errorf("BusinessCategory = %q; want %q", cd.BusinessCategory, "ExerciseGym")
+	}
+}
+
+// TestFlattenJSONLDNodes_NestedGraph verifies @graph arrays (including a
+// nested array-of-arrays edge case some generators emit) are fully expanded
+// to a flat list, and that a node with no @graph is passed through as-is.
+func TestFlattenJSONLDNodes_NestedGraph(t *testing.T) {
+	raw := []map[string]any{
+		{
+			"@context": "https://schema.org",
+			"@graph": []any{
+				map[string]any{"@type": "WebSite", "name": "A"},
+				map[string]any{"@type": "HealthClub", "name": "B"},
+			},
+		},
+		{"@type": "LocalBusiness", "name": "C"}, // no @graph — passthrough
+	}
+	got := flattenJSONLDNodes(raw)
+	// Expect: the @graph container itself (no usable @type), WebSite, HealthClub, LocalBusiness = 4 nodes.
+	if len(got) != 4 {
+		t.Fatalf("flattenJSONLDNodes returned %d nodes; want 4 (container + 2 graph members + 1 passthrough): %+v", len(got), got)
+	}
+	var sawHealthClub, sawLocalBusiness bool
+	for _, n := range got {
+		if n["name"] == "B" && n["@type"] == "HealthClub" {
+			sawHealthClub = true
+		}
+		if n["name"] == "C" && n["@type"] == "LocalBusiness" {
+			sawLocalBusiness = true
+		}
+	}
+	if !sawHealthClub {
+		t.Error("flattened nodes missing the @graph-nested HealthClub node")
+	}
+	if !sawLocalBusiness {
+		t.Error("flattened nodes missing the passthrough LocalBusiness node")
+	}
+}
+
+// TestJSONLDTypes_ArrayAndPrefix verifies @type normalization: string form,
+// array form, and the schema.org URI/prefix forms some generators emit.
+func TestJSONLDTypes_ArrayAndPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		ld   map[string]any
+		want []string
+	}{
+		{"string", map[string]any{"@type": "HealthClub"}, []string{"HealthClub"}},
+		{"array", map[string]any{"@type": []any{"LocalBusiness", "DaySpa"}}, []string{"LocalBusiness", "DaySpa"}},
+		{"schema prefix", map[string]any{"@type": "schema:HealthClub"}, []string{"HealthClub"}},
+		{"https URI", map[string]any{"@type": "https://schema.org/HealthClub"}, []string{"HealthClub"}},
+		{"missing", map[string]any{}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := jsonLDTypes(tc.ld)
+			if len(got) != len(tc.want) {
+				t.Fatalf("jsonLDTypes(%+v) = %v; want %v", tc.ld, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("jsonLDTypes(%+v)[%d] = %q; want %q", tc.ld, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestApplyTLDCountryFallback_EnvGated(t *testing.T) {
 	t.Run("disabled by default", func(t *testing.T) {
 		os.Unsetenv("COUNTRY_TLD_FALLBACK_ENABLED")

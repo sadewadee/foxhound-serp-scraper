@@ -531,6 +531,8 @@ func runMigrations(db *sql.DB) error {
 		  q_country_name TEXT := '';
 		  q_city TEXT := '';
 		  raw_country_code TEXT := NULL;
+		  niche_text TEXT;
+		  niche_bucket TEXT;
 		BEGIN
 		  IF NEW.status = 'completed' AND (OLD.status IS NULL OR OLD.status != 'completed') THEN
 		    -- Geo lineage (2026-06-10, v4 schema direction): the source query
@@ -556,6 +558,45 @@ func runMigrations(db *sql.DB) error {
 		      WHERE LOWER(c.name) = LOWER(NEW.raw_country) OR c.code = UPPER(NEW.raw_country)
 		      LIMIT 1;
 		    END IF;
+
+		    -- Niche keyword classification (2026-09-25 fix): computed ONCE here
+		    -- instead of re-evaluating the same regex union 15x inline in the
+		    -- INSERT below. niche_bucket is also the SINGLE source of truth the
+		    -- off_niche CASE consults FIRST (before any @type check) — schema.org
+		    -- @type must never override real keyword evidence on the page. See
+		    -- the 2026-09-25 gotcha entry ("schema.org @type overrides keyword
+		    -- niche classification") for the incident this fixes.
+		    --
+		    -- Regex note: every alternation below is wrapped with word-boundary
+		    -- markers around the WHOLE group (or just a leading marker for the
+		    -- intentionally prefix-only stem groups — ayurved/bodywork/therapy/
+		    -- nutrition/naturopathy/coaching/fitness-broadened). The un-grouped
+		    -- form used before this fix only anchored the FIRST alternative at
+		    -- word-start and the LAST at word-end; every
+		    -- alternative in between matched as an unanchored substring
+		    -- ("spin" inside "spinach", "barre" inside "barrel", "hatha"/"asana"
+		    -- mid-word). Kept in lockstep with nicheBuckets in niche.go — same
+		    -- patterns, same precedence (first match wins).
+		    niche_text := LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,''));
+		    niche_bucket := CASE
+		      WHEN niche_text ~ '\m(yoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti|yogi|yogis)\M' THEN 'yoga'
+		      WHEN niche_text ~ '\m(pilates|reformer)\M' THEN 'pilates'
+		      WHEN niche_text ~ '\m(crossfit|bootcamp|hiit|barre|spin)\M' THEN 'fitness'
+		      WHEN niche_text ~ '\m(gym|fitness)\M' THEN 'fitness'
+		      WHEN niche_text ~ '\m(personal train|strength coach|conditioning coach|functional train|kickbox|boxing|martial art|swimming|zumba|pole danc|pole fit|pole instructor|dance)' THEN 'fitness'
+		      WHEN niche_text ~ '\m(meditation|mindfulness|breathwork)\M' THEN 'meditation'
+		      WHEN niche_text ~ '\m(reiki|sound healing|energy healing|healing)\M' THEN 'healing'
+		      WHEN niche_text ~ '\mayurved' THEN 'ayurveda'
+		      WHEN niche_text ~ '\m(spa|massage|thermal)\M' THEN 'spa'
+		      WHEN niche_text ~ '\m(wellness|holistic)\M' THEN 'wellness'
+		      WHEN niche_text ~ '\m(osteopath|physiotherap|physical therap|chiropract|acupunctur|craniosacral|reflexolog|kinesiolog)' THEN 'bodywork'
+		      WHEN niche_text ~ '\m(hypnotherap|psychotherap|counsel)' THEN 'therapy'
+		      WHEN niche_text ~ '\m(dietit|dietician|nutrition)' THEN 'nutrition'
+		      WHEN niche_text ~ '\m(naturopath|herbal|homeopath|homoeopath)' THEN 'naturopathy'
+		      WHEN niche_text ~ '\m(life coach|health coach|mindset coach)' THEN 'coaching'
+		      ELSE NULL
+		    END;
+
 		    -- 1. Upsert business_listings.
 		    --    Forward every raw_* the extractor populates. Previously
 		    --    description and location were hardcoded NULL here, and
@@ -584,24 +625,52 @@ func runMigrations(db *sql.DB) error {
 		        NEW.raw_phones[1], COALESCE(NEW.raw_phones, '{}'), NEW.url, NEW.raw_page_title, NEW.raw_social,
 		        NEW.raw_opening_hours, NEW.raw_rating, NEW.raw_tiktok, NEW.raw_youtube, NEW.raw_telegram,
 		        NEW.parent_query_id,
-		        -- off_niche
+		        -- off_niche (2026-09-25 precedence rewrite — see the niche_text/
+		        -- niche_bucket computation above for the incident this fixes):
+		        --   1. beauty/grooming keyword evidence -> TRUE, always (never
+		        --      overridden — off-target even if some other wellness
+		        --      keyword also appears on the page).
+		        --   2. niche_bucket IS NOT NULL -> FALSE, REGARDLESS of @type.
+		        --      A real keyword match (e.g. "physiotherapy clinic" on a
+		        --      page whose JSON-LD says Physician, or "Yoga Studio" on a
+		        --      page whose JSON-LD says Article/ContactPage) is stronger
+		        --      evidence than a schema.org @type — schema.org @type must
+		        --      never override real page keyword evidence. This is the
+		        --      core fix.
+		        --   3. else raw_category in the hard off-niche business @type
+		        --      list -> TRUE (no keyword evidence AND an explicitly
+		        --      off-target business kind).
+		        --   4. else raw_category is SET and >100 chars (legacy
+		        --      meta-keyword-soup garbage, e.g. an old
+		        --      <meta name="keywords"> value stuffed into raw_category)
+		        --      -> TRUE. NULL / blank / whitespace-only raw_category does
+		        --      NOT match here — "no category info" is NOT off-niche
+		        --      evidence. Many legit contact pages carry no JSON-LD @type
+		        --      at all; their niche is filled later from the SOURCE QUERY
+		        --      by BackfillListingNicheInherit (internal/db/niche.go),
+		        --      which only touches off_niche IS NOT TRUE rows — wrongly
+		        --      forcing NULL category to TRUE here would permanently
+		        --      exclude those rows (2026-09-25 review fix — NULL used to
+		        --      fall through to ELSE FALSE before this file's first pass
+		        --      at this CASE regressed it to TRUE).
+		        --   5. else raw_category is schema.org content/page noise, or a
+		        --      generic business container with no keyword evidence
+		        --      -> TRUE.
+		        --   6. else FALSE (NULL/blank/whitespace-only category, or an
+		        --      unrecognized-but-specific @type, with no positive
+		        --      off-niche signal).
 		        CASE
-		          WHEN NEW.raw_category IS NOT NULL AND LENGTH(NEW.raw_category) > 100 THEN TRUE
-		          -- 2026-06-11 (v0.9.8 broad-wellness scope): off-target beauty/grooming
-		          -- (nail, barber, esthetician, …) is ALWAYS off_niche, even if the page
-		          -- also mentions a wellness keyword. Kept in sync with niche.go
-		          -- beautyOffNichePattern + BackfillNicheTaxonomyV2.
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(nail salon|manicure|pedicure|esthetic|aesthetic|beautician|cosmetolog|barber|hairdress|hair salon|makeup|make-up|eyelash|lash extension|eyebrow|microblad|waxing salon|tattoo)' THEN TRUE
+		          WHEN niche_text ~ '\m(nail salon|manicure|pedicure|esthetic|aesthetic|beautician|cosmetolog|barber|hairdress|hair salon|makeup|make-up|eyelash|lash extension|eyebrow|microblad|waxing salon|tattoo)' THEN TRUE
+		          WHEN niche_bucket IS NOT NULL THEN FALSE
 		          WHEN NEW.raw_category IN (
-		            'AutoDealer','Hotel','Restaurant','Dentist','Physician',
-		            'RealEstateAgent','LegalService','HairSalon','BeautySalon',
+		            'AutoDealer','Hotel','Restaurant','Dentist',
+		            'RealEstateAgent','LegalService','HairSalon','BeautySalon','NailSalon',
 		            'TravelAgency','LodgingBusiness','GeneralContractor',
-		            'RoofingContractor','HomeAndConstructionBusiness',
-		            'MedicalClinic','MedicalBusiness','HealthAndBeautyBusiness'
+		            'RoofingContractor','HomeAndConstructionBusiness'
 		          ) THEN TRUE
-		          -- 2026-06: schema.org content/media/app/page-structure @type
-		          -- values — never a wellness business lead. Always off_niche
-		          -- (category-pollution cleanup; kept in sync with the backfill).
+		          WHEN NEW.raw_category IS NOT NULL AND LENGTH(NEW.raw_category) > 100 THEN TRUE
+		          -- schema.org content/media/app/page-structure @type values —
+		          -- never a wellness business lead on their own.
 		          WHEN NEW.raw_category IN (
 		            'Article','BlogPosting','NewsArticle','TechArticle','MedicalWebPage',
 		            'FAQPage','QAPage','Recipe','HowTo','VideoObject','Movie','Book','Dataset',
@@ -613,60 +682,23 @@ func runMigrations(db *sql.DB) error {
 		            'ImageGallery','WPHeader','WPFooter','WPSidebar','Person','Place',
 		            'contao:Page'
 		          ) THEN TRUE
-		          -- 2026-06: generic business @types + blank category carry no
-		          -- niche signal on their own — off_niche ONLY when the keyword
-		          -- classifier (same union as the niche_category CASE below)
-		          -- matched nothing, so a real wellness business whose page had a
-		          -- generic/empty @type but a niche name/title is still kept.
+		          -- Generic business @type containers + the specific-but-too-broad
+		          -- medical/beauty umbrella types (Physician/MedicalClinic/
+		          -- MedicalBusiness/HealthAndBeautyBusiness moved here 2026-09-25
+		          -- — they no longer hard-force TRUE; niche_bucket at step 2
+		          -- already rescues a real physio/chiro/spa business with page
+		          -- keyword evidence).
 		          WHEN NEW.raw_category IN (
 		            'Organization','organization','LocalBusiness','Corporation','Store',
 		            'OnlineStore','Service','ProfessionalService','EducationalOrganization',
 		            'NewsMediaOrganization','GovernmentOrganization','FinancialService',
-		            'FoodEstablishment','RadioStation',' ',''
-		          ) AND LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                      COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                      COALESCE(NEW.raw_description,'')) !~ '\myoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti|pilates|reformer|crossfit|bootcamp|hiit|barre|spin|gym|fitness|meditation|mindfulness|breathwork|reiki|sound healing|energy healing|healing|ayurved|spa|massage|thermal|personal train|strength coach|conditioning coach|functional train|kickbox|boxing|martial art|swimming|zumba|pole danc|pole fit|pole instructor|dance|osteopath|physiotherap|physical therap|chiropract|acupunctur|craniosacral|reflexolog|kinesiolog|hypnotherap|psychotherap|counsel|dietit|dietician|nutrition|naturopath|herbal|homeopath|homoeopath|life coach|health coach|mindset coach|wellness|holistic\M' THEN TRUE
+		            'FoodEstablishment','RadioStation','Physician','MedicalClinic',
+		            'MedicalBusiness','HealthAndBeautyBusiness'
+		          ) THEN TRUE
 		          ELSE FALSE
 		        END,
-		        -- niche_category
-		        CASE
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\myoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti\M' THEN 'yoga'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\mpilates|reformer\M' THEN 'pilates'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\mcrossfit|bootcamp|hiit|barre|spin\M' THEN 'fitness'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\m(gym|fitness)\M' THEN 'fitness'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(personal train|strength coach|conditioning coach|functional train|kickbox|boxing|martial art|swimming|zumba|pole danc|pole fit|pole instructor|dance)' THEN 'fitness'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\mmeditation|mindfulness|breathwork\M' THEN 'meditation'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\mreiki|sound healing|energy healing|healing\M' THEN 'healing'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\mayurved' THEN 'ayurveda'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\m(spa|massage|thermal)\M' THEN 'spa'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' ||
-		                     COALESCE(NEW.raw_page_title,'') || ' ' ||
-		                     COALESCE(NEW.raw_description,'')) ~ '\m(wellness|holistic)\M' THEN 'wellness'
-		          -- 2026-06-11 (v0.9.8 broad-wellness scope) — health-adjacent buckets.
-		          -- Kept in lockstep with niche.go nicheBuckets + the test.
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(osteopath|physiotherap|physical therap|chiropract|acupunctur|craniosacral|reflexolog|kinesiolog)' THEN 'bodywork'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(hypnotherap|psychotherap|counsel)' THEN 'therapy'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(dietit|dietician|nutrition)' THEN 'nutrition'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(naturopath|herbal|homeopath|homoeopath)' THEN 'naturopathy'
-		          WHEN LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,'')) ~ '\m(life coach|health coach|mindset coach)' THEN 'coaching'
-		          ELSE NULL
-		        END,
+		        -- niche_category — computed once above (niche_bucket).
+		        niche_bucket,
 		        -- country_code (v4 FK-ready ISO-2): page extraction resolved via the
 		        -- countries lookup; falls back to the source query's code.
 		        CASE
@@ -724,10 +756,22 @@ func runMigrations(db *sql.DB) error {
 		        tiktok        = COALESCE(EXCLUDED.tiktok, business_listings.tiktok),
 		        youtube       = COALESCE(EXCLUDED.youtube, business_listings.youtube),
 		        telegram      = COALESCE(EXCLUDED.telegram, business_listings.telegram),
-		        -- Niche fields: only promote a TRUE off_niche so a re-enrichment
-		        -- of a previously-tagged off-niche row never silently flips back
-		        -- to in-niche.
-		        off_niche      = (business_listings.off_niche OR EXCLUDED.off_niche),
+		        -- off_niche (2026-09-25): fresh page evidence of a niche bucket
+		        -- (EXCLUDED.niche_category IS NOT NULL) takes EXCLUDED.off_niche
+		        -- outright — letting a re-enrich that now finds real keyword
+		        -- evidence flip a previously-wrong TRUE back to FALSE (off_niche
+		        -- was unconditionally sticky via OR before this fix, so a wrong
+		        -- TRUE could never self-heal). Safe even for the beauty pattern:
+		        -- beauty text forces EXCLUDED.off_niche=TRUE regardless of
+		        -- niche_bucket (see the off_niche CASE above), so a beauty row
+		        -- that also matches a niche keyword still lands on TRUE here.
+		        -- Otherwise (no fresh bucket this pass) fall back to the old
+		        -- sticky-OR so a genuinely off-niche row never silently flips
+		        -- back to in-niche just because THIS visit found no keyword.
+		        off_niche      = CASE
+		                           WHEN EXCLUDED.niche_category IS NOT NULL THEN EXCLUDED.off_niche
+		                           ELSE (business_listings.off_niche OR EXCLUDED.off_niche)
+		                         END,
 		        -- Niche precedence mirrors geo: a fresh page-extracted niche
 		        -- supersedes a query-inferred one (niche_source='query_inference');
 		        -- otherwise COALESCE keeps the existing bucket when re-enrich misses

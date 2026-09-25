@@ -5,6 +5,27 @@ import (
 	"strings"
 )
 
+// jsonLDTypeString normalizes a JSON-LD "@type" value to a single display
+// string. Schema.org allows "@type" to be either a plain string or an array
+// of strings (a node can belong to multiple types at once, e.g.
+// ["LocalBusiness","HealthClub"]) — the previous `ld["@type"].(string)`
+// assertion silently returned "" for the array form. Returns the first
+// non-empty entry — good enough for Listing.Category, a single display
+// field, not a classifier input.
+func jsonLDTypeString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []any:
+		for _, item := range t {
+			if s, ok := item.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // extractFromJSONLD creates a Listing from a JSON-LD object.
 // Works for LocalBusiness, Restaurant, GymFitness, Organization, etc.
 func extractFromJSONLD(ld map[string]any, source string) Listing {
@@ -26,7 +47,7 @@ func extractFromJSONLD(ld map[string]any, source string) Listing {
 		l.Email = email
 	}
 
-	if typ, ok := ld["@type"].(string); ok {
+	if typ := jsonLDTypeString(ld["@type"]); typ != "" {
 		l.Category = typ
 	}
 
