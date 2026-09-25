@@ -51,6 +51,7 @@ type SERPStage struct {
 	queriesProcessed atomic.Int64
 	urlsFound        atomic.Int64
 	pagesProcessed   atomic.Int64
+	pagesIrrelevant  atomic.Int64
 
 	// 429 cooldown: when consecutive 429s exceed threshold, all tabs back off.
 	consecutive429 atomic.Int64
@@ -504,14 +505,9 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		}
 
 		if fetchErr != nil {
-			attemptKey := "serp:attempt:" + job.ID
-			newAttempt, _ := s.redis.Incr(ctx, attemptKey).Result()
-			s.redis.Expire(ctx, attemptKey, 1*time.Hour)
-
 			errStr := fetchErr.Error()
-			slog.Warn("serp: fetch failed", "job", job.ID, "attempt", newAttempt, "tab", tabID, "error", fetchErr)
 
-			// Fix 2: 429 backoff — sleep this tab before picking next job.
+			// 429 backoff — sleep this tab before picking next job.
 			is429 := strings.Contains(errStr, "429")
 			isCaptcha := strings.Contains(errStr, "captcha")
 			if is429 || isCaptcha {
@@ -527,18 +523,27 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				s.consecutive429.Store(0)
 			}
 
-			maxAttempts := int64(5)
-			if newAttempt >= maxAttempts {
-				s.db.Exec(`UPDATE serp_jobs SET status = 'failed', attempt_count = $1, error_msg = $2, locked_by = NULL, updated_at = NOW() WHERE id = $3`,
-					int(newAttempt), errStr, job.ID)
+			// Atomic SQL increment: attempt_count increments in DB without relying on
+			// transient Redis counters (Invariant #1). Cap against serp_jobs.max_attempts.
+			var newAttempt, maxAttempts int
+			var newStatus string
+			rowErr := s.db.QueryRowContext(ctx, `
+				UPDATE serp_jobs SET
+					attempt_count = attempt_count + 1,
+					status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'failed' ELSE 'new' END,
+					next_attempt_at = CASE WHEN attempt_count + 1 >= max_attempts THEN NULL
+						ELSE NOW() + interval '1 second' * (30 * power(2, LEAST(6, attempt_count))) END,
+					error_msg = $1,
+					locked_by = NULL,
+					picked_at = NULL,
+					updated_at = NOW()
+				WHERE id = $2
+				RETURNING attempt_count, max_attempts, status
+			`, errStr, job.ID).Scan(&newAttempt, &maxAttempts, &newStatus)
+			if rowErr != nil {
+				slog.Error("serp: update failed job error", "job", job.ID, "error", rowErr)
 			} else {
-				shift := newAttempt - 1
-				if shift < 0 {
-					shift = 0
-				}
-				backoffSec := 30 * (1 << shift)
-				s.db.Exec(`UPDATE serp_jobs SET status = 'new', attempt_count = $1, next_attempt_at = NOW() + interval '1 second' * $2, error_msg = $3, locked_by = NULL, picked_at = NULL, updated_at = NOW() WHERE id = $4`,
-					int(newAttempt), backoffSec, errStr, job.ID)
+				slog.Warn("serp: fetch failed", "job", job.ID, "attempt", newAttempt, "max_attempts", maxAttempts, "status", newStatus, "tab", tabID, "error", fetchErr)
 			}
 
 			s.redis.Del(ctx, "serp:lock:"+job.ID)
@@ -578,37 +583,34 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			}
 
 			if len(results) >= 3 && ratio < minRatio {
-				slog.Warn("serp: irrelevant SERP page — treated as soft block",
-					"job", job.ID, "engine", job.Engine, "found", len(results),
-					"relevant", len(kept), "ratio", ratio, "min", minRatio)
-
-				attemptKey := "serp:attempt:" + job.ID
-				newAttempt, _ := s.redis.Incr(ctx, attemptKey).Result()
-				s.redis.Expire(ctx, attemptKey, 1*time.Hour)
-
+				s.pagesIrrelevant.Add(1)
 				errStr := fmt.Sprintf("irrelevant SERP page (ratio %.2f < %.2f)", ratio, minRatio)
-				slog.Warn("serp: relevance soft block", "job", job.ID, "attempt", newAttempt, "tab", tabID, "error", errStr)
 
-				s.consecutive429.Add(1)
-				backoff429 := 30 * time.Second
-				slog.Warn("serp: rate limited, tab backing off", "tab", tabID, "backoff", backoff429)
-				select {
-				case <-ctx.Done():
-				case <-time.After(backoff429):
-				}
-
-				maxAttempts := int64(5)
-				if newAttempt >= maxAttempts {
-					s.db.Exec(`UPDATE serp_jobs SET status = 'failed', attempt_count = $1, error_msg = $2, locked_by = NULL, updated_at = NOW() WHERE id = $3`,
-						int(newAttempt), errStr, job.ID)
+				// Atomic SQL increment: cap retries low specifically for irrelevant pages
+				// (MaxIrrelevantAttempts = 3) because poisoned pages are query-deterministic
+				// and rarely self-heal, so we fail fast to preserve crawl budget and proxy bandwidth.
+				// Does NOT increment consecutive429 or sleep the tab, as this is not a rate limit.
+				var newAttempt, maxAttempts int
+				var newStatus string
+				rowErr := s.db.QueryRowContext(ctx, `
+					UPDATE serp_jobs SET
+						attempt_count = attempt_count + 1,
+						status = CASE WHEN attempt_count + 1 >= $1 OR attempt_count + 1 >= max_attempts THEN 'failed' ELSE 'new' END,
+						next_attempt_at = CASE WHEN attempt_count + 1 >= $1 OR attempt_count + 1 >= max_attempts THEN NULL
+							ELSE NOW() + interval '1 second' * (30 * power(2, LEAST(6, attempt_count))) END,
+						error_msg = $2,
+						locked_by = NULL,
+						picked_at = NULL,
+						updated_at = NOW()
+					WHERE id = $3
+					RETURNING attempt_count, max_attempts, status
+				`, MaxIrrelevantAttempts, errStr, job.ID).Scan(&newAttempt, &maxAttempts, &newStatus)
+				if rowErr != nil {
+					slog.Error("serp: update irrelevant job error", "job", job.ID, "error", rowErr)
 				} else {
-					shift := newAttempt - 1
-					if shift < 0 {
-						shift = 0
-					}
-					backoffSec := 30 * (1 << shift)
-					s.db.Exec(`UPDATE serp_jobs SET status = 'new', attempt_count = $1, next_attempt_at = NOW() + interval '1 second' * $2, error_msg = $3, locked_by = NULL, picked_at = NULL, updated_at = NOW() WHERE id = $4`,
-						int(newAttempt), backoffSec, errStr, job.ID)
+					slog.Warn("serp: irrelevant SERP page — soft-blocked",
+						"job", job.ID, "engine", job.Engine, "attempt", newAttempt, "max_attempts", maxAttempts,
+						"status", newStatus, "found", len(results), "relevant", len(kept), "ratio", ratio, "min", minRatio)
 				}
 
 				s.redis.Del(ctx, "serp:lock:"+job.ID)
@@ -1032,3 +1034,50 @@ func shortHostname() string {
 func (s *SERPStage) QueriesProcessed() int64 { return s.queriesProcessed.Load() }
 func (s *SERPStage) URLsFound() int64        { return s.urlsFound.Load() }
 func (s *SERPStage) PagesProcessed() int64   { return s.pagesProcessed.Load() }
+func (s *SERPStage) PagesIrrelevant() int64  { return s.pagesIrrelevant.Load() }
+
+// MaxIrrelevantAttempts caps retries for poisoned/irrelevant SERP pages.
+// Poisoning is query-deterministic (same query -> same irrelevant results),
+// so retrying repeatedly wastes crawl budget; failing after 3 attempts allows
+// transient engine/proxy routing glitches to recover while capping wasted work.
+const MaxIrrelevantAttempts = 3
+
+// RetryDecision calculates next status, attempt count, and backoff delay.
+type RetryDecision struct {
+	NewAttempt int
+	Status     string // "new" or "failed"
+	BackoffSec int    // 0 if failed
+}
+
+// EvaluateRetryDecision calculates the transition for a failing or soft-blocked job.
+func EvaluateRetryDecision(currentAttempt, maxAttempts, capOverride int) RetryDecision {
+	newAttempt := currentAttempt + 1
+	effectiveCap := maxAttempts
+	if capOverride > 0 && (effectiveCap <= 0 || capOverride < effectiveCap) {
+		effectiveCap = capOverride
+	}
+	if effectiveCap <= 0 {
+		effectiveCap = 3
+	}
+
+	if newAttempt >= effectiveCap {
+		return RetryDecision{
+			NewAttempt: newAttempt,
+			Status:     "failed",
+			BackoffSec: 0,
+		}
+	}
+
+	shift := currentAttempt
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 6 {
+		shift = 6
+	}
+	return RetryDecision{
+		NewAttempt: newAttempt,
+		Status:     "new",
+		BackoffSec: 30 * (1 << shift),
+	}
+}
