@@ -1,6 +1,7 @@
 package directory
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -27,33 +28,52 @@ func (e *YellowPagesExtractor) Extract(body []byte) []Listing {
 		return nil
 	}
 
+	seen := make(map[string]bool)
+
 	// Yellow Pages result cards.
-	doc.Each(".result, .search-results .srp-listing, .v-card", func(_ int, s *goquery.Selection) {
-		name := strings.TrimSpace(s.Find(".business-name a, .n a, h2 a").First().Text())
+	// Prefer .search-results .srp-listing to target organic results and avoid matching
+	// nested elements (.result contains .srp-listing which contains .v-card).
+	cards := doc.Find(".search-results .srp-listing")
+	if cards.Length() == 0 {
+		cards = doc.Find(".srp-listing")
+	}
+	if cards.Length() == 0 {
+		cards = doc.Find(".result")
+	}
+
+	cards.Each(func(_ int, s *goquery.Selection) {
+		name := strings.TrimSpace(s.Find(".business-name a, .business-name, .n a, h2 a").First().Text())
 		if name == "" {
 			return
 		}
 
-		href, _ := s.Find(".business-name a, .n a, h2 a").First().Attr("href")
-		if href != "" && !strings.HasPrefix(href, "http") {
-			href = "https://www.yellowpages.com" + href
-		}
-
 		// Yellow Pages shows website link separately.
 		website, _ := s.Find("a.track-visit-website, a[href*='website']").First().Attr("href")
+		website = strings.TrimSpace(website)
+		if website != "" {
+			website = unwrapYellowPagesURL(website)
+		}
+		if isYellowPagesDomain(website) {
+			website = ""
+		}
 
 		phone := strings.TrimSpace(s.Find(".phone, .phones, [class*='phone']").First().Text())
 		address := strings.TrimSpace(s.Find(".adr, .street-address, [class*='address']").First().Text())
 		category := strings.TrimSpace(s.Find(".categories a, [class*='category']").First().Text())
 
-		url := website
-		if url == "" {
-			url = href
+		// Deduplicate: key by external website if present, otherwise by name + "|" + phone
+		dedupKey := strings.ToLower(name) + "|" + strings.ToLower(phone)
+		if website != "" {
+			dedupKey = "url:" + strings.ToLower(website)
 		}
+		if seen[dedupKey] {
+			return
+		}
+		seen[dedupKey] = true
 
 		listings = append(listings, Listing{
 			Name:     name,
-			URL:      url,
+			URL:      website, // Business website URL only (never internal yellowpages.com detail page)
 			Phone:    phone,
 			Address:  address,
 			Category: category,
@@ -62,4 +82,38 @@ func (e *YellowPagesExtractor) Extract(body []byte) []Listing {
 	})
 
 	return listings
+}
+
+// isYellowPagesDomain returns true if the URL belongs to yellowpages.com or a subdomain.
+func isYellowPagesDomain(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "yellowpages.com" || strings.HasSuffix(host, ".yellowpages.com")
+}
+
+// unwrapYellowPagesURL unwraps external destination URLs from YellowPages redirect/tracking links.
+func unwrapYellowPagesURL(rawURL string) string {
+	if !isYellowPagesDomain(rawURL) {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	for _, qKey := range []string{"target", "url", "dest", "destination", "u"} {
+		if dest := u.Query().Get(qKey); dest != "" {
+			if strings.HasPrefix(dest, "http://") || strings.HasPrefix(dest, "https://") {
+				if !isYellowPagesDomain(dest) {
+					return dest
+				}
+			}
+		}
+	}
+	return rawURL
 }

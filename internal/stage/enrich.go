@@ -44,7 +44,7 @@ import (
 //   - Image/document/CDN (IMDB, Scribd, Shutterstock, Getty)
 //   - Logistics (UPS, FedEx, DHL)
 //   - Academic (PMC NCBI, SAGE, Taylor & Francis)
-//   - Other (RocketReach contacts aggregator, Yellowpages, Whitepages, Walmart)
+//   - Other (RocketReach contacts aggregator, Whitepages, Walmart)
 var blockedDomains = map[string]bool{
 	// Directory aggregators
 	"www.yelp.com": true, "m.yelp.com": true,
@@ -54,8 +54,10 @@ var blockedDomains = map[string]bool{
 	"www.ziprecruiter.com": true, "www.simplyhired.com": true,
 	"www.glassdoor.com": true, "www.glassdoor.co.uk": true, "www.glassdoor.de": true,
 	"www.bbb.org": true, "maps.google.com": true,
-	"www.yellowpages.com": true, "www.whitepages.com": true,
-	"rocketreach.co": true,
+	// www.yellowpages.com re-enabled: re-tested 2026-09-25, foxhound stealth HTTP
+	// successfully fetches YellowPages search pages (200 OK) without proxy.
+	"www.whitepages.com": true,
+	"rocketreach.co":     true,
 
 	// Social / UGC
 	"www.linkedin.com": true,
