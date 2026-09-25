@@ -2,19 +2,13 @@ package stage
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
-	"encoding/hex"
 	"fmt"
-	"net"
-	"net/url"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/sadewadee/serp-scraper/internal/testpg"
 )
 
 // TestReconcileSQLShape locks the invariants of the reconciler queries without a
@@ -86,10 +80,7 @@ func TestParseRetiredEngines(t *testing.T) {
 // absent elsewhere are left alone, pending jobs of another host block
 // completion, and only truly retired engines are dead-lettered.
 func TestReconcileProcessingQueries_HeterogeneousHosts(t *testing.T) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not available")
-	}
-	db := startReconcilePostgres(t)
+	db := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_reconcile_"}).DB()
 	defer db.Close()
 	if _, err := db.Exec(reconcileTestSchema); err != nil {
 		t.Fatalf("schema: %v", err)
@@ -213,11 +204,8 @@ func TestReconcileProcessingQueries_HeterogeneousHosts(t *testing.T) {
 // TestReconcileProcessingQueries_Integration seeds the five query states the
 // reconciler must distinguish and runs one pass against a throwaway Postgres.
 func TestReconcileProcessingQueries_Integration(t *testing.T) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not available")
-	}
 
-	db := startReconcilePostgres(t)
+	db := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_reconcile_"}).DB()
 	defer db.Close()
 
 	if _, err := db.Exec(reconcileTestSchema); err != nil {
@@ -333,10 +321,7 @@ func TestReconcileProcessingQueries_Integration(t *testing.T) {
 // locked rows and picks a disjoint batch, so both finish without timing out
 // and the union of their work equals a single serial pass.
 func TestReconcileProcessingQueries_ConcurrentCallers(t *testing.T) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not available")
-	}
-	db := startReconcilePostgres(t)
+	db := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_reconcile_"}).DB()
 	if _, err := db.Exec(reconcileTestSchema); err != nil {
 		t.Fatalf("schema: %v", err)
 	}
@@ -424,91 +409,3 @@ CREATE TABLE serp_jobs (
     error_msg     TEXT,
     updated_at    TIMESTAMPTZ DEFAULT NOW()
 );`
-
-// startReconcilePostgres boots a throwaway Postgres bound to loopback with
-// random credentials and registers its own cleanup. The hook in this
-// environment blocks docker rm from an ad-hoc shell, so the removal has to
-// happen inside the test process.
-func startReconcilePostgres(t *testing.T) *sql.DB {
-	t.Helper()
-
-	user := "xxchk_" + randHex(t, 3)
-	pass := randB64(t)
-	port := freePort(t)
-	name := "xxchk_reconcile_" + randHex(t, 3)
-
-	run := exec.Command("docker", "run", "--rm", "-d",
-		"--name", name,
-		"-p", "127.0.0.1:"+port+":5432",
-		"-e", "POSTGRES_USER="+user,
-		"-e", "POSTGRES_PASSWORD="+pass,
-		"-e", "POSTGRES_DB=xxchk",
-		"postgres:17")
-	if out, err := run.CombinedOutput(); err != nil {
-		t.Fatalf("start postgres: %v\n%s", err, out)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
-	})
-
-	// Credentials are random and may contain URL-reserved characters, so
-	// build the DSN through net/url rather than Sprintf.
-	u := &url.URL{
-		Scheme:   "postgres",
-		User:     url.UserPassword(user, pass),
-		Host:     "127.0.0.1:" + port,
-		Path:     "/xxchk",
-		RawQuery: "sslmode=disable",
-	}
-	return waitForDB(t, u.String())
-}
-
-func randHex(t *testing.T, n int) string {
-	t.Helper()
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		t.Fatal(err)
-	}
-	return hex.EncodeToString(b)
-}
-
-func randB64(t *testing.T) string {
-	t.Helper()
-	out, err := exec.Command("openssl", "rand", "-base64", "24").Output()
-	if err != nil {
-		t.Fatalf("openssl rand: %v", err)
-	}
-	return strings.TrimSpace(string(out))
-}
-
-func freePort(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	return fmt.Sprintf("%d", ln.Addr().(*net.TCPAddr).Port)
-}
-
-func waitForDB(t *testing.T, dsn string) *sql.DB {
-	t.Helper()
-	deadline := time.Now().Add(60 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		db, err := sql.Open("postgres", dsn)
-		if err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			err = db.PingContext(ctx)
-			cancel()
-			if err == nil {
-				return db
-			}
-			db.Close()
-		}
-		lastErr = err
-		time.Sleep(500 * time.Millisecond)
-	}
-	t.Fatalf("postgres never became ready: %v", lastErr)
-	return nil
-}
