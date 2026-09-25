@@ -46,6 +46,9 @@ var engines = map[string]SearchEngine{
 	"google":     &GoogleEngine{},
 	"bing":       &BingEngine{},
 	"duckduckgo": &DuckDuckGoEngine{},
+	// "searxng" is registered by NewSearXNGEngine (it needs the configured base
+	// URL); GetEngine("searxng") returns nil until then, and EnabledEngines adds
+	// it when SERP_ENGINES asks for it and a URL is configured.
 }
 
 // GetEngine returns the SearchEngine for the given name, or nil if not found.
@@ -55,6 +58,10 @@ func GetEngine(name string) SearchEngine {
 
 // AllEngines returns all registered SearchEngine implementations.
 func AllEngines() []SearchEngine {
+	// SearXNG is intentionally NOT here: it needs a configured base URL, and
+	// EnabledEngines adds it when SERP_ENGINES names it (see the placeholder
+	// branch below). Including it in the default set would run a stage that
+	// cannot fetch anything.
 	return []SearchEngine{&GoogleEngine{}, &BingEngine{}, &DuckDuckGoEngine{}}
 }
 
@@ -67,6 +74,12 @@ func EnabledEngines(enginesCfg string) []SearchEngine {
 	var enabled []SearchEngine
 	for _, name := range strings.Split(enginesCfg, ",") {
 		name = strings.TrimSpace(strings.ToLower(name))
+		if name == "searxng" {
+			// Placeholder; stage init replaces it with the configured instance
+			// (or drops it, with a warning, when SEARXNG_URL is empty).
+			enabled = append(enabled, &SearXNGEngine{})
+			continue
+		}
 		if eng := GetEngine(name); eng != nil {
 			enabled = append(enabled, eng)
 		}

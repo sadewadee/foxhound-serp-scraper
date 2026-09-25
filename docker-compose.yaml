@@ -147,6 +147,13 @@ services:
       GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-1}"
       BING_MAX_PAGES: "${BING_MAX_PAGES:-5}"
       DDG_MAX_PAGES: "${DDG_MAX_PAGES:-5}"
+      # SearXNG engine. The serp container must share a docker network with the
+      # SearXNG container for this URL to resolve. Empty URL = engine dropped.
+      SEARXNG_URL: "${SEARXNG_URL:-}"
+      SEARXNG_MAX_PAGES: "${SEARXNG_MAX_PAGES:-2}"
+      SEARXNG_TIMEOUT_MS: "${SEARXNG_TIMEOUT_MS:-15000}"
+      SEARXNG_ENGINES: "${SEARXNG_ENGINES:-}"
+      SEARXNG_DELAY_MS: "${SEARXNG_DELAY_MS:-1000}"
       SERP_RELEVANCE_MIN: "${SERP_RELEVANCE_MIN:-0.3}"
       SERP_RELEVANCE_GUARD: "${SERP_RELEVANCE_GUARD:-1}"
       # ── Beta features DISABLED for SERP — circuit breaker skips proxy too aggressively ──

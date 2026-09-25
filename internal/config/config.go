@@ -60,14 +60,19 @@ type SERPConfig struct {
 	ResultsPerPage        int     `yaml:"results_per_page"`
 	DelayBetweenPagesMs   int     `yaml:"delay_between_pages_ms"`
 	DelayBetweenQueriesMs int     `yaml:"delay_between_queries_ms"`
-	Concurrency           int     `yaml:"concurrency"`      // number of tabs (goroutines)
-	SERPDelayMs           int     `yaml:"serp_delay_ms"`    // inter-page delay override (0 = use timing profile)
-	Engines               string  `yaml:"engines"`          // "all", "google", "bing", "duckduckgo" (default: "all")
-	GoogleMaxPages        int     `yaml:"google_max_pages"` // default 3
-	BingMaxPages          int     `yaml:"bing_max_pages"`   // default 5
-	DDGMaxPages           int     `yaml:"ddg_max_pages"`    // default 1
-	RelevanceMin          float64 `yaml:"relevance_min"`    // default 0.3
-	RelevanceGuard        bool    `yaml:"relevance_guard"`  // default true ("1", "0" disables)
+	Concurrency           int     `yaml:"concurrency"`        // number of tabs (goroutines)
+	SERPDelayMs           int     `yaml:"serp_delay_ms"`      // inter-page delay override (0 = use timing profile)
+	Engines               string  `yaml:"engines"`            // "all", "google", "bing", "duckduckgo" (default: "all")
+	GoogleMaxPages        int     `yaml:"google_max_pages"`   // default 3
+	BingMaxPages          int     `yaml:"bing_max_pages"`     // default 5
+	DDGMaxPages           int     `yaml:"ddg_max_pages"`      // default 1
+	SearXNGURL            string  `yaml:"searxng_url"`        // base URL; empty disables the engine
+	SearXNGMaxPages       int     `yaml:"searxng_max_pages"`  // default 2
+	SearXNGTimeoutMs      int     `yaml:"searxng_timeout_ms"` // per-request timeout, default 15000
+	SearXNGEngines        string  `yaml:"searxng_engines"`    // optional upstream engine list ("google,brave")
+	SearXNGDelayMs        int     `yaml:"searxng_delay_ms"`   // per-request delay for this engine, default 1000
+	RelevanceMin          float64 `yaml:"relevance_min"`      // default 0.3
+	RelevanceGuard        bool    `yaml:"relevance_guard"`    // default true ("1", "0" disables)
 }
 
 type WebsiteConfig struct {
@@ -180,13 +185,18 @@ func LoadFromEnv() (*Config, error) {
 			Country: os.Getenv("PROXY_COUNTRY"),
 		},
 		SERP: SERPConfig{
-			SERPDelayMs:    parseEnvInt("SERP_DELAY_MS", 0),
-			Engines:        os.Getenv("SERP_ENGINES"),
-			GoogleMaxPages: parseEnvInt("GOOGLE_MAX_PAGES", 0),
-			BingMaxPages:   parseEnvInt("BING_MAX_PAGES", 0),
-			DDGMaxPages:    parseEnvInt("DDG_MAX_PAGES", 0),
-			RelevanceMin:   parseEnvFloat("SERP_RELEVANCE_MIN", 0.3),
-			RelevanceGuard: os.Getenv("SERP_RELEVANCE_GUARD") != "0",
+			SERPDelayMs:      parseEnvInt("SERP_DELAY_MS", 0),
+			Engines:          os.Getenv("SERP_ENGINES"),
+			GoogleMaxPages:   parseEnvInt("GOOGLE_MAX_PAGES", 0),
+			BingMaxPages:     parseEnvInt("BING_MAX_PAGES", 0),
+			DDGMaxPages:      parseEnvInt("DDG_MAX_PAGES", 0),
+			SearXNGURL:       os.Getenv("SEARXNG_URL"),
+			SearXNGMaxPages:  parseEnvInt("SEARXNG_MAX_PAGES", 0),
+			SearXNGTimeoutMs: parseEnvInt("SEARXNG_TIMEOUT_MS", 0),
+			SearXNGEngines:   os.Getenv("SEARXNG_ENGINES"),
+			SearXNGDelayMs:   parseEnvInt("SEARXNG_DELAY_MS", 0),
+			RelevanceMin:     parseEnvFloat("SERP_RELEVANCE_MIN", 0.3),
+			RelevanceGuard:   os.Getenv("SERP_RELEVANCE_GUARD") != "0",
 		},
 		Fetch: FetchConfig{
 			Headless:             true,
@@ -278,6 +288,15 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.SERP.DDGMaxPages == 0 {
 		cfg.SERP.DDGMaxPages = 3
+	}
+	if cfg.SERP.SearXNGMaxPages == 0 {
+		cfg.SERP.SearXNGMaxPages = 2
+	}
+	if cfg.SERP.SearXNGTimeoutMs == 0 {
+		cfg.SERP.SearXNGTimeoutMs = 15000
+	}
+	if cfg.SERP.SearXNGDelayMs == 0 {
+		cfg.SERP.SearXNGDelayMs = 1000
 	}
 	if cfg.SERP.RelevanceMin == 0 {
 		cfg.SERP.RelevanceMin = 0.3

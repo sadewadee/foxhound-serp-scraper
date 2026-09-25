@@ -53,6 +53,10 @@ type SERPStage struct {
 	pagesProcessed   atomic.Int64
 	pagesIrrelevant  atomic.Int64
 
+	// searxngSuspended counts pages where SearXNG reported its own upstream
+	// engines as suspended/rate-limited (requeued without burning an attempt).
+	searxngSuspended atomic.Int64
+
 	// 429 cooldown: when consecutive 429s exceed threshold, all tabs back off.
 	consecutive429 atomic.Int64
 
@@ -66,7 +70,7 @@ type SERPStage struct {
 }
 
 func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPStage {
-	engines := scraper.EnabledEngines(cfg.SERP.Engines)
+	engines := resolveEngines(cfg)
 	engineNames := make([]string, len(engines))
 	for i, e := range engines {
 		engineNames[i] = e.Name()
@@ -304,6 +308,10 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 				if s.cfg.SERP.DDGMaxPages > 0 {
 					maxPages = s.cfg.SERP.DDGMaxPages
 				}
+			case "searxng":
+				if s.cfg.SERP.SearXNGMaxPages > 0 {
+					maxPages = s.cfg.SERP.SearXNGMaxPages
+				}
 			}
 
 			var gl, hl string
@@ -344,6 +352,13 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 	stealth := scraper.NewStealth(s.cfg)
 	stealthCount := 0
 	stealthRecycleAfter := s.cfg.Fetch.StealthRecycleAfter
+	// One plain client per worker for internal engines (SearXNG): reused for
+	// every request, never created per request (Invariant #5).
+	plainClient := scraper.NewPlainHTTPFetcher(time.Duration(s.cfg.SERP.SearXNGTimeoutMs) * time.Millisecond)
+	// Consecutive SearXNG suspensions seen by THIS tab. Drives an escalating
+	// tab sleep so a suspension window stops consuming jobs quickly; reset on
+	// the first successful SearXNG page.
+	suspendStreak := 0
 	defer stealth.Close()
 
 	for {
@@ -485,6 +500,64 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				}
 			}
 			fetchCancel()
+		} else if _, plain := eng.(scraper.PlainHTTPEngine); plain {
+			// Internal service (SearXNG): plain pooled HTTP, no proxy, no TLS
+			// impersonation. Its own per-request delay; the stealth recycle below
+			// does not apply.
+			delay := time.Duration(s.cfg.SERP.SearXNGDelayMs) * time.Millisecond
+			if delay > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+				}
+			}
+			// Escalating tab sleep while SearXNG keeps suspending us: a
+			// suspension window means every job this tab touches would
+			// otherwise be requeued immediately, so slow this tab down.
+			if suspendBackoff := SuspensionBackoff(suspendStreak); suspendBackoff > 0 {
+				slog.Warn("serp: searxng suspending — tab backing off", "tab", tabID,
+					"streak", suspendStreak, "backoff", suspendBackoff)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(suspendBackoff):
+				}
+			}
+			fetchCtx, fetchCancel := context.WithTimeout(ctx, time.Duration(s.cfg.SERP.SearXNGTimeoutMs)*time.Millisecond)
+			var plainStatus int
+			body, plainStatus, fetchErr = plainClient.FetchPlain(fetchCtx, job.URL)
+			fetchCancel()
+
+			// SearXNG capacity failures are not job faults: classify before the
+			// generic fetch-error path below.
+			if _, isSearxng := eng.(*scraper.SearXNGEngine); isSearxng {
+				decision := ClassifySearXNGOutcome(plainStatus, body, fetchErr)
+				switch decision.Outcome {
+				case OutcomeSuspended:
+					suspendStreak++
+					s.searxngSuspended.Add(1)
+					backoff := SuspensionBackoff(suspendStreak)
+					slog.Warn("serp: searxng upstream suspended — requeuing without burning an attempt",
+						"job", job.ID, "tab", tabID, "unresponsive", decision.Engines,
+						"streak", suspendStreak, "tab_backoff", backoff, "error", decision.ErrMsg)
+					s.db.Exec(`UPDATE serp_jobs SET status = 'new', next_attempt_at = NOW() + ($1 || ' seconds')::interval,
+						error_msg = $2, locked_by = NULL, picked_at = NULL, updated_at = NOW() WHERE id = $3`,
+						fmt.Sprintf("%d", int(backoff/time.Second)), decision.ErrMsg, job.ID)
+					s.redis.Del(ctx, "serp:lock:"+job.ID)
+					continue
+				case OutcomeSuccess:
+					// First usable page clears any accumulated tab backoff.
+					suspendStreak = 0
+					// A transport error carrying a usable body (partial read) is
+					// still a page worth trusting: drop the error.
+					fetchErr = nil
+				case OutcomeGenuineFailure:
+					// Fall through to the generic attempt-incrementing path with
+					// the classifier's message.
+					fetchErr = fmt.Errorf("%s", decision.ErrMsg)
+				}
+			}
 		} else {
 			// Recycle stealth fetcher periodically to rotate identity/TLS fingerprint.
 			stealthCount++
@@ -1008,3 +1081,4 @@ func (s *SERPStage) QueriesProcessed() int64 { return s.queriesProcessed.Load() 
 func (s *SERPStage) URLsFound() int64        { return s.urlsFound.Load() }
 func (s *SERPStage) PagesProcessed() int64   { return s.pagesProcessed.Load() }
 func (s *SERPStage) PagesIrrelevant() int64  { return s.pagesIrrelevant.Load() }
+func (s *SERPStage) SearXNGSuspended() int64 { return s.searxngSuspended.Load() }
