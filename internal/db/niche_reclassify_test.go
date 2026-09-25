@@ -53,6 +53,45 @@ func TestBuildReclassifyPredicateSQL_Shape(t *testing.T) {
 	}
 }
 
+// TestBuildReclassifyPredicateSQL_ExcludesHardAndContentCommerceTypes is the
+// 2026-09-26 false-positive audit regression guard: the predicate must also
+// require category NOT IN the HARD off-niche @type list (hardOffNicheTypes —
+// Hotel/Casino/Restaurant/... win over keyword evidence, same as the
+// trigger) and NOT IN the content/commerce @type list
+// (contentCommerceOffNicheTypes — Article/Product/Review/... are never a
+// business lead on their own). Without these two NOT IN clauses, the sweep
+// would have flipped exactly the false positives the 2026-09-25 production
+// dry-run audit caught (Hyatt Place Fremont, Hero Spin Casino, Yogi Flight
+// School, DanzaShop online dance store, ...).
+func TestBuildReclassifyPredicateSQL_ExcludesHardAndContentCommerceTypes(t *testing.T) {
+	sql := buildReclassifyPredicateSQL()
+	if strings.Count(sql, "NOT IN") != 2 {
+		t.Fatalf("buildReclassifyPredicateSQL() must contain exactly 2 NOT IN clauses (hard @type list + content/commerce @type list): %s", sql)
+	}
+	wantHard := "COALESCE(category,'') NOT IN (" + sqlQuotedList(hardOffNicheTypes) + ")"
+	if !strings.Contains(sql, wantHard) {
+		t.Errorf("buildReclassifyPredicateSQL() missing hard off-niche @type exclusion %q: %s", wantHard, sql)
+	}
+	wantContent := "COALESCE(category,'') NOT IN (" + sqlQuotedList(contentCommerceOffNicheTypes) + ")"
+	if !strings.Contains(sql, wantContent) {
+		t.Errorf("buildReclassifyPredicateSQL() missing content/commerce @type exclusion %q: %s", wantContent, sql)
+	}
+	// Spot-check a handful of representative entries from each list so a
+	// regression in sqlQuotedList itself (e.g. wrong separator) doesn't hide
+	// behind an otherwise-matching wantHard/wantContent string built the
+	// same broken way.
+	for _, want := range []string{"'Hotel'", "'Casino'", "'Restaurant'", "'Resort'"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("buildReclassifyPredicateSQL() missing hard @type entry %s: %s", want, sql)
+		}
+	}
+	for _, want := range []string{"'Article'", "'Product'", "'Review'", "'OnlineStore'"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("buildReclassifyPredicateSQL() missing content/commerce @type entry %s: %s", want, sql)
+		}
+	}
+}
+
 func TestBuildReclassifyCountSQL_Shape(t *testing.T) {
 	sql := buildReclassifyCountSQL()
 	if !strings.HasPrefix(sql, "SELECT COUNT(*) FROM business_listings WHERE id > $1 AND id <= $2 AND ") {

@@ -37,12 +37,22 @@ func TestNicheBuckets_WordBoundaries(t *testing.T) {
 		// the fix must not have overcorrected into under-matching.
 		{"hiit class", "fitness"},
 		{"barre studio", "fitness"},
-		{"spin class", "fitness"},
 		{"hatha yoga", "yoga"},
-		// "yogi" is an explicit inflection added alongside the grouping fix
-		// (yoga|...|yogi|yogis) — intentional, documented here so a future
-		// tightening of the yoga pattern doesn't silently drop it.
-		{"yogi tea house", "yoga"},
+		// "yogi"/"yogis" were REMOVED from the yoga group in the 2026-09-26
+		// false-positive audit fix — "Yogi Flight School" (Organization) had
+		// no yoga content at all, just a founder/brand name containing
+		// "yogi". "yoga" (the whole word) still matches; "yogi" alone no
+		// longer buckets anything.
+		{"yogi tea house", ""},
+		{"yogi flight school", ""},
+		// "spin" (bare) was REPLACED with specific fitness phrases in the
+		// same fix — "Hero Spin Casino" and "free spins" (casino/slots
+		// content) must NOT bucket as fitness, while real spin-class copy
+		// still must.
+		{"hero spin casino", ""},
+		{"free spins", ""},
+		{"spin class", "fitness"},
+		{"indoor cycling studio", "fitness"},
 		// "healing" (last alternative in the healing group) as a whole word
 		// must match at both string-boundary positions (after a leading
 		// word, and at end of string).
@@ -122,5 +132,67 @@ func TestTriggerNicheCaseMatchesNicheBuckets(t *testing.T) {
 			continue
 		}
 		cursor += idx + len(want)
+	}
+}
+
+// TestTriggerHardOffNicheListMatchesGoSlice is the lockstep guard between
+// hardOffNicheTypes (niche.go) and the trg_normalize_enrichment off_niche
+// CASE's HARD off-niche @type IN(...) list (migrate.go) — the 2026-09-26
+// false-positive audit fix that made hard @type values (Hotel, Casino, ...)
+// win over keyword evidence again. Unlike buildReclassifyPredicateSQL (which
+// renders hardOffNicheTypes directly into SQL via sqlQuotedList), the
+// trigger's list is a hand-maintained SQL literal — replaceTriggerFunctionIfNewer
+// / fmt.Sprintf render trgNormalizeEnrichmentFnBody with only the version
+// marker substituted (see TestTriggerFnBodiesEmbedVersionMarker in
+// trigger_version_guard_test.go), so nothing else catches the two lists
+// drifting apart. Reads migrate.go via os.ReadFile and asserts every
+// hardOffNicheTypes entry appears, in order, inside the specific IN(...)
+// block marked with the "lockstep: hardOffNicheTypes (niche.go)" comment.
+func TestTriggerHardOffNicheListMatchesGoSlice(t *testing.T) {
+	src, err := os.ReadFile("migrate.go")
+	if err != nil {
+		t.Fatalf("reading migrate.go: %v", err)
+	}
+	content := string(src)
+
+	const startMarker = "lockstep: hardOffNicheTypes (niche.go)"
+	startIdx := strings.Index(content, startMarker)
+	if startIdx == -1 {
+		t.Fatal("could not find the hardOffNicheTypes lockstep marker in migrate.go's off_niche CASE — has the trigger been restructured? update this test's markers (and the marker comment itself) to match")
+	}
+
+	const endMarker = ") THEN TRUE"
+	relEndIdx := strings.Index(content[startIdx:], endMarker)
+	if relEndIdx == -1 {
+		t.Fatal("could not find the closing `) THEN TRUE` for the hard off-niche @type IN(...) list in migrate.go")
+	}
+	block := content[startIdx : startIdx+relEndIdx+len(endMarker)]
+
+	cursor := 0
+	for _, want := range hardOffNicheTypes {
+		wantQuoted := "'" + want + "'"
+		idx := strings.Index(block[cursor:], wantQuoted)
+		if idx == -1 {
+			t.Errorf("trigger hard off-niche @type IN(...) list missing (or out of order relative to hardOffNicheTypes): %s", wantQuoted)
+			continue
+		}
+		cursor += idx + len(wantQuoted)
+	}
+}
+
+// TestOffNicheTypeListsAreSQLSafe guards sqlQuotedList's safety assumption
+// (niche.go doc comment): direct '...' interpolation of hardOffNicheTypes /
+// contentCommerceOffNicheTypes is only safe because neither slice's entries
+// contain a quote (which would break out of the SQL string literal) or a
+// '%' (which fmt.Sprintf would otherwise treat as a directive in some
+// render paths). A future entry violating either must fail here, not in
+// production SQL.
+func TestOffNicheTypeListsAreSQLSafe(t *testing.T) {
+	for _, list := range [][]string{hardOffNicheTypes, contentCommerceOffNicheTypes} {
+		for _, v := range list {
+			if strings.ContainsAny(v, `'%`) {
+				t.Errorf("off-niche @type entry %q contains a quote or '%%' — unsafe for direct SQL interpolation via sqlQuotedList", v)
+			}
+		}
 	}
 }
