@@ -41,11 +41,27 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, enabledEngines 
 
 	// 1. Select bounded batch of processing queries ordered by updated_at ASC.
 	// Uses idx_queries_processing_updated.
+	//
+	// FOR UPDATE SKIP LOCKED (same idiom as the feeder's job claim) is what keeps
+	// the hachibi and kurawa serp containers from fighting over the same rows:
+	// every reconcile runs in every container on both hosts, and without it both
+	// pick the same "500 oldest processing" batch and then contend on the
+	// trailing UPDATEs, which showed up in prod as
+	// `serp: advance active queries: canceling statement due to statement
+	// timeout (57014)`. With the lock held until COMMIT, a concurrent caller
+	// skips the locked rows and picks the next 500 instead, so the two hosts
+	// work on disjoint batches and still both make progress.
+	//
+	// A transaction-scoped advisory lock was the alternative, but it serializes
+	// the pass: the loser returns having done nothing, wasting a host's tick.
+	// SKIP LOCKED gets the same contention-free behavior while keeping both
+	// hosts useful.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id FROM queries
 		WHERE status = 'processing'
 		ORDER BY updated_at ASC
 		LIMIT 500
+		FOR UPDATE SKIP LOCKED
 	`)
 	if err != nil {
 		return ReconcileResult{}, fmt.Errorf("serp: query processing batch: %w", err)

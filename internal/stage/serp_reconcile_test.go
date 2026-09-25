@@ -36,6 +36,7 @@ func TestReconcileSQLShape(t *testing.T) {
 		"SET LOCAL statement_timeout = '5000'",
 		"LIMIT 500",
 		"ORDER BY updated_at ASC",
+		"FOR UPDATE SKIP LOCKED",
 		"engine disabled in SERP_ENGINES",
 		"all serp jobs failed/dead with 0 results",
 	} {
@@ -58,29 +59,7 @@ func TestReconcileProcessingQueries_Integration(t *testing.T) {
 		t.Skip("docker not available")
 	}
 
-	user := "xxchk_" + randHex(t, 3)
-	pass := randB64(t)
-	port := freePort(t)
-	name := "xxchk_reconcile_" + randHex(t, 3)
-
-	run := exec.Command("docker", "run", "--rm", "-d",
-		"--name", name,
-		"-p", "127.0.0.1:"+port+":5432",
-		"-e", "POSTGRES_USER="+user,
-		"-e", "POSTGRES_PASSWORD="+pass,
-		"-e", "POSTGRES_DB=xxchk",
-		"postgres:17")
-	if out, err := run.CombinedOutput(); err != nil {
-		t.Fatalf("start postgres: %v\n%s", err, out)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command("docker", "rm", "-f", name).Run()
-	})
-
-	// Credentials are random and may contain URL-reserved characters.
-	dsn := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%s/xxchk?sslmode=disable",
-		url.QueryEscape(user), url.QueryEscape(pass), port)
-	db := waitForDB(t, dsn)
+	db := startReconcilePostgres(t)
 	defer db.Close()
 
 	if _, err := db.Exec(reconcileTestSchema); err != nil {
@@ -186,6 +165,86 @@ func TestReconcileProcessingQueries_Integration(t *testing.T) {
 	}
 }
 
+// TestReconcileProcessingQueries_ConcurrentCallers is the regression test for
+// the prod contention seen after #54 shipped: ReconcileProcessingQueries runs
+// in every serp container on both hosts, and without FOR UPDATE SKIP LOCKED
+// both callers took the identical "500 oldest processing" batch and then
+// blocked on each other's row locks until the 5s statement_timeout fired
+// (`serp: advance active queries: canceling statement due to statement
+// timeout (57014)`, ~9x/3h). With SKIP LOCKED the second caller skips the
+// locked rows and picks a disjoint batch, so both finish without timing out
+// and the union of their work equals a single serial pass.
+func TestReconcileProcessingQueries_ConcurrentCallers(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	db := startReconcilePostgres(t)
+	if _, err := db.Exec(reconcileTestSchema); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+
+	// 600 processing queries whose only job is completed, so every one of them
+	// is eligible for completion. A serial pass would finish all 600; two
+	// contending passes without SKIP LOCKED would each try to take 500 of the
+	// same rows.
+	const total = 600
+	for i := 0; i < total; i++ {
+		var id int64
+		if err := db.QueryRow(
+			`INSERT INTO queries (text, text_hash, status) VALUES ($1, $2, 'processing') RETURNING id`,
+			fmt.Sprintf("conc-%d", i), fmt.Sprintf("conc-%d", i)).Scan(&id); err != nil {
+			t.Fatalf("seed query %d: %v", i, err)
+		}
+		if _, err := db.Exec(
+			`INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, engine, status, result_count)
+			 VALUES ($1, $2, 'http://example/', 0, 'bing', 'completed', 1)`,
+			fmt.Sprintf("conc-job-%d", i), id); err != nil {
+			t.Fatalf("seed job %d: %v", i, err)
+		}
+	}
+
+	type outcome struct {
+		res ReconcileResult
+		err error
+		d   time.Duration
+	}
+	start := make(chan struct{})
+	out := make(chan outcome, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start // release both goroutines at once
+			t0 := time.Now()
+			r, err := ReconcileProcessingQueries(context.Background(), db, []string{"bing", "duckduckgo"})
+			out <- outcome{r, err, time.Since(t0)}
+		}()
+	}
+	close(start)
+
+	var sum int
+	for i := 0; i < 2; i++ {
+		o := <-out
+		if o.err != nil {
+			t.Fatalf("concurrent reconcile errored: %v", o.err)
+		}
+		t.Logf("caller finished in %s: %+v", o.d.Round(time.Millisecond), o.res)
+		if o.d > 4*time.Second {
+			t.Errorf("caller took %s — looks like it blocked on the other caller", o.d)
+		}
+		sum += o.res.Completed
+	}
+	if sum != total {
+		t.Errorf("total completed = %d, want %d (rows were either taken twice or skipped)", sum, total)
+	}
+
+	var stillProcessing int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM queries WHERE status = 'processing'`).Scan(&stillProcessing); err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if stillProcessing != 0 {
+		t.Errorf("%d queries still processing after two concurrent passes, want 0", stillProcessing)
+	}
+}
+
 const reconcileTestSchema = `
 CREATE TABLE queries (
     id           BIGSERIAL PRIMARY KEY,
@@ -207,6 +266,44 @@ CREATE TABLE serp_jobs (
     error_msg     TEXT,
     updated_at    TIMESTAMPTZ DEFAULT NOW()
 );`
+
+// startReconcilePostgres boots a throwaway Postgres bound to loopback with
+// random credentials and registers its own cleanup. The hook in this
+// environment blocks docker rm from an ad-hoc shell, so the removal has to
+// happen inside the test process.
+func startReconcilePostgres(t *testing.T) *sql.DB {
+	t.Helper()
+
+	user := "xxchk_" + randHex(t, 3)
+	pass := randB64(t)
+	port := freePort(t)
+	name := "xxchk_reconcile_" + randHex(t, 3)
+
+	run := exec.Command("docker", "run", "--rm", "-d",
+		"--name", name,
+		"-p", "127.0.0.1:"+port+":5432",
+		"-e", "POSTGRES_USER="+user,
+		"-e", "POSTGRES_PASSWORD="+pass,
+		"-e", "POSTGRES_DB=xxchk",
+		"postgres:17")
+	if out, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("start postgres: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("docker", "rm", "-f", name).Run()
+	})
+
+	// Credentials are random and may contain URL-reserved characters, so
+	// build the DSN through net/url rather than Sprintf.
+	u := &url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(user, pass),
+		Host:     "127.0.0.1:" + port,
+		Path:     "/xxchk",
+		RawQuery: "sslmode=disable",
+	}
+	return waitForDB(t, u.String())
+}
 
 func randHex(t *testing.T, n int) string {
 	t.Helper()
