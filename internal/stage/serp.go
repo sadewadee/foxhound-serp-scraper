@@ -66,7 +66,7 @@ type SERPStage struct {
 }
 
 func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPStage {
-	engines := scraper.EnabledEngines(cfg.SERP.Engines)
+	engines := resolveEngines(cfg)
 	engineNames := make([]string, len(engines))
 	for i, e := range engines {
 		engineNames[i] = e.Name()
@@ -304,6 +304,10 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 				if s.cfg.SERP.DDGMaxPages > 0 {
 					maxPages = s.cfg.SERP.DDGMaxPages
 				}
+			case "searxng":
+				if s.cfg.SERP.SearXNGMaxPages > 0 {
+					maxPages = s.cfg.SERP.SearXNGMaxPages
+				}
 			}
 
 			var gl, hl string
@@ -344,6 +348,9 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 	stealth := scraper.NewStealth(s.cfg)
 	stealthCount := 0
 	stealthRecycleAfter := s.cfg.Fetch.StealthRecycleAfter
+	// One plain client per worker for internal engines (SearXNG): reused for
+	// every request, never created per request (Invariant #5).
+	plainClient := scraper.NewPlainHTTPFetcher(time.Duration(s.cfg.SERP.SearXNGTimeoutMs) * time.Millisecond)
 	defer stealth.Close()
 
 	for {
@@ -484,6 +491,21 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 					body, fetchErr = scraper.FetchSERP(fetchCtx, browser, job.URL, job.ID)
 				}
 			}
+			fetchCancel()
+		} else if _, plain := eng.(scraper.PlainHTTPEngine); plain {
+			// Internal service (SearXNG): plain pooled HTTP, no proxy, no TLS
+			// impersonation. Its own per-request delay; the stealth recycle below
+			// does not apply.
+			delay := time.Duration(s.cfg.SERP.SearXNGDelayMs) * time.Millisecond
+			if delay > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+				}
+			}
+			fetchCtx, fetchCancel := context.WithTimeout(ctx, time.Duration(s.cfg.SERP.SearXNGTimeoutMs)*time.Millisecond)
+			body, _, fetchErr = plainClient.FetchPlain(fetchCtx, job.URL)
 			fetchCancel()
 		} else {
 			// Recycle stealth fetcher periodically to rotate identity/TLS fingerprint.
