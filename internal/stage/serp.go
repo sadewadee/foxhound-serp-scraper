@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -356,7 +357,10 @@ func (s *SERPStage) bufferKeys() []string {
 			keys = append(keys, feeder.BufferKeyForEngine(e.Name()))
 		}
 	}
-	if len(keys) == 0 {
+	// Always drain the legacy shared list last: a deploy landing on top of a
+	// non-empty old `serp:buffer` would otherwise strand its items. Foreign
+	// items popped from there hit the release-on-miss path, which is safe.
+	if len(keys) == 0 || !slices.Contains(keys, feeder.SERPBufferKey) {
 		keys = append(keys, feeder.SERPBufferKey)
 	}
 	return keys

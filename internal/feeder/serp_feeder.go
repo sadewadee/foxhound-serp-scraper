@@ -76,20 +76,24 @@ func (f *SERPFeeder) Run(ctx context.Context) {
 			continue
 		}
 		if bufLen >= SERPBufferMaxLen {
-			sleepCtx(ctx, 1*time.Second)
-			engineIdx--
+			// This engine's list is saturated — move on so it cannot starve the
+			// other engines.
+			// Sleeping only when a whole round-robin pass was dry keeps a
+			// saturated engine from stalling the others (SearXNG's list is
+			// often full: it consumes slowly by design, 3s per request).
+			if nextPassDry(engineIdx, f.engines) {
+				sleepCtx(ctx, 1*time.Second)
+			}
 			continue
 		}
 
 		items := f.claimJobs(ctx, engine)
 		if len(items) == 0 {
-			// If all engines return 0 in a row, sleep briefly.
-			if engineIdx%len(f.engines) == 0 {
+			if nextPassDry(engineIdx, f.engines) {
 				sleepCtx(ctx, 2*time.Second)
 			}
 			continue
 		}
-
 		// Push to buffer.
 		for _, item := range items {
 			data, _ := json.Marshal(item)
@@ -98,6 +102,13 @@ func (f *SERPFeeder) Run(ctx context.Context) {
 
 		slog.Info("serp-feeder: pushed to buffer", "engine", engine, "count", len(items))
 	}
+}
+
+// nextPassDry reports whether the just-finished engine closed a complete
+// round-robin pass that fed nothing. engineIdx is the counter AFTER the
+// current engine was taken (i.e. it now points at the next engine).
+func nextPassDry(engineIdx int, engines []string) bool {
+	return len(engines) > 0 && engineIdx%len(engines) == 0
 }
 
 // claimJobs atomically claims up to 20 unclaimed jobs for a specific engine.

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
+	"github.com/sadewadee/serp-scraper/internal/feeder"
 	"github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
@@ -21,7 +22,9 @@ func hasEngine(engines []scraper.SearchEngine, name string) bool {
 // TestBufferKeysAreEngineScoped locks the per-host isolation of the Redis
 // buffer: hachibi and kurawa share one Redis, so a single global list let a
 // host consume (and then release) jobs of an engine it cannot run. Every key
-// returned must belong to an engine this stage actually serves.
+// returned must belong to an engine this stage actually serves — plus the
+// legacy shared key, always last, so a deploy on top of a non-empty old buffer
+// drains it instead of stranding those jobs.
 func TestBufferKeysAreEngineScoped(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.SERP.Engines = "searxng,duckduckgo"
@@ -31,14 +34,17 @@ func TestBufferKeysAreEngineScoped(t *testing.T) {
 	s.engines = resolveEngines(cfg)
 
 	keys := s.bufferKeys()
-	if len(keys) != 2 {
-		t.Fatalf("bufferKeys() = %v, want one key per configured engine", keys)
+	if len(keys) != 3 {
+		t.Fatalf("bufferKeys() = %v, want 2 engine keys + the legacy key", keys)
 	}
 	want := map[string]bool{"serp:buffer:searxng": true, "serp:buffer:duckduckgo": true}
-	for _, k := range keys {
+	for _, k := range keys[:2] {
 		if !want[k] {
 			t.Errorf("bufferKeys() = %q, want one of the configured engines", k)
 		}
+	}
+	if last := keys[len(keys)-1]; last != feeder.SERPBufferKey {
+		t.Errorf("last buffer key = %q, want the legacy %q so it drains", last, feeder.SERPBufferKey)
 	}
 }
 
