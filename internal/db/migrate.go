@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -273,305 +275,46 @@ CREATE INDEX IF NOT EXISTS idx_category_stats_biz_count ON category_stats (biz_c
 //     forever.
 const idxBlReenrichScoreDDL = `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_reenrich_score ON business_listings (completeness_score) WHERE re_enriched_at IS NULL`
 
-// runMigrations applies incremental schema changes that are safe to re-run.
-func runMigrations(db *sql.DB) error {
-	// Enable pgcrypto for SHA-256 hashing in triggers.
-	if _, err := db.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
-		return fmt.Errorf("db: create extension pgcrypto: %w", err)
-	}
+// enqueueTriggerVersion and normalizeTriggerVersion are the current
+// definitions' versions (YYYYMMDD). Bump the relevant const whenever that
+// trigger function's body changes.
+//
+// Each version is embedded into its function body as a
+// "-- <fn> version: NNNNNNNN" marker (trgEnqueueEnrichmentFnBody /
+// trgNormalizeEnrichmentFnBody below), which liveTriggerFnVersion reads back
+// out of pg_proc at boot. This guards against the 2026-09-25 incident: a
+// stale remote-worker binary (v0.8.3-niche) called db.Migrate() on every
+// boot and its unconditional CREATE OR REPLACE FUNCTION silently downgraded
+// the live trg_normalize_enrichment to its old definition, so the v0.9.0
+// v0.9.8 classifier fixes never took effect in prod. replaceTriggerFunctionIfNewer
+// (below) refuses to replace a live function whose embedded version is newer
+// than the binary's — it does NOT upgrade stale binaries; those still need
+// a real deploy.
+const enqueueTriggerVersion = 20260925
+const normalizeTriggerVersion = 20260925
 
-	// GUARDRAIL: Legacy tables renamed to _backup, NEVER dropped.
-	// Incident 2026-04-03: DROP TABLE destroyed 344K emails. Never again.
-	db.Exec(`ALTER TABLE IF EXISTS enrich_jobs RENAME TO enrich_jobs_backup`)
-	db.Exec(`ALTER TABLE IF EXISTS websites RENAME TO websites_backup`)
-
-	// Add picked_at column to serp_jobs if missing (from redesign).
-	if _, err := db.Exec(`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`); err != nil {
-		return fmt.Errorf("db: add picked_at column: %w", err)
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_feed ON serp_jobs(created_at) WHERE status = 'new' AND picked_at IS NULL`); err != nil {
-		return fmt.Errorf("db: create idx_serp_feed: %w", err)
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_stale ON serp_jobs(picked_at) WHERE status = 'new' AND picked_at IS NOT NULL`); err != nil {
-		return fmt.Errorf("db: create idx_serp_stale: %w", err)
-	}
-
-	// Index for reconciler: retire exhausted failed jobs to 'dead' and resurrect viable ones.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_failed_retry ON serp_jobs(updated_at) WHERE status = 'failed'`); err != nil {
-		return fmt.Errorf("db: create idx_serp_failed_retry: %w", err)
-	}
-
-	// V2 API performance indexes.
-	// pg_trgm extension for ILIKE search index.
-	db.Exec(`CREATE EXTENSION IF NOT EXISTS pg_trgm`)
-	for _, stmt := range []string{
-		// emails.created_at: used by stats last_hour/last_24h queries (noted in gotchas.md 2026-04-06).
-		`CREATE INDEX IF NOT EXISTS idx_emails_created_at ON emails(created_at)`,
-		// business_listings.business_name: used by V2 search filter (ILIKE).
-		// pg_trgm GIN index supports ILIKE efficiently.
-		`CREATE INDEX IF NOT EXISTS idx_bl_name_trgm ON business_listings USING gin(business_name gin_trgm_ops)`,
-		// business_listings.phone: used by V2 stats with_phone count.
-		`CREATE INDEX IF NOT EXISTS idx_bl_phone ON business_listings(phone) WHERE phone IS NOT NULL AND phone != ''`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			// pg_trgm might not be available on some setups; log and continue.
-			slog.Warn("db: optional index creation", "error", err)
-		}
-	}
-
-	// Populate emails.domain and emails.local_part for rows that have NULLs.
-	if _, err := db.Exec(`UPDATE emails SET domain = split_part(email, '@', 2), local_part = split_part(email, '@', 1) WHERE domain IS NULL AND email LIKE '%@%'`); err != nil {
-		return fmt.Errorf("db: backfill email domain/local_part: %w", err)
-	}
-
-	// Add delta tracking columns to workers for per-heartbeat rate calculation.
-	for _, stmt := range []string{
-		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_prev BIGINT DEFAULT 0`,
-		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_prev BIGINT DEFAULT 0`,
-		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_delta INT DEFAULT 0`,
-		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_delta INT DEFAULT 0`,
-		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS delta_at TIMESTAMPTZ`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("db: worker delta columns: %w", err)
-		}
-	}
-
-	// Schema fix 2026-04-27: extraction layer captured fields that the trigger
-	// hardcoded to NULL (description, location) or never had a column for
-	// (country, city, contact_name, opening_hours, rating, multi-phone).
-	// Add missing columns + raw_* counterparts; the trigger update later in
-	// this file forwards them. opening_hours/rating remain optional — they
-	// stay null when extraction misses them.
-	for _, stmt := range []string{
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country TEXT`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS city TEXT`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS contact_name TEXT`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS phones TEXT[] DEFAULT '{}'`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS tiktok TEXT`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS youtube TEXT`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS telegram TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_country TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_city TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_contact_name TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_description TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_location TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_opening_hours TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_rating TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_tiktok TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_youtube TEXT`,
-		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_telegram TEXT`,
-		`CREATE INDEX IF NOT EXISTS idx_bl_country ON business_listings(country) WHERE country IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_bl_city ON business_listings(city) WHERE city IS NOT NULL`,
-		// Niche infrastructure (2026-05-22). The category column is contaminated:
-		// ~6K rows are explicit off-niche schema.org types (Hotel, AutoDealer,
-		// Dentist, Restaurant, ...) and ~41K are meta-keyword soup (>100 chars).
-		// off_niche flag lets the API default-filter to wellness/yoga/fitness
-		// results without DELETing data (memory feedback_never_drop_data.md).
-		// niche_category is the trigger-classified bucket (yoga, pilates,
-		// fitness, wellness, healing, ayurveda, spa, meditation) for the
-		// upcoming ?niche= filter. Both columns also wired into the upsert
-		// trigger below so new rows get tagged at insert time.
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS off_niche BOOLEAN DEFAULT FALSE`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_category TEXT`,
-		// completeness_score (0-100): precomputed reenrich-eligibility score, set by
-		// trg_normalize_enrichment + a one-time backfill, so the reenrich worker
-		// filters on an indexed column instead of a per-candidate correlated EXISTS
-		// (the 2026-06-02 eligibility timeout storm). NULL = not yet scored.
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS completeness_score SMALLINT`,
-		// Geo lineage (2026-06-10): queries carry the targeted city alongside
-		// country; listings record where their geo came from (NULL = page
-		// extraction, 'query_inference' = inherited from the source query).
-		// MUST run before the trg_normalize_enrichment CREATE OR REPLACE below
-		// — the new function body references both columns, and live enrich
-		// completions fire it the moment it is replaced.
-		`ALTER TABLE queries ADD COLUMN IF NOT EXISTS city TEXT DEFAULT ''`,
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS geo_source TEXT`,
-		// niche_source: provenance for niche_category — NULL = page extraction
-		// (the trigger classifier), 'query_inference' = inherited from the source
-		// query text (BackfillListingNicheInherit). Lets a later re-enrich that
-		// finds a real page keyword supersede an inferred bucket (precedence in the
-		// ON CONFLICT below), exactly like geo_source does for country/city.
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_source TEXT`,
-		// country_code: the v4 FK-ready ISO-2 column, populated alongside the
-		// legacy full-name country text (drop-legacy-last per the v4 migration
-		// notes). No FK constraint yet — added once legacy values are migrated.
-		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country_code CHAR(2)`,
-		// business_listings is read-hot (the v2 results API counts/filters it)
-		// and write-hot (enrich upserts continuously). Default autovacuum
-		// (scale_factor 0.2 → ~220K dead/inserted tuples before a vacuum) lets the
-		// visibility map go stale, so the index-only COUNT(*) for ?category=
-		// degrades to ~72K heap fetches and times out (the 2026-06-02 category
-		// fetch 500s — VACUUM gave temporary relief). Aggressive per-table
-		// autovacuum keeps the VM fresh → index-only counts stay ~100ms. Storage
-		// params only: online, no restart, no table rewrite. (Distinct from the
-		// gated global Phase 6 tuning, which needs a Postgres restart.)
-		`ALTER TABLE business_listings SET (
-		    autovacuum_vacuum_scale_factor = 0.02,
-		    autovacuum_analyze_scale_factor = 0.02,
-		    autovacuum_vacuum_insert_scale_factor = 0.02,
-		    autovacuum_vacuum_cost_delay = 2
-		)`,
-		// idx_bl_niche_active + idx_bl_off_niche_false are created BELOW with
-		// CONCURRENTLY (auditor P1 fix): plain CREATE INDEX takes ShareLock on
-		// business_listings (779K rows), and with 7 deploy containers racing
-		// db.Migrate() against PG_MAX_OPEN_CONNS=2 the lock contention saturates
-		// the pool. CONCURRENTLY uses ShareUpdateExclusiveLock instead, which
-		// doesn't block concurrent writes. Cannot live inside this batch since
-		// CONCURRENTLY is illegal inside a transaction block.
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
-		}
-	}
-
-	// Bootstrap category_stats on a fresh database now that niche_category /
-	// off_niche exist (see categoryStatsBootstrapDDL doc comment). IF NOT
-	// EXISTS makes this a no-op on any existing deploy.
-	if _, err := db.Exec(categoryStatsBootstrapDDL); err != nil {
-		return fmt.Errorf("db: category_stats bootstrap: %w", err)
-	}
-
-	// Niche indexes — created CONCURRENTLY outside any tx (CLAUDE.md /
-	// CONCURRENTLY is illegal inside a tx block).
-	//
-	//   idx_bl_niche_active   — serves ?include_off_niche=false + ?niche=X.
-	//                            Skips NULL niche_category to keep idx small
-	//                            on the long tail of unclassified rows.
-	//   idx_bl_off_niche_false — serves the default-listing path (no niche
-	//                            filter, just off_niche=false). PK already
-	//                            covers ORDER BY bl.id, this partial idx
-	//                            backs the WHERE predicate.
-	//
-	// Failure handling: CONCURRENTLY can race with parallel deploys; one of
-	// the 7 containers will succeed, the rest will see IF NOT EXISTS and skip.
-	// We log+continue on error rather than failing the entire migration, since
-	// the partial idx is an optimization, not a correctness requirement (the
-	// planner falls back to PK scan + filter, slower but correct).
-	for _, stmt := range []string{
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_niche_active ON business_listings(niche_category) WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`,
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_off_niche_false ON business_listings(id) WHERE off_niche IS NOT TRUE`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			slog.Warn("db: niche index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
-				"stmt", stmt, "error", err)
-		}
-	}
-
-	// Healing index: makes healZombieQueries fast on the ~116K stuck-processing
-	// rows. The reconciler hits this predicate every 60s; without the index it
-	// would do a full seqscan on the 3.16M-row queries table.
-	//
-	// Using CONCURRENTLY (outside any tx) so it doesn't take a ShareLock that
-	// would stall writes on the queries table during deploy (same reason as the
-	// niche indexes above). CONCURRENTLY cannot run inside a transaction block.
-	// Log-and-continue: if it fails (e.g. a previous failed concurrent build
-	// left an INVALID index), the migration still succeeds — the planner will
-	// fall back to the existing idx_queries_status B-tree, which is slower but
-	// correct. The next successful deploy will retry and IF NOT EXISTS will no-op
-	// once the valid index exists.
-	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_queries_processing_updated ON queries (updated_at) WHERE status = 'processing'`); err != nil {
-		slog.Warn("db: idx_queries_processing_updated CONCURRENTLY failed — planner will use idx_queries_status fallback", "error", err)
-	}
-
-	// Backs the reenrich eligibility EXISTS subquery
-	// (e.is_acceptable = true OR e.score >= 0.7), which otherwise re-evaluates
-	// per candidate row and was a contributor to the 5s statement_timeout that
-	// drove the reenrich health-flap (2026-06-01). CONCURRENTLY + log-continue,
-	// same pattern as the niche indexes above.
-	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_emails_acceptable_score ON emails (is_acceptable, score)`); err != nil {
-		slog.Warn("db: idx_emails_acceptable_score CONCURRENTLY failed — reenrich eligibility EXISTS will fall back to PK scan", "error", err)
-	}
-
-	// Read-path indexes for business_listings and business_emails.
-	//
-	//   idx_bl_created_at  — backs ORDER BY created_at DESC on the v2 results
-	//                         listing endpoint; without it every paginated read
-	//                         on the 779K-row table does a full sort.
-	//   idx_bl_updated_at  — backs ORDER BY updated_at DESC for the "recently
-	//                         enriched" feed and the reenrich eligibility query.
-	//   idx_bl_category    — backs ?category= filter on v2 results; partial
-	//                         (category IS NOT NULL) keeps the index small.
-	//   idx_be_email_id    — backs the business_emails → emails JOIN on
-	//                         email_id; the junction's PK covers (business_id,
-	//                         email_id) but not the reverse lookup.
-	//
-	// All created CONCURRENTLY outside any tx (same reason as the niche indexes
-	// above). Log-and-continue: failure here is non-fatal — the planner falls
-	// back to PK scans, slower but correct.
-	for _, stmt := range []string{
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_created_at ON business_listings (created_at DESC)`,
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_updated_at ON business_listings (updated_at DESC)`,
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category ON business_listings (category) WHERE category IS NOT NULL`,
-		// Composite for ?category= + the default id_desc sort: serves
-		// WHERE category=X ORDER BY bl.id DESC LIMIT N without a separate sort
-		// over the (high-cardinality) filtered set, e.g. category=yogaalliance
-		// has ~77K rows and timed out the plain category+PK-backward-scan path.
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category_id ON business_listings (category, id DESC) WHERE category IS NOT NULL`,
-		// Partial composite over the DEFAULT off_niche-excluded set: the v2 results
-		// count for ?category=X filters `off_niche IS NOT TRUE`, which idx_bl_category
-		// can't cover (heap fetch per row → ~12s on the 77K yogaalliance category).
-		// This makes the count an index-only scan and the list an index scan.
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category_offniche ON business_listings (category, id DESC) WHERE off_niche IS NOT TRUE`,
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_email_id ON business_emails (email_id)`,
-		// Backs the ?source= filter EXISTS(business_emails.source = $N). Partial on
-		// the ~80K non-'enrichment' (directory-crawler) rows only — without it the
-		// correlated EXISTS seq-scans 3.9M rows → 57014 timeout (500).
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_source ON business_emails (source, business_id) WHERE source <> 'enrichment'`,
-		// Backs the reenrich eligibility query: WHERE re_enriched_at IS NULL AND
-		// completeness_score < $1. Partial on the (shrinking) un-reenriched set.
-		// On a fresh database this attempt is expected to fail and log below —
-		// re_enriched_at doesn't exist yet at this point in runMigrations. It
-		// is retried (and self-heals) right after the reenrichColVersion ALTER
-		// further down guarantees the column exists — see idxBlReenrichScoreDDL.
-		idxBlReenrichScoreDDL,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			slog.Warn("db: read-path index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
-				"stmt", stmt, "error", err)
-		}
-	}
-
-	// --- Triggers ---
-
-	// Trigger 1: serp_results INSERT -> create enrichment_job.
-	if _, err := db.Exec(`
+// trgEnqueueEnrichmentFnBody is the trg_enqueue_enrichment CREATE OR REPLACE
+// statement, with a %d placeholder for enqueueTriggerVersion — the single
+// source of truth for both the executed SQL and the marker
+// liveTriggerFnVersion reads back.
+const trgEnqueueEnrichmentFnBody = `
 		CREATE OR REPLACE FUNCTION trg_enqueue_enrichment()
 		RETURNS TRIGGER AS $$
 		BEGIN
+		  -- trg_enqueue_enrichment version: %d
 		  INSERT INTO enrichment_jobs (url, url_hash, domain, parent_query_id, source, status)
 		  VALUES (NEW.url, NEW.url_hash, NEW.domain, NEW.source_query_id, 'serp_result', 'pending')
 		  ON CONFLICT (url_hash) DO NOTHING;
 		  RETURN NEW;
 		END;
 		$$ LANGUAGE plpgsql;
-	`); err != nil {
-		return fmt.Errorf("db: create trg_enqueue_enrichment function: %w", err)
-	}
-	// Bind the trigger only if it is missing. CREATE OR REPLACE FUNCTION above
-	// already updates the body lock-free; the previous unconditional
-	// DROP TRIGGER … CREATE TRIGGER took an ACCESS EXCLUSIVE lock on serp_results
-	// on EVERY boot and was a primary driver of the boot DDL herd. The trigger
-	// binding never changes, so create it once and skip thereafter. (If the
-	// binding ever needs to change, do it via a one-shot versioned migration.)
-	if _, err := db.Exec(`
-		DO $$
-		BEGIN
-		  IF NOT EXISTS (
-		    SELECT 1 FROM pg_trigger
-		    WHERE tgname = 'trg_serp_results_enqueue' AND NOT tgisinternal
-		  ) THEN
-		    CREATE TRIGGER trg_serp_results_enqueue
-		      AFTER INSERT ON serp_results
-		      FOR EACH ROW EXECUTE FUNCTION trg_enqueue_enrichment();
-		  END IF;
-		END $$;
-	`); err != nil {
-		return fmt.Errorf("db: create trg_serp_results_enqueue trigger: %w", err)
-	}
+`
 
-	// Trigger 2: enrichment_jobs completed -> normalize + queue contact pages.
-	if _, err := db.Exec(`
+// trgNormalizeEnrichmentFnBody is the trg_normalize_enrichment CREATE OR
+// REPLACE statement, with a %d placeholder for normalizeTriggerVersion —
+// the single source of truth for both the executed SQL and the marker
+// liveTriggerFnVersion reads back.
+const trgNormalizeEnrichmentFnBody = `
 		CREATE OR REPLACE FUNCTION trg_normalize_enrichment()
 		RETURNS TRIGGER AS $$
 		DECLARE
@@ -585,6 +328,7 @@ func runMigrations(db *sql.DB) error {
 		  niche_text TEXT;
 		  niche_bucket TEXT;
 		BEGIN
+		  -- trg_normalize_enrichment version: %d
 		  IF NEW.status = 'completed' AND (OLD.status IS NULL OR OLD.status != 'completed') THEN
 		    -- Geo lineage (2026-06-10, v4 schema direction): the source query
 		    -- carries the targeted city + ISO-2 country (resolved at INSERT time
@@ -901,7 +645,376 @@ func runMigrations(db *sql.DB) error {
 		  RETURN NEW;
 		END;
 		$$ LANGUAGE plpgsql;
+`
+
+// triggerVersionMarkerRe parses the "-- <fn> version: NNNNNNNN" marker
+// embedded in a trigger function's plpgsql body (see enqueueTriggerVersion /
+// normalizeTriggerVersion above). Deliberately loose — it only needs to find
+// digits after "version:" within the source pulled for one specific
+// proname, so it doesn't need to also match the function name.
+var triggerVersionMarkerRe = regexp.MustCompile(`version:\s*(\d+)`)
+
+// parseTriggerVersionMarker extracts the version out of a trigger function's
+// plpgsql source via triggerVersionMarkerRe. Returns 0 — "no usable version
+// info" — when the marker is absent, or present but its captured text isn't
+// a valid integer (a mangled/garbage marker). Split out from
+// liveTriggerFnVersion so the parsing logic is unit-testable without a DB.
+func parseTriggerVersionMarker(prosrc string) int {
+	m := triggerVersionMarkerRe.FindStringSubmatch(prosrc)
+	if m == nil {
+		return 0
+	}
+	v, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// liveTriggerFnVersion reads the currently-live plpgsql body of function fn
+// (public schema) from pg_proc and parses its embedded version marker.
+// Returns 0 — "no version info, always replaceable" — when the function
+// doesn't exist yet, or exists but predates the marker convention (i.e.
+// every pre-guard version, which must remain freely replaceable).
+func liveTriggerFnVersion(db *sql.DB, fn string) (int, error) {
+	var prosrc string
+	err := db.QueryRow(`
+		SELECT p.prosrc
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE p.proname = $1 AND n.nspname = 'public'
+	`, fn).Scan(&prosrc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return parseTriggerVersionMarker(prosrc), nil
+}
+
+// shouldReplaceTriggerFn reports whether a CREATE OR REPLACE carrying
+// version `ours` should proceed given the live function's parsed version
+// `live`. Live newer than ours means some other (newer) deploy already
+// upgraded the function — this binary must never downgrade it back. Equal
+// versions still replace, keeping today's idempotent CREATE OR REPLACE
+// behavior for same-version boots.
+func shouldReplaceTriggerFn(live, ours int) bool {
+	return live <= ours
+}
+
+// replaceTriggerFunctionIfNewer executes createSQL (a CREATE OR REPLACE
+// FUNCTION statement for fn, versioned ourVersion) unless the live database
+// already carries a NEWER version of fn — in which case the replace is
+// skipped and a Warn is logged instead (Invariant #7: fail-open paths must
+// log). A version-check query error also fails open (matches this file's
+// pre-guard behavior for any DB error) but always logs, so operators can see
+// the guard is running degraded.
+func replaceTriggerFunctionIfNewer(db *sql.DB, fn string, ourVersion int, createSQL string) error {
+	live, err := liveTriggerFnVersion(db, fn)
+	if err != nil {
+		slog.Warn("db: failed to read live trigger function version — proceeding with replace",
+			"fn", fn, "error", err)
+	} else if !shouldReplaceTriggerFn(live, ourVersion) {
+		slog.Warn("db: live trigger function is newer than this binary — NOT downgrading",
+			"fn", fn, "live_version", live, "binary_version", ourVersion)
+		return nil
+	}
+	_, err = db.Exec(createSQL)
+	return err
+}
+
+// runMigrations applies incremental schema changes that are safe to re-run.
+func runMigrations(db *sql.DB) error {
+	// Enable pgcrypto for SHA-256 hashing in triggers.
+	if _, err := db.Exec(`CREATE EXTENSION IF NOT EXISTS pgcrypto`); err != nil {
+		return fmt.Errorf("db: create extension pgcrypto: %w", err)
+	}
+
+	// GUARDRAIL: Legacy tables renamed to _backup, NEVER dropped.
+	// Incident 2026-04-03: DROP TABLE destroyed 344K emails. Never again.
+	db.Exec(`ALTER TABLE IF EXISTS enrich_jobs RENAME TO enrich_jobs_backup`)
+	db.Exec(`ALTER TABLE IF EXISTS websites RENAME TO websites_backup`)
+
+	// Add picked_at column to serp_jobs if missing (from redesign).
+	if _, err := db.Exec(`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`); err != nil {
+		return fmt.Errorf("db: add picked_at column: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_feed ON serp_jobs(created_at) WHERE status = 'new' AND picked_at IS NULL`); err != nil {
+		return fmt.Errorf("db: create idx_serp_feed: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_stale ON serp_jobs(picked_at) WHERE status = 'new' AND picked_at IS NOT NULL`); err != nil {
+		return fmt.Errorf("db: create idx_serp_stale: %w", err)
+	}
+
+	// Index for reconciler: retire exhausted failed jobs to 'dead' and resurrect viable ones.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_failed_retry ON serp_jobs(updated_at) WHERE status = 'failed'`); err != nil {
+		return fmt.Errorf("db: create idx_serp_failed_retry: %w", err)
+	}
+
+	// V2 API performance indexes.
+	// pg_trgm extension for ILIKE search index.
+	db.Exec(`CREATE EXTENSION IF NOT EXISTS pg_trgm`)
+	for _, stmt := range []string{
+		// emails.created_at: used by stats last_hour/last_24h queries (noted in gotchas.md 2026-04-06).
+		`CREATE INDEX IF NOT EXISTS idx_emails_created_at ON emails(created_at)`,
+		// business_listings.business_name: used by V2 search filter (ILIKE).
+		// pg_trgm GIN index supports ILIKE efficiently.
+		`CREATE INDEX IF NOT EXISTS idx_bl_name_trgm ON business_listings USING gin(business_name gin_trgm_ops)`,
+		// business_listings.phone: used by V2 stats with_phone count.
+		`CREATE INDEX IF NOT EXISTS idx_bl_phone ON business_listings(phone) WHERE phone IS NOT NULL AND phone != ''`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			// pg_trgm might not be available on some setups; log and continue.
+			slog.Warn("db: optional index creation", "error", err)
+		}
+	}
+
+	// Populate emails.domain and emails.local_part for rows that have NULLs.
+	if _, err := db.Exec(`UPDATE emails SET domain = split_part(email, '@', 2), local_part = split_part(email, '@', 1) WHERE domain IS NULL AND email LIKE '%@%'`); err != nil {
+		return fmt.Errorf("db: backfill email domain/local_part: %w", err)
+	}
+
+	// Add delta tracking columns to workers for per-heartbeat rate calculation.
+	for _, stmt := range []string{
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_prev BIGINT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_prev BIGINT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS pages_delta INT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_delta INT DEFAULT 0`,
+		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS delta_at TIMESTAMPTZ`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("db: worker delta columns: %w", err)
+		}
+	}
+
+	// Schema fix 2026-04-27: extraction layer captured fields that the trigger
+	// hardcoded to NULL (description, location) or never had a column for
+	// (country, city, contact_name, opening_hours, rating, multi-phone).
+	// Add missing columns + raw_* counterparts; the trigger update later in
+	// this file forwards them. opening_hours/rating remain optional — they
+	// stay null when extraction misses them.
+	for _, stmt := range []string{
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS city TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS contact_name TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS phones TEXT[] DEFAULT '{}'`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS tiktok TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS youtube TEXT`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS telegram TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_country TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_city TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_contact_name TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_description TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_location TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_opening_hours TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_rating TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_tiktok TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_youtube TEXT`,
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_telegram TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_bl_country ON business_listings(country) WHERE country IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_bl_city ON business_listings(city) WHERE city IS NOT NULL`,
+		// Niche infrastructure (2026-05-22). The category column is contaminated:
+		// ~6K rows are explicit off-niche schema.org types (Hotel, AutoDealer,
+		// Dentist, Restaurant, ...) and ~41K are meta-keyword soup (>100 chars).
+		// off_niche flag lets the API default-filter to wellness/yoga/fitness
+		// results without DELETing data (memory feedback_never_drop_data.md).
+		// niche_category is the trigger-classified bucket (yoga, pilates,
+		// fitness, wellness, healing, ayurveda, spa, meditation) for the
+		// upcoming ?niche= filter. Both columns also wired into the upsert
+		// trigger below so new rows get tagged at insert time.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS off_niche BOOLEAN DEFAULT FALSE`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_category TEXT`,
+		// completeness_score (0-100): precomputed reenrich-eligibility score, set by
+		// trg_normalize_enrichment + a one-time backfill, so the reenrich worker
+		// filters on an indexed column instead of a per-candidate correlated EXISTS
+		// (the 2026-06-02 eligibility timeout storm). NULL = not yet scored.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS completeness_score SMALLINT`,
+		// Geo lineage (2026-06-10): queries carry the targeted city alongside
+		// country; listings record where their geo came from (NULL = page
+		// extraction, 'query_inference' = inherited from the source query).
+		// MUST run before the trg_normalize_enrichment CREATE OR REPLACE below
+		// — the new function body references both columns, and live enrich
+		// completions fire it the moment it is replaced.
+		`ALTER TABLE queries ADD COLUMN IF NOT EXISTS city TEXT DEFAULT ''`,
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS geo_source TEXT`,
+		// niche_source: provenance for niche_category — NULL = page extraction
+		// (the trigger classifier), 'query_inference' = inherited from the source
+		// query text (BackfillListingNicheInherit). Lets a later re-enrich that
+		// finds a real page keyword supersede an inferred bucket (precedence in the
+		// ON CONFLICT below), exactly like geo_source does for country/city.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS niche_source TEXT`,
+		// country_code: the v4 FK-ready ISO-2 column, populated alongside the
+		// legacy full-name country text (drop-legacy-last per the v4 migration
+		// notes). No FK constraint yet — added once legacy values are migrated.
+		`ALTER TABLE business_listings ADD COLUMN IF NOT EXISTS country_code CHAR(2)`,
+		// business_listings is read-hot (the v2 results API counts/filters it)
+		// and write-hot (enrich upserts continuously). Default autovacuum
+		// (scale_factor 0.2 → ~220K dead/inserted tuples before a vacuum) lets the
+		// visibility map go stale, so the index-only COUNT(*) for ?category=
+		// degrades to ~72K heap fetches and times out (the 2026-06-02 category
+		// fetch 500s — VACUUM gave temporary relief). Aggressive per-table
+		// autovacuum keeps the VM fresh → index-only counts stay ~100ms. Storage
+		// params only: online, no restart, no table rewrite. (Distinct from the
+		// gated global Phase 6 tuning, which needs a Postgres restart.)
+		`ALTER TABLE business_listings SET (
+		    autovacuum_vacuum_scale_factor = 0.02,
+		    autovacuum_analyze_scale_factor = 0.02,
+		    autovacuum_vacuum_insert_scale_factor = 0.02,
+		    autovacuum_vacuum_cost_delay = 2
+		)`,
+		// idx_bl_niche_active + idx_bl_off_niche_false are created BELOW with
+		// CONCURRENTLY (auditor P1 fix): plain CREATE INDEX takes ShareLock on
+		// business_listings (779K rows), and with 7 deploy containers racing
+		// db.Migrate() against PG_MAX_OPEN_CONNS=2 the lock contention saturates
+		// the pool. CONCURRENTLY uses ShareUpdateExclusiveLock instead, which
+		// doesn't block concurrent writes. Cannot live inside this batch since
+		// CONCURRENTLY is illegal inside a transaction block.
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
+		}
+	}
+
+	// Bootstrap category_stats on a fresh database now that niche_category /
+	// off_niche exist (see categoryStatsBootstrapDDL doc comment). IF NOT
+	// EXISTS makes this a no-op on any existing deploy.
+	if _, err := db.Exec(categoryStatsBootstrapDDL); err != nil {
+		return fmt.Errorf("db: category_stats bootstrap: %w", err)
+	}
+
+	// Niche indexes — created CONCURRENTLY outside any tx (CLAUDE.md /
+	// CONCURRENTLY is illegal inside a tx block).
+	//
+	//   idx_bl_niche_active   — serves ?include_off_niche=false + ?niche=X.
+	//                            Skips NULL niche_category to keep idx small
+	//                            on the long tail of unclassified rows.
+	//   idx_bl_off_niche_false — serves the default-listing path (no niche
+	//                            filter, just off_niche=false). PK already
+	//                            covers ORDER BY bl.id, this partial idx
+	//                            backs the WHERE predicate.
+	//
+	// Failure handling: CONCURRENTLY can race with parallel deploys; one of
+	// the 7 containers will succeed, the rest will see IF NOT EXISTS and skip.
+	// We log+continue on error rather than failing the entire migration, since
+	// the partial idx is an optimization, not a correctness requirement (the
+	// planner falls back to PK scan + filter, slower but correct).
+	for _, stmt := range []string{
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_niche_active ON business_listings(niche_category) WHERE off_niche IS NOT TRUE AND niche_category IS NOT NULL`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_off_niche_false ON business_listings(id) WHERE off_niche IS NOT TRUE`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("db: niche index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
+				"stmt", stmt, "error", err)
+		}
+	}
+
+	// Healing index: makes healZombieQueries fast on the ~116K stuck-processing
+	// rows. The reconciler hits this predicate every 60s; without the index it
+	// would do a full seqscan on the 3.16M-row queries table.
+	//
+	// Using CONCURRENTLY (outside any tx) so it doesn't take a ShareLock that
+	// would stall writes on the queries table during deploy (same reason as the
+	// niche indexes above). CONCURRENTLY cannot run inside a transaction block.
+	// Log-and-continue: if it fails (e.g. a previous failed concurrent build
+	// left an INVALID index), the migration still succeeds — the planner will
+	// fall back to the existing idx_queries_status B-tree, which is slower but
+	// correct. The next successful deploy will retry and IF NOT EXISTS will no-op
+	// once the valid index exists.
+	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_queries_processing_updated ON queries (updated_at) WHERE status = 'processing'`); err != nil {
+		slog.Warn("db: idx_queries_processing_updated CONCURRENTLY failed — planner will use idx_queries_status fallback", "error", err)
+	}
+
+	// Backs the reenrich eligibility EXISTS subquery
+	// (e.is_acceptable = true OR e.score >= 0.7), which otherwise re-evaluates
+	// per candidate row and was a contributor to the 5s statement_timeout that
+	// drove the reenrich health-flap (2026-06-01). CONCURRENTLY + log-continue,
+	// same pattern as the niche indexes above.
+	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_emails_acceptable_score ON emails (is_acceptable, score)`); err != nil {
+		slog.Warn("db: idx_emails_acceptable_score CONCURRENTLY failed — reenrich eligibility EXISTS will fall back to PK scan", "error", err)
+	}
+
+	// Read-path indexes for business_listings and business_emails.
+	//
+	//   idx_bl_created_at  — backs ORDER BY created_at DESC on the v2 results
+	//                         listing endpoint; without it every paginated read
+	//                         on the 779K-row table does a full sort.
+	//   idx_bl_updated_at  — backs ORDER BY updated_at DESC for the "recently
+	//                         enriched" feed and the reenrich eligibility query.
+	//   idx_bl_category    — backs ?category= filter on v2 results; partial
+	//                         (category IS NOT NULL) keeps the index small.
+	//   idx_be_email_id    — backs the business_emails → emails JOIN on
+	//                         email_id; the junction's PK covers (business_id,
+	//                         email_id) but not the reverse lookup.
+	//
+	// All created CONCURRENTLY outside any tx (same reason as the niche indexes
+	// above). Log-and-continue: failure here is non-fatal — the planner falls
+	// back to PK scans, slower but correct.
+	for _, stmt := range []string{
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_created_at ON business_listings (created_at DESC)`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_updated_at ON business_listings (updated_at DESC)`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category ON business_listings (category) WHERE category IS NOT NULL`,
+		// Composite for ?category= + the default id_desc sort: serves
+		// WHERE category=X ORDER BY bl.id DESC LIMIT N without a separate sort
+		// over the (high-cardinality) filtered set, e.g. category=yogaalliance
+		// has ~77K rows and timed out the plain category+PK-backward-scan path.
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category_id ON business_listings (category, id DESC) WHERE category IS NOT NULL`,
+		// Partial composite over the DEFAULT off_niche-excluded set: the v2 results
+		// count for ?category=X filters `off_niche IS NOT TRUE`, which idx_bl_category
+		// can't cover (heap fetch per row → ~12s on the 77K yogaalliance category).
+		// This makes the count an index-only scan and the list an index scan.
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_category_offniche ON business_listings (category, id DESC) WHERE off_niche IS NOT TRUE`,
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_email_id ON business_emails (email_id)`,
+		// Backs the ?source= filter EXISTS(business_emails.source = $N). Partial on
+		// the ~80K non-'enrichment' (directory-crawler) rows only — without it the
+		// correlated EXISTS seq-scans 3.9M rows → 57014 timeout (500).
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_source ON business_emails (source, business_id) WHERE source <> 'enrichment'`,
+		// Backs the reenrich eligibility query: WHERE re_enriched_at IS NULL AND
+		// completeness_score < $1. Partial on the (shrinking) un-reenriched set.
+		// On a fresh database this attempt is expected to fail and log below —
+		// re_enriched_at doesn't exist yet at this point in runMigrations. It
+		// is retried (and self-heals) right after the reenrichColVersion ALTER
+		// further down guarantees the column exists — see idxBlReenrichScoreDDL.
+		idxBlReenrichScoreDDL,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("db: read-path index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
+				"stmt", stmt, "error", err)
+		}
+	}
+
+	// --- Triggers ---
+
+	// Trigger 1: serp_results INSERT -> create enrichment_job.
+	if err := replaceTriggerFunctionIfNewer(db, "trg_enqueue_enrichment", enqueueTriggerVersion,
+		fmt.Sprintf(trgEnqueueEnrichmentFnBody, enqueueTriggerVersion)); err != nil {
+		return fmt.Errorf("db: create trg_enqueue_enrichment function: %w", err)
+	}
+	// Bind the trigger only if it is missing. CREATE OR REPLACE FUNCTION above
+	// already updates the body lock-free; the previous unconditional
+	// DROP TRIGGER … CREATE TRIGGER took an ACCESS EXCLUSIVE lock on serp_results
+	// on EVERY boot and was a primary driver of the boot DDL herd. The trigger
+	// binding never changes, so create it once and skip thereafter. (If the
+	// binding ever needs to change, do it via a one-shot versioned migration.)
+	if _, err := db.Exec(`
+		DO $$
+		BEGIN
+		  IF NOT EXISTS (
+		    SELECT 1 FROM pg_trigger
+		    WHERE tgname = 'trg_serp_results_enqueue' AND NOT tgisinternal
+		  ) THEN
+		    CREATE TRIGGER trg_serp_results_enqueue
+		      AFTER INSERT ON serp_results
+		      FOR EACH ROW EXECUTE FUNCTION trg_enqueue_enrichment();
+		  END IF;
+		END $$;
 	`); err != nil {
+		return fmt.Errorf("db: create trg_serp_results_enqueue trigger: %w", err)
+	}
+
+	// Trigger 2: enrichment_jobs completed -> normalize + queue contact pages.
+	if err := replaceTriggerFunctionIfNewer(db, "trg_normalize_enrichment", normalizeTriggerVersion,
+		fmt.Sprintf(trgNormalizeEnrichmentFnBody, normalizeTriggerVersion)); err != nil {
 		return fmt.Errorf("db: create trg_normalize_enrichment function: %w", err)
 	}
 	// CREATE TRIGGER ... WHEN (...) filters at trigger-system level so the
