@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.13-niche localhost:32769/foxhound-serp-scraper:v0.9.13-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.13-niche
+#   hachibi: docker tag …:v0.9.14-niche localhost:32769/foxhound-serp-scraper:v0.9.14-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.14-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.13-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.14-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -243,14 +243,19 @@
 #     served by this host'.
 #   DEPLOY BOTH HOSTS; kurawa serp-worker was stopped as mitigation — restart it.
 #
-# Deploy: set IMAGE_TAG=v0.9.13-niche on the serp stack and redeploy.
+# v0.9.14-niche = v0.9.13 + SearXNG engine-level suspension backoff (#63):
+#   • While searxng is backed off, tabs keep serving the host's other engines
+#     (duckduckgo was starving on hachibi: 0 pages in 12 min behind a 4-min tab sleep).
+#   • Searxng items popped during backoff are released without burning attempts.
+#
+# Deploy: set IMAGE_TAG=v0.9.14-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.13-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.14-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
