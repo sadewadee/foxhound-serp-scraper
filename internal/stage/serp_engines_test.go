@@ -4,6 +4,7 @@ package stage
 
 import (
 	"testing"
+	"time"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/feeder"
@@ -30,10 +31,17 @@ func TestBufferKeysAreEngineScoped(t *testing.T) {
 	cfg.SERP.Engines = "searxng,duckduckgo"
 	cfg.SERP.SearXNGURL = "http://searxng:8080"
 
-	s := &SERPStage{cfg: cfg, enginesByName: engineLookup(resolveEngines(cfg))}
+	s := &SERPStage{
+		cfg:            cfg,
+		enginesByName:  engineLookup(resolveEngines(cfg)),
+		searxngBackoff: NewEngineBackoff(),
+	}
 	s.engines = resolveEngines(cfg)
 
-	keys := s.bufferKeys()
+	keys, allBackedOff := s.bufferKeys()
+	if allBackedOff {
+		t.Error("no engine is backed off yet — allBackedOff must be false")
+	}
 	if len(keys) != 3 {
 		t.Fatalf("bufferKeys() = %v, want 2 engine keys + the legacy key", keys)
 	}
@@ -45,6 +53,17 @@ func TestBufferKeysAreEngineScoped(t *testing.T) {
 	}
 	if last := keys[len(keys)-1]; last != feeder.SERPBufferKey {
 		t.Errorf("last buffer key = %q, want the legacy %q so it drains", last, feeder.SERPBufferKey)
+	}
+
+	// A live suspension window removes only the searxng key: duckduckgo must
+	// keep flowing, and the legacy list is always readable.
+	s.searxngBackoff.RecordSuspension(time.Now())
+	keys, allBackedOff = s.bufferKeys()
+	if allBackedOff {
+		t.Fatal("duckduckgo is still healthy — allBackedOff must be false")
+	}
+	if len(keys) != 2 || keys[0] != "serp:buffer:duckduckgo" || keys[1] != feeder.SERPBufferKey {
+		t.Errorf("bufferKeys() during backoff = %v, want duckduckgo + the legacy key", keys)
 	}
 }
 
