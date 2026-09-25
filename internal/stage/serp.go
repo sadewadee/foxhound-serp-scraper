@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +60,13 @@ type SERPStage struct {
 	// engines as suspended/rate-limited (requeued without burning an attempt).
 	searxngSuspended atomic.Int64
 
+	// searxngBackoff is the stage-wide suspension window for the SearXNG
+	// engine, shared by every tab worker: a suspended upstream is a property
+	// of the engine, not of whichever tab hit it. While it is set, tabs skip
+	// SearXNG's buffer list and keep draining the other engines instead of
+	// parking (which starved duckduckgo: 0 pages in 12 min on hachibi).
+	searxngBackoff *EngineBackoff
+
 	// 429 cooldown: when consecutive 429s exceed threshold, all tabs back off.
 	consecutive429 atomic.Int64
 
@@ -86,6 +92,7 @@ func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPSt
 		db:             database,
 		redis:          dd.Client(),
 		dedup:          dd,
+		searxngBackoff: NewEngineBackoff(),
 		queryRepo:      query.NewRepositoryWithRedis(database, dd.Client()),
 		timing:         behavior.NewTiming(behavior.CarefulProfile().Timing),
 		engines:        engines,
@@ -350,20 +357,24 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 // The keys are scoped per engine because hachibi and kurawa share one Redis
 // but serve different engines: a single global list let a host consume jobs it
 // cannot run, and every one of them was dead-lettered.
-func (s *SERPStage) bufferKeys() []string {
-	keys := make([]string, 0, len(s.engines))
+//
+// An engine currently inside a suspension backoff is left out, so tabs keep
+// draining the host's other engines instead of idling behind SearXNG's
+// suspension. allBackedOff is true when that filtering left nothing to read.
+func (s *SERPStage) bufferKeys() (keys []string, allBackedOff bool) {
+	engineKeys := make([]string, 0, len(s.engines))
 	for _, e := range s.engines {
 		if e != nil && e.Name() != "" {
-			keys = append(keys, feeder.BufferKeyForEngine(e.Name()))
+			engineKeys = append(engineKeys, feeder.BufferKeyForEngine(e.Name()))
 		}
 	}
 	// Always drain the legacy shared list last: a deploy landing on top of a
 	// non-empty old `serp:buffer` would otherwise strand its items. Foreign
 	// items popped from there hit the release-on-miss path, which is safe.
-	if len(keys) == 0 || !slices.Contains(keys, feeder.SERPBufferKey) {
-		keys = append(keys, feeder.SERPBufferKey)
-	}
-	return keys
+	keys, allBackedOff = SelectBufferKeys(engineKeys, feeder.SERPBufferKey, func(k string) bool {
+		return k == feeder.BufferKeyForEngine("searxng") && s.searxngBackoff.BackedOff(time.Now())
+	})
+	return keys, allBackedOff
 }
 
 // tabWorker pops from serp:buffer (Redis LIST), fetches SERP pages,
@@ -380,10 +391,6 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 	// One plain client per worker for internal engines (SearXNG): reused for
 	// every request, never created per request (Invariant #5).
 	plainClient := scraper.NewPlainHTTPFetcher(time.Duration(s.cfg.SERP.SearXNGTimeoutMs) * time.Millisecond)
-	// Consecutive SearXNG suspensions seen by THIS tab. Drives an escalating
-	// tab sleep so a suspension window stops consuming jobs quickly; reset on
-	// the first successful SearXNG page.
-	suspendStreak := 0
 	defer stealth.Close()
 
 	for {
@@ -395,7 +402,23 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 
 		// BLPOP from this host's per-engine lists only — never from another
 		// host's engines (the feeder claims per engine from the same sets).
-		result, err := s.redis.BLPop(ctx, 5*time.Second, s.bufferKeys()...).Result()
+		// An engine inside a suspension backoff is left out, so the other
+		// engines keep draining instead of every tab parking behind SearXNG.
+		keys, allBackedOff := s.bufferKeys()
+		if allBackedOff {
+			wait := WaitForAnyBackoff([]time.Duration{s.searxngBackoff.Remaining(time.Now())}, MaxAllEnginesWait)
+			if wait <= 0 {
+				wait = 5 * time.Second
+			}
+			slog.Info("serp: all engines backed off — short wait", "wait", wait, "tab", tabID)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+			continue
+		}
+		result, err := s.redis.BLPop(ctx, 5*time.Second, keys...).Result()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -533,43 +556,55 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 				case <-time.After(delay):
 				}
 			}
-			// Escalating tab sleep while SearXNG keeps suspending us: a
-			// suspension window means every job this tab touches would
-			// otherwise be requeued immediately, so slow this tab down.
-			if suspendBackoff := SuspensionBackoff(suspendStreak); suspendBackoff > 0 {
-				slog.Warn("serp: searxng suspending — tab backing off", "tab", tabID,
-					"streak", suspendStreak, "backoff", suspendBackoff)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(suspendBackoff):
-				}
-			}
+			// No tab sleep here on purpose: the suspension state is engine-wide
+			// and the read loop already skips a parked engine's list, so this
+			// tab keeps serving the other engines. A job popped from the
+			// legacy list can still arrive here mid-window — the classifier
+			// below releases it rather than fetching in vain... but fetching
+			// once is the probe that DETECTED the suspension, so one extra
+			// request while the window opens is expected and cheap.
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, time.Duration(s.cfg.SERP.SearXNGTimeoutMs)*time.Millisecond)
 			var plainStatus int
 			body, plainStatus, fetchErr = plainClient.FetchPlain(fetchCtx, job.URL)
 			fetchCancel()
 
 			// SearXNG capacity failures are not job faults: classify before the
-			// generic fetch-error path below.
+			// generic fetch-error path below. The suspension state is shared
+			// across tabs, since a suspended upstream is a property of the
+			// engine, not of whichever tab noticed it.
 			if _, isSearxng := eng.(*scraper.SearXNGEngine); isSearxng {
+				// An item that arrived while the window was already open —
+				// e.g. popped from the legacy shared list, whose key is
+				// always readable — is released without fetching again.
+				if s.searxngBackoff.BackedOff(time.Now()) {
+					_, streak := s.searxngBackoff.State()
+					s.searxngSuspended.Add(1)
+					release := s.searxngBackoff.Remaining(time.Now())
+					slog.Info("serp: searxng still backed off — releasing job for the next window",
+						"job", job.ID, "tab", tabID, "streak", streak, "release_in", release)
+					s.db.Exec(`UPDATE serp_jobs SET status = 'new', next_attempt_at = NOW() + ($1 || ' seconds')::interval,
+						error_msg = $2, locked_by = NULL, picked_at = NULL, updated_at = NOW() WHERE id = $3`,
+						fmt.Sprintf("%d", int(release/time.Second)+1), "searxng engine in backoff window", job.ID)
+					s.redis.Del(ctx, "serp:lock:"+job.ID)
+					continue
+				}
 				decision := ClassifySearXNGOutcome(plainStatus, body, fetchErr)
 				switch decision.Outcome {
 				case OutcomeSuspended:
-					suspendStreak++
+					deadline, streak := s.searxngBackoff.RecordSuspension(time.Now())
 					s.searxngSuspended.Add(1)
-					backoff := SuspensionBackoff(suspendStreak)
 					slog.Warn("serp: searxng upstream suspended — requeuing without burning an attempt",
 						"job", job.ID, "tab", tabID, "unresponsive", decision.Engines,
-						"streak", suspendStreak, "tab_backoff", backoff, "error", decision.ErrMsg)
+						"streak", streak, "backed_off_until", deadline.Format(time.Kitchen), "error", decision.ErrMsg)
+					backoff := deadline.Sub(time.Now())
 					s.db.Exec(`UPDATE serp_jobs SET status = 'new', next_attempt_at = NOW() + ($1 || ' seconds')::interval,
 						error_msg = $2, locked_by = NULL, picked_at = NULL, updated_at = NOW() WHERE id = $3`,
-						fmt.Sprintf("%d", int(backoff/time.Second)), decision.ErrMsg, job.ID)
+						fmt.Sprintf("%d", int(backoff/time.Second)+1), decision.ErrMsg, job.ID)
 					s.redis.Del(ctx, "serp:lock:"+job.ID)
 					continue
 				case OutcomeSuccess:
-					// First usable page clears any accumulated tab backoff.
-					suspendStreak = 0
+					// First usable page clears the shared window.
+					s.searxngBackoff.RecordSuccess()
 					// A transport error carrying a usable body (partial read) is
 					// still a page worth trusting: drop the error.
 					fetchErr = nil
