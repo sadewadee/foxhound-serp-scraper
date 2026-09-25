@@ -154,6 +154,13 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 			// bucket the expanded health/fitness niches (bodywork/therapy/nutrition/
 			// naturopathy/coaching) for rows the first pass left NULL.
 			db.BackfillNicheTaxonomyV2(ctx, database)
+			// 2026-09-25: heal off_niche=TRUE rows a stale schema.org @type wrongly
+			// excluded even though the page's own name/title/description carries
+			// real niche keyword evidence — the fix for the "schema.org overrides
+			// keyword" incident. Dry-run by default (NICHE_RECLASSIFY_DRY_RUN);
+			// runs after the taxonomy backfills above so niche_bucket precedence
+			// matches the buckets those passes already established.
+			db.ReclassifyOffNicheByKeyword(ctx, database)
 		}()
 	}
 

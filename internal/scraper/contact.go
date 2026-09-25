@@ -178,17 +178,200 @@ func ExtractContacts(body []byte) *ContactData {
 	return cd
 }
 
+// flattenJSONLDNodes recursively expands "@graph" containers (and any nested
+// arrays of node-like maps) from the raw top-level objects foxhound's
+// ExtractJSONLD returns. foxhound's parser (parse.ExtractJSONLDFromDoc,
+// v0.0.27) only returns the top-level <script> objects — it does NOT descend
+// into "@graph". That is exactly how Yoast/RankMath (the WordPress SEO
+// plugins behind the vast majority of scraped sites) nest the real business
+// node: {"@graph": [WebSite, WebPage, Organization, Person, LocalBusiness,
+// ...]}. Without flattening, every WordPress site's business JSON-LD
+// (name/type/address/description) was invisible to the extractor entirely —
+// root cause #2 of the 2026-09-25 schema.org-overrides-keyword incident.
+func flattenJSONLDNodes(raw []map[string]any) []map[string]any {
+	var out []map[string]any
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			out = append(out, t)
+			if graph, ok := t["@graph"]; ok {
+				walk(graph)
+			}
+		case []any:
+			for _, item := range t {
+				walk(item)
+			}
+		}
+	}
+	for _, ld := range raw {
+		walk(ld)
+	}
+	return out
+}
+
+// jsonLDTypes normalizes a JSON-LD node's "@type" field to a slice of bare
+// type names. Schema.org allows "@type" to be either a single string or an
+// array of strings when a node belongs to multiple types at once (e.g.
+// ["LocalBusiness","HealthClub"]) — the previous `ld["@type"].(string)` type
+// assertion silently returned "" for the array form, dropping the type
+// entirely. Also strips a "schema:" or "http(s)://schema.org/" prefix some
+// generators emit.
+func jsonLDTypes(ld map[string]any) []string {
+	var raw []any
+	switch t := ld["@type"].(type) {
+	case string:
+		raw = []any{t}
+	case []any:
+		raw = t
+	default:
+		return nil
+	}
+	var out []string
+	for _, v := range raw {
+		s, ok := v.(string)
+		if !ok || s == "" {
+			continue
+		}
+		s = strings.TrimPrefix(s, "schema:")
+		s = strings.TrimPrefix(s, "https://schema.org/")
+		s = strings.TrimPrefix(s, "http://schema.org/")
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// jsonLDNeverCategoryTypes are schema.org (and common non-standard/WordPress)
+// @type values that describe page/content/structure, never an actual
+// business — picking one of these as BusinessCategory produced junk like
+// "Article", "ContactPage", "Person" in production (root cause #1 of the
+// 2026-09-25 incident). Mirrors the content/page-type IN(...) list in
+// trg_normalize_enrichment (internal/db/migrate.go) — keep both in lockstep.
+var jsonLDNeverCategoryTypes = map[string]bool{
+	"WebSite": true, "website": true, "WebPage": true, "BreadcrumbList": true,
+	"ItemList": true, "SearchAction": true, "ReadAction": true, "ImageObject": true,
+	"Article": true, "BlogPosting": true, "NewsArticle": true, "TechArticle": true,
+	"MedicalWebPage": true, "FAQPage": true, "QAPage": true, "Recipe": true,
+	"HowTo": true, "VideoObject": true, "Movie": true, "Book": true, "Dataset": true,
+	"Review": true, "AggregateRating": true, "DefinedTerm": true, "CreativeWork": true,
+	"CreativeWorkSeries": true, "DiscussionForumPosting": true, "Course": true,
+	"JobPosting": true, "Blog": true, "SoftwareApplication": true, "WebApplication": true,
+	"MobileApplication": true, "VideoGame": true, "Product": true, "product": true,
+	"ProductGroup": true, "CollectionPage": true, "ProfilePage": true, "AboutPage": true,
+	"ContactPage": true, "SearchResultsPage": true, "SiteNavigationElement": true,
+	"ImageGallery": true, "WPHeader": true, "WPFooter": true, "WPSidebar": true,
+	"Person": true, "Place": true, "contao:Page": true, "Offer": true, "Event": true,
+}
+
+// jsonLDGenericCategoryTypes are business-container @type values that carry
+// no niche-specific signal by themselves (an umbrella term, not a business
+// kind) — ranked below a specific business subtype found on ANY other
+// JSON-LD node on the same page. Mirrors the generic-business IN(...) list in
+// trg_normalize_enrichment. Physician/MedicalClinic/MedicalBusiness/
+// HealthAndBeautyBusiness live here (not in the "never" set) because they
+// are real business types, just too broad to tell an in-niche bodywork/spa
+// business apart from an out-of-niche one without page keyword evidence.
+var jsonLDGenericCategoryTypes = map[string]bool{
+	"Organization": true, "organization": true, "LocalBusiness": true,
+	"Corporation": true, "Store": true, "OnlineStore": true, "Service": true,
+	"ProfessionalService": true, "EducationalOrganization": true,
+	"NewsMediaOrganization": true, "GovernmentOrganization": true,
+	"FinancialService": true, "FoodEstablishment": true, "RadioStation": true,
+	"HealthAndBeautyBusiness": true, "MedicalBusiness": true, "MedicalClinic": true,
+	"Physician": true,
+}
+
+// categoryTier ranks a @type value by how useful it is as BusinessCategory:
+// 1 = specific business subtype (best — HealthClub, YogaStudio, Restaurant,
+// Hotel, Dentist, ... — anything not explicitly generic or never-usable),
+// 2 = generic business container (jsonLDGenericCategoryTypes),
+// 3 = page/content/structure noise, never usable (jsonLDNeverCategoryTypes).
+// Everything not in the generic or never sets defaults to tier 1 — this
+// intentionally avoids enumerating every schema.org LocalBusiness subtype
+// (Restaurant, Hotel, AutoDealer, DaySpa, HealthClub, YogaStudio, ...): they
+// are all "specific" by not being generic or content noise.
+func categoryTier(t string) int {
+	if jsonLDNeverCategoryTypes[t] {
+		return 3
+	}
+	if jsonLDGenericCategoryTypes[t] {
+		return 2
+	}
+	return 1
+}
+
+// jsonLDCategoryPick is the winning node + @type found by pickJSONLDCategory.
+type jsonLDCategoryPick struct {
+	node     map[string]any
+	category string
+	tier     int
+}
+
+// pickJSONLDCategory scans all flattened JSON-LD nodes and returns the
+// node + @type with the most specific (lowest) tier — replacing the old
+// "first @type that isn't in a tiny skip list wins" logic that let
+// Yoast/RankMath's Organization/Person/WebPage wrapper nodes (which appear
+// BEFORE the real business node in @graph) clobber a genuine LocalBusiness
+// subtype, and let content types (Article, BlogPosting, ContactPage) become
+// BusinessCategory outright. Tier-3 (never-usable) types are skipped
+// entirely — BusinessCategory stays empty rather than junk. Ties within a
+// tier keep the first node encountered (document order), matching the
+// page's own JSON-LD authoring order once a genuinely usable type is found.
+func pickJSONLDCategory(nodes []map[string]any) *jsonLDCategoryPick {
+	var best *jsonLDCategoryPick
+	for _, n := range nodes {
+		for _, t := range jsonLDTypes(n) {
+			tier := categoryTier(t)
+			if tier == 3 {
+				continue
+			}
+			if best == nil || tier < best.tier {
+				best = &jsonLDCategoryPick{node: n, category: t, tier: tier}
+			}
+			if best.tier == 1 {
+				break // this node can't offer anything more specific
+			}
+		}
+		if best != nil && best.tier == 1 {
+			break // no other node can beat an already-specific pick
+		}
+	}
+	return best
+}
+
 // extractJSONLD parses JSON-LD structured data for business information.
 // Handles LocalBusiness, Organization, Restaurant, GymFitness, etc.
 func extractJSONLD(resp *foxhound.Response, cd *ContactData) {
-	jsonlds, err := parse.ExtractJSONLD(resp)
-	if err != nil || len(jsonlds) == 0 {
+	rawNodes, err := parse.ExtractJSONLD(resp)
+	if err != nil || len(rawNodes) == 0 {
+		return
+	}
+	jsonlds := flattenJSONLDNodes(rawNodes)
+	if len(jsonlds) == 0 {
 		return
 	}
 
-	for _, ld := range jsonlds {
-		ldType, _ := ld["@type"].(string)
+	// Choose BusinessCategory by specificity across ALL nodes (see
+	// pickJSONLDCategory), not "first node, first non-skip @type wins".
+	pick := pickJSONLDCategory(jsonlds)
+	if pick != nil {
+		cd.BusinessCategory = pick.category
+	}
 
+	// Prefer the node the winning category came from for name / description /
+	// address / geo — it's the actual business node, not a WebSite/Person/
+	// Organization wrapper that happens to appear earlier in the @graph.
+	// Processing it first (then falling through to the full node list) is a
+	// no-op for fields it doesn't have — the empty-guards below just fall
+	// back to the original per-field first-non-empty scan.
+	scanOrder := jsonlds
+	if pick != nil {
+		scanOrder = append([]map[string]any{pick.node}, jsonlds...)
+	}
+
+	for _, ld := range scanOrder {
 		// Extract business name.
 		if cd.BusinessName == "" {
 			if name, ok := ld["name"].(string); ok && name != "" {
@@ -220,17 +403,6 @@ func extractJSONLD(resp *foxhound.Response, cd *ContactData) {
 						cd.ContactName = v
 					}
 				}
-			}
-		}
-
-		// Extract business category from @type.
-		if cd.BusinessCategory == "" && ldType != "" {
-			// Skip generic types.
-			switch ldType {
-			case "WebSite", "WebPage", "BreadcrumbList", "ItemList",
-				"SearchAction", "ReadAction", "ImageObject":
-			default:
-				cd.BusinessCategory = ldType
 			}
 		}
 
@@ -875,11 +1047,15 @@ func extractMetadata(resp *foxhound.Response, cd *ContactData) {
 			cd.Description = truncate(desc, 500)
 		}
 	}
-	if cd.BusinessCategory == "" {
-		if kw, ok := meta["keywords"]; ok {
-			cd.BusinessCategory = truncate(kw, 200)
-		}
-	}
+	// NOTE: previously fell back to <meta name="keywords"> for BusinessCategory
+	// here. Removed 2026-09-25 — meta keywords is SEO keyword soup ("yoga,
+	// pilates, wellness, spa, jakarta, ...", often >100 chars), not a category.
+	// The trigger's off_niche CASE already treats LENGTH(raw_category) > 100 as
+	// "no niche evidence" → off_niche=TRUE, so this fallback was actively
+	// excluding real businesses whose page had keyword-stuffed meta but no
+	// usable JSON-LD @type. Category now stays empty in that case — pure
+	// keyword classification (business_name/page_title/description) still
+	// runs downstream in the trigger regardless of category.
 
 	// Meta author → contact name.
 	if cd.ContactName == "" {
