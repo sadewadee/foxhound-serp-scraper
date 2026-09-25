@@ -101,10 +101,8 @@ CREATE TABLE IF NOT EXISTS serp_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_claim ON serp_jobs(parent_job_id, status, priority DESC, created_at) WHERE status = 'new';
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_parent ON serp_jobs(parent_job_id);
-CREATE INDEX IF NOT EXISTS idx_serp_jobs_parent_status ON serp_jobs(parent_job_id, status);
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_status ON serp_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_serp_engine ON serp_jobs(engine, status);
-CREATE INDEX IF NOT EXISTS idx_serp_claim_engine ON serp_jobs(engine, priority DESC, created_at) WHERE status = 'new';
 CREATE INDEX IF NOT EXISTS idx_serp_jobs_updated_at ON serp_jobs(updated_at) WHERE status = 'completed';
 CREATE INDEX IF NOT EXISTS idx_serp_locked ON serp_jobs(locked_at) WHERE status = 'processing';
 -- idx_serp_feed and idx_serp_stale created in runMigrations (after ALTER ADD COLUMN picked_at).
@@ -764,6 +762,66 @@ func replaceTriggerFunctionIfNewer(db *sql.DB, fn string, ourVersion int, create
 	return err
 }
 
+// indexBuildAction is the decision for a CONCURRENTLY index build.
+type indexBuildAction int
+
+const (
+	indexBuildCreate  indexBuildAction = iota // absent: build it
+	indexBuildSkip                            // present and valid: nothing to do
+	indexBuildRebuild                         // present but INVALID: drop, then rebuild
+)
+
+// indexBuildDecision decides what to do with a concurrently-built index given
+// whether it exists and whether pg_index.indisvalid is true. An interrupted
+// CREATE INDEX CONCURRENTLY leaves the index in place but invalid, and
+// IF NOT EXISTS would then skip it forever — so an invalid index must be
+// dropped and rebuilt, not kept.
+func indexBuildDecision(exists, valid bool) indexBuildAction {
+	switch {
+	case !exists:
+		return indexBuildCreate
+	case !valid:
+		return indexBuildRebuild
+	default:
+		return indexBuildSkip
+	}
+}
+
+// ensureIndexConcurrently builds index name with createDDL (which must be a
+// CREATE INDEX CONCURRENTLY statement — it cannot run inside a transaction)
+// unless a VALID index of that name already exists. An INVALID leftover from
+// an interrupted concurrent build is dropped and rebuilt. Every path logs, so
+// a degraded boot is visible (Invariant #7).
+func ensureIndexConcurrently(db *sql.DB, name, createDDL string) {
+	var valid bool
+	err := db.QueryRow(`
+		SELECT i.indisvalid
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE c.relname = $1`, name).Scan(&valid)
+
+	exists := err == nil
+	if err != nil && err != sql.ErrNoRows {
+		slog.Warn("db: failed to read index validity — attempting create anyway", "index", name, "error", err)
+	}
+
+	switch indexBuildDecision(exists, valid) {
+	case indexBuildSkip:
+		return
+	case indexBuildRebuild:
+		slog.Warn("db: index exists but is INVALID (interrupted concurrent build) — dropping and rebuilding", "index", name)
+		if _, err := db.Exec(fmt.Sprintf(`DROP INDEX CONCURRENTLY IF EXISTS %s`, name)); err != nil {
+			slog.Warn("db: dropping invalid index failed — create will be skipped by IF NOT EXISTS", "index", name, "error", err)
+			return
+		}
+	case indexBuildCreate:
+	}
+
+	if _, err := db.Exec(createDDL); err != nil {
+		slog.Warn("db: concurrent index build failed", "index", name, "error", err)
+	}
+}
+
 // runMigrations applies incremental schema changes that are safe to re-run.
 func runMigrations(db *sql.DB) error {
 	// Enable pgcrypto for SHA-256 hashing in triggers.
@@ -965,13 +1023,21 @@ func runMigrations(db *sql.DB) error {
 		slog.Warn("db: idx_queries_processing_updated CONCURRENTLY failed — planner will use idx_queries_status fallback", "error", err)
 	}
 
-	// Indexes for stuck-query reconciliation and engine job claiming.
-	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_serp_jobs_parent_status ON serp_jobs (parent_job_id, status)`); err != nil {
-		slog.Warn("db: idx_serp_jobs_parent_status CONCURRENTLY failed", "error", err)
-	}
-	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_serp_claim_engine ON serp_jobs (engine, priority DESC, created_at) WHERE status = 'new'`); err != nil {
-		slog.Warn("db: idx_serp_claim_engine CONCURRENTLY failed", "error", err)
-	}
+	// Feeds the serp claim query (engine = $1 AND status = 'new' ORDER BY
+	// priority DESC, created_at). idx_serp_engine only covers (engine, status),
+	// so the planner bitmap-scans then sorts the whole per-engine backlog
+	// (1.3M 'new' duckduckgo rows in prod, 2026-09-25). This index serves the
+	// predicate and the order together.
+	//
+	// Deliberately NOT also declared in the schema const above: schema runs on
+	// every boot before runMigrations, and a non-concurrent build over the 9GB
+	// serp_jobs table takes a write-blocking ShareLock for minutes under the
+	// migrate advisory lock. The CONCURRENTLY build here covers fresh databases
+	// too. Self-healing because an interrupted concurrent build (manager
+	// restarted mid-build) leaves an INVALID index that IF NOT EXISTS would
+	// silently keep forever.
+	ensureIndexConcurrently(db, "idx_serp_claim_engine",
+		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_serp_claim_engine ON serp_jobs (engine, priority DESC, created_at) WHERE status = 'new'`)
 
 	// Backs the reenrich eligibility EXISTS subquery
 	// (e.is_acceptable = true OR e.score >= 0.7), which otherwise re-evaluates
