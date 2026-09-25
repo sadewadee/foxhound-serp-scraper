@@ -1,5 +1,3 @@
-//go:build playwright
-
 package query
 
 import (

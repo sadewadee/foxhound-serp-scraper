@@ -223,6 +223,30 @@ CREATE TABLE IF NOT EXISTS workers (
 -- RefreshCategoryStatsLoop seeds and refreshes it off the request path.
 -- Definition body lives in categoryStatsSelect (shared with the redefinition
 -- migration — keep using the const, never inline a second copy).
+--
+-- NOTE: the CREATE MATERIALIZED VIEW itself (+ its two indexes) does NOT live
+-- in this const anymore — see categoryStatsBootstrapDDL below. This schema
+-- block runs BEFORE runMigrations' ALTER TABLE ... ADD COLUMN niche_category /
+-- off_niche statements, so on a brand-new database categoryStatsSelect would
+-- reference columns that don't exist yet (the fresh-DB bootstrap failure fixed
+-- 2026-09). categoryStatsBootstrapDDL runs the identical IF NOT EXISTS DDL
+-- later in runMigrations, once those columns exist.
+`
+
+// categoryStatsBootstrapDDL creates category_stats (+ the index REFRESH
+// MATERIALIZED VIEW CONCURRENTLY requires, + the biz_count sort index) on a
+// database that doesn't have it yet. It used to live inline in the schema
+// const above, but schema runs before runMigrations' ALTER TABLE ... ADD
+// COLUMN niche_category / off_niche statements — so on a brand-new empty
+// Postgres, categoryStatsSelect (which references bl.niche_category /
+// bl.off_niche) failed with "column does not exist". This const is executed
+// in runMigrations AFTER those ALTERs run (see the call site below), so the
+// columns always exist first. IF NOT EXISTS throughout makes it a no-op on
+// every existing deploy — they already have category_stats either from the
+// original boot schema (older deploys) or from the versioned redefinition
+// migration further down in this file (categoryStatsNicheVersion), which is
+// left untouched and keeps behaving exactly as before.
+const categoryStatsBootstrapDDL = `
 CREATE MATERIALIZED VIEW IF NOT EXISTS category_stats AS` + categoryStatsSelect + `
 WITH NO DATA;
 
@@ -232,6 +256,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_category_stats_category ON category_stats 
 -- Serves the handler's ORDER BY biz_count DESC LIMIT 100.
 CREATE INDEX IF NOT EXISTS idx_category_stats_biz_count ON category_stats (biz_count DESC);
 `
+
+// idxBlReenrichScoreDDL backs the reenrich eligibility query: WHERE
+// re_enriched_at IS NULL AND completeness_score < $1 (partial on the
+// shrinking un-reenriched set). Referenced from TWO call sites in
+// runMigrations, so the definition can never drift between them:
+//  1. The early read-path CONCURRENTLY block — on a brand-new database this
+//     attempt fails and logs a warning, because re_enriched_at doesn't exist
+//     yet (it's only added later by the reenrichColVersion migration).
+//  2. Immediately after that reenrichColVersion ALTER guarantees the column
+//     exists (see the call site there) — CONCURRENTLY + IF NOT EXISTS makes
+//     the retry a fast no-op once the index already exists, and it runs
+//     unconditionally so a database that skipped it (e.g. reenrichColVersion
+//     was already recorded by an older binary that predates this retry)
+//     self-heals on its next boot instead of running without the index
+//     forever.
+const idxBlReenrichScoreDDL = `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_reenrich_score ON business_listings (completeness_score) WHERE re_enriched_at IS NULL`
 
 // runMigrations applies incremental schema changes that are safe to re-run.
 func runMigrations(db *sql.DB) error {
@@ -385,6 +425,13 @@ func runMigrations(db *sql.DB) error {
 		}
 	}
 
+	// Bootstrap category_stats on a fresh database now that niche_category /
+	// off_niche exist (see categoryStatsBootstrapDDL doc comment). IF NOT
+	// EXISTS makes this a no-op on any existing deploy.
+	if _, err := db.Exec(categoryStatsBootstrapDDL); err != nil {
+		return fmt.Errorf("db: category_stats bootstrap: %w", err)
+	}
+
 	// Niche indexes — created CONCURRENTLY outside any tx (CLAUDE.md /
 	// CONCURRENTLY is illegal inside a tx block).
 	//
@@ -473,7 +520,11 @@ func runMigrations(db *sql.DB) error {
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_source ON business_emails (source, business_id) WHERE source <> 'enrichment'`,
 		// Backs the reenrich eligibility query: WHERE re_enriched_at IS NULL AND
 		// completeness_score < $1. Partial on the (shrinking) un-reenriched set.
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_reenrich_score ON business_listings (completeness_score) WHERE re_enriched_at IS NULL`,
+		// On a fresh database this attempt is expected to fail and log below —
+		// re_enriched_at doesn't exist yet at this point in runMigrations. It
+		// is retried (and self-heals) right after the reenrichColVersion ALTER
+		// further down guarantees the column exists — see idxBlReenrichScoreDDL.
+		idxBlReenrichScoreDDL,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			slog.Warn("db: read-path index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
@@ -1075,6 +1126,22 @@ func runMigrations(db *sql.DB) error {
 				reenrichColVersion, "add re_enriched_at to business_listings for autonomous reenrich worker")
 			slog.Info("db: reenrich col migration applied")
 		}
+	}
+
+	// Retry idx_bl_reenrich_score now that re_enriched_at is guaranteed to
+	// exist (the ALTER immediately above, or an earlier boot's copy of it).
+	// The FIRST attempt lives up in the early read-path CONCURRENTLY block —
+	// on a brand-new database that attempt runs before re_enriched_at exists
+	// and fails/logs (expected, non-fatal). This retry self-heals that case,
+	// and also self-heals any existing database that recorded
+	// reenrichColVersion under an older binary that predated this retry (this
+	// runs unconditionally, NOT gated by schema_migrations). CONCURRENTLY +
+	// IF NOT EXISTS makes it a fast no-op once the index already exists.
+	// Outside any transaction, same as every other CONCURRENTLY statement in
+	// this file — CONCURRENTLY is illegal inside a tx block.
+	if _, err := db.Exec(idxBlReenrichScoreDDL); err != nil {
+		slog.Warn("db: idx_bl_reenrich_score CREATE CONCURRENTLY retry failed — continuing without it (planner will fall back to PK scan)",
+			"stmt", idxBlReenrichScoreDDL, "error", err)
 	}
 
 	// re_enrich_locked_at: claim sentinel for multi-worker coordination.
@@ -1883,86 +1950,49 @@ func runMigrations(db *sql.DB) error {
 	}
 
 	// -------------------------------------------------------------------------
-	// 2026-06-10 v0.9.5 — Geo-recovery Phase 1: backfill queries.country from
-	// city tokens in query text.
+	// 2026-06-10 — RETIRED: legacy geo-recovery queries.country backfill.
 	//
-	// Background: the wellness generator creates ~3.45M queries with city tokens
-	// (e.g. "yoga instructor jakarta contact") but never fills the queries.country
-	// field, so geographic lineage is lost. The city→country map exists in
-	// wellness.go (Cities map keyed by country) but is never used during INSERT.
-	// This migration extracts city tokens from each query text by searching for
-	// known city names (case-insensitive) and backfills queries.country with the
-	// corresponding ISO 3166-1 alpha-2 code.
+	// This one-shot migration used to build a giant SQL CASE expression by
+	// fmt.Sprintf-interpolating raw city names straight into ILIKE string
+	// literals, then ran a single unwindowed UPDATE over the entire queries
+	// table (~3.45M rows) to backfill queries.country from city tokens in the
+	// query text. It has NEVER once succeeded in production — it warned
+	// "geo-recovery queries country backfill failed" on every boot, because
+	// the US cities list contains a possessive place name (an island off Cape
+	// Cod) whose unescaped apostrophe breaks the generated SQL with a syntax
+	// error.
+	//
+	// It was also architecturally unsafe even syntax-fixed, which is why it is
+	// being retired rather than repaired:
+	//   - the CASE compared LOWER(text) (a string) against `text ILIKE
+	//     '%city%'` (a boolean) — a simple-CASE/searched-CASE type mismatch
+	//     that never matched what it looked like it should.
+	//   - substring ILIKE matching produces false positives — e.g. "Marin"
+	//     inside "marine", and ambiguous city names (Chelsea, Richmond,
+	//     Victoria, Hamilton, Kingston, Solo, ...) silently assigned to the
+	//     wrong country.
+	//   - Go map iteration order is nondeterministic, so which of two
+	//     colliding WHEN branches "won" was not even reproducible run to run.
+	//   - none of the above belongs in a single unwindowed UPDATE over a
+	//     multi-million-row table (Operational Invariants #2 and #6).
+	//
+	// Superseded by BackfillQueryGeo in internal/db/geo.go: id-windowed,
+	// word-boundary alternation against the geo_cities reference table,
+	// dated the same day (2026-06-10). DO NOT resurrect or "fix" this block —
+	// any future city→country backfill work belongs in BackfillQueryGeo /
+	// geo_cities, not here. This block now only records that the legacy
+	// version was retired (zero UPDATEs on queries) so it never re-runs and
+	// never warns again.
 	// -------------------------------------------------------------------------
 	const geoRecoveryQueriesCountryVersion = "2026_06_10_geo_recovery_queries_country"
 	var geoQueriesDone bool
 	if err := db.QueryRow(
 		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, geoRecoveryQueriesCountryVersion,
 	).Scan(&geoQueriesDone); err == nil && !geoQueriesDone {
-		// Build the city→country ISO-2 map in Go from wellness.Cities.
-		cityMap := make(map[string]string)
-		iso2ByCountry := map[string]string{
-			"Indonesia": "ID", "United States": "US", "Canada": "CA",
-			"Australia": "AU", "New Zealand": "NZ", "United Kingdom": "GB",
-			"Ireland": "IE", "Germany": "DE", "Austria": "AT",
-			"Switzerland": "CH", "France": "FR", "Spain": "ES",
-			"Netherlands": "NL", "Belgium": "BE", "Italy": "IT",
-			"Portugal": "PT", "Sweden": "SE", "Denmark": "DK",
-			"Norway": "NO", "Finland": "FI", "Poland": "PL",
-			"Czech Republic": "CZ", "Hungary": "HU", "Romania": "RO",
-			"Croatia": "HR", "Greece": "GR", "Turkey": "TR",
-			"Thailand": "TH", "Vietnam": "VN", "Philippines": "PH",
-			"Malaysia": "MY", "Singapore": "SG", "Cambodia": "KH",
-			"Myanmar": "MM", "India": "IN", "Sri Lanka": "LK",
-			"Nepal": "NP", "UAE": "AE", "Qatar": "QA",
-			"Saudi Arabia": "SA", "Bahrain": "BH", "Japan": "JP",
-			"South Korea": "KR", "Taiwan": "TW", "Hong Kong": "HK",
-			"South Africa": "ZA", "Kenya": "KE", "Nigeria": "NG",
-			"Morocco": "MA", "Egypt": "EG", "Mexico": "MX",
-			"Brazil": "BR", "Colombia": "CO", "Argentina": "AR",
-			"Chile": "CL", "Peru": "PE", "Costa Rica": "CR",
-			"Panama": "PA",
-		}
-		// Populate cityMap with all known city→ISO mappings from wellness.query.Cities.
-		// This duplicates the city list from query/wellness.go to avoid circular dependency.
-		// The mapping is hardcoded here; if Cities changes in wellness.go, this must be updated.
-		citiesByCountry := map[string][]string{
-			"Indonesia":     {"Jakarta", "Surabaya", "Bandung", "Medan", "Semarang", "Makassar", "Palembang", "Tangerang", "Depok", "Bekasi", "Tangerang Selatan", "Bogor", "Serang", "Cilegon", "Denpasar", "Bali", "Ubud", "Canggu", "Seminyak", "Sanur", "Kuta", "Nusa Dua", "Uluwatu", "Jimbaran", "Pererenan", "Berawa", "Kerobokan", "Umalas", "Sidemen", "Amed", "Lovina", "Munduk", "Tabanan", "Gianyar", "Yogyakarta", "Malang", "Solo", "Surakarta", "Cirebon", "Purwokerto", "Kediri", "Madiun", "Probolinggo", "Balikpapan", "Manado", "Batam", "Samarinda", "Pontianak", "Banjarmasin", "Pekanbaru", "Padang", "Jambi", "Bengkulu", "Lombok", "Senggigi", "Kuta Lombok", "Gili Trawangan", "Kemang", "Senopati", "Menteng", "Kelapa Gading", "PIK Jakarta", "Sudirman", "Kuningan", "Pondok Indah", "Cipete", "Tebet", "Cilandak", "Pasar Minggu", "Kebayoran", "SCBD", "BSD", "Alam Sutera", "Gading Serpong"},
-			"United States": {"New York", "Los Angeles", "Chicago", "Houston", "Phoenix", "San Antonio", "San Diego", "Dallas", "San Jose", "Austin", "Jacksonville", "Fort Worth", "Columbus", "Indianapolis", "Charlotte", "San Francisco", "Seattle", "Denver", "Washington DC", "Boston", "El Paso", "Nashville", "Detroit", "Oklahoma City", "Portland", "Las Vegas", "Memphis", "Louisville", "Baltimore", "Milwaukee", "Albuquerque", "Tucson", "Fresno", "Sacramento", "Kansas City", "Mesa", "Atlanta", "Omaha", "Colorado Springs", "Miami", "Raleigh", "Long Beach", "Virginia Beach", "Oakland", "Minneapolis", "Tulsa", "Arlington", "Tampa", "New Orleans", "Cleveland", "Scottsdale", "Boulder", "Santa Monica", "Sedona", "Asheville", "Park City", "Aspen", "Palm Springs", "Ojai", "Big Sur", "Carmel", "Napa", "Sonoma", "Jackson Hole", "Vail", "Taos", "Santa Fe", "Telluride", "Marfa", "Key West", "Martha's Vineyard", "Honolulu", "Maui", "Oahu", "Kauai", "Big Island", "Lahaina", "Kihei", "Wailea", "Paia", "Hanalei", "Brooklyn", "Manhattan", "Queens", "Bronx", "Williamsburg", "Park Slope", "Upper East Side", "Upper West Side", "SoHo", "Tribeca", "Harlem", "DUMBO", "Greenpoint", "Bushwick", "Long Island City", "Astoria", "Chelsea", "West Village", "East Village", "NoHo", "Gramercy", "Flatiron", "Venice Beach", "Silver Lake", "West Hollywood", "Beverly Hills", "Pasadena", "Glendale", "Culver City", "Los Feliz", "Echo Park", "Highland Park", "Malibu", "Marina del Rey", "Manhattan Beach", "Hermosa Beach", "Redondo Beach", "Topanga", "Studio City", "Sherman Oaks", "Oakland", "Berkeley", "Palo Alto", "Mountain View", "Fremont", "San Mateo", "Redwood City", "Menlo Park", "Marin", "Mill Valley", "Sausalito", "Tiburon", "Tampa", "Orlando", "Fort Lauderdale", "West Palm Beach", "Boca Raton", "Delray Beach", "Sarasota", "Naples", "Fort Myers", "Destin", "St Petersburg", "Clearwater", "Plano", "Frisco", "Irving", "McKinney", "Round Rock", "Sugar Land", "The Woodlands", "Katy", "Tempe", "Chandler", "Gilbert", "Flagstaff", "Durham", "Chapel Hill", "Richmond", "Charleston", "Savannah", "Tallahassee", "Salt Lake City", "Boise", "Missoula", "Bozeman", "Pittsburgh", "Philadelphia", "Hartford", "Providence", "Princeton", "Hoboken", "Jersey City", "Stamford", "New Haven", "Arlington VA", "Alexandria"},
-			"Canada":        {"Toronto", "Vancouver", "Montreal", "Calgary", "Edmonton", "Ottawa", "Winnipeg", "Quebec City", "Halifax", "Victoria", "Whistler", "Kelowna", "Saskatoon", "Regina", "Mississauga", "Brampton", "Hamilton", "London Ontario", "Surrey BC", "Burnaby", "Richmond BC", "Langley", "Kitchener", "Waterloo", "Oakville", "Burlington", "Markham", "Vaughan", "Richmond Hill", "Oshawa", "Gatineau", "Sherbrooke", "Trois-Rivieres", "Laval", "North Vancouver", "West Vancouver", "Squamish", "Banff", "Canmore", "Jasper", "Tofino", "Ucluelet", "Niagara Falls", "Kingston", "Guelph"},
-		}
-		for country, cities := range citiesByCountry {
-			iso2 := iso2ByCountry[country]
-			if iso2 == "" {
-				continue
-			}
-			for _, city := range cities {
-				cityMap[strings.ToLower(city)] = iso2
-			}
-		}
-
-		var caseBuilder strings.Builder
-		caseBuilder.WriteString(`CASE LOWER(text)`)
-		for city, iso2 := range cityMap {
-			caseBuilder.WriteString(fmt.Sprintf(` WHEN text ILIKE '%%' || '%s' || '%%' THEN '%s'`, city, iso2))
-		}
-		caseBuilder.WriteString(` ELSE NULL END`)
-
-		updateSQL := fmt.Sprintf(`
-			UPDATE queries SET country = %s, updated_at = NOW()
-			WHERE (country IS NULL OR country = '') AND %s IS NOT NULL
-		`, caseBuilder.String(), caseBuilder.String())
-
-		res, err := db.Exec(updateSQL)
-		if err != nil {
-			slog.Warn("db: geo-recovery queries country backfill failed", "error", err)
-		} else {
-			n, _ := res.RowsAffected()
-			slog.Info("db: geo-recovery queries country backfilled", "rows_updated", n)
-			db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
-				geoRecoveryQueriesCountryVersion,
-				"backfill queries.country from city tokens (~3.45M queries)")
-		}
+		db.Exec(`INSERT INTO schema_migrations (version, notes) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			geoRecoveryQueriesCountryVersion,
+			"retired: superseded by BackfillQueryGeo (internal/db/geo.go); legacy CASE/ILIKE backfill never succeeded")
+		slog.Info("db: geo-recovery queries country backfill retired — superseded by BackfillQueryGeo", "version", geoRecoveryQueriesCountryVersion)
 	}
 
 	// -------------------------------------------------------------------------
