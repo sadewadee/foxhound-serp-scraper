@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.14-niche localhost:32769/foxhound-serp-scraper:v0.9.14-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.14-niche
+#   hachibi: docker tag …:v0.9.15-niche localhost:32769/foxhound-serp-scraper:v0.9.15-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.15-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
-# Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
+# Tag produced (foxhound v0.0.28 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.14-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.15-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -248,14 +248,22 @@
 #     (duckduckgo was starving on hachibi: 0 pages in 12 min behind a 4-min tab sleep).
 #   • Searxng items popped during backoff are released without burning attempts.
 #
-# Deploy: set IMAGE_TAG=v0.9.14-niche on the serp stack and redeploy.
+# v0.9.15-niche = v0.9.14 + foxhound v0.0.28 + test robustness (#65, #66):
+#   • #65 foxhound v0.0.28: PagePool Release/WarmUp hold the pool mutex across the
+#     closed-check and send; Close is idempotent — fixes the rare enrich-worker
+#     `panic: send on closed channel` during a shared-browser restart.
+#   • #66 internal/testpg: shared throwaway-Postgres helper (TEST_PG_READY_TIMEOUT,
+#     default 180s; server under `timeout 900`, self-terminating); docker-backed
+#     tests pass on this host again. Test-only.
+#
+# Deploy: set IMAGE_TAG=v0.9.15-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.14-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.15-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
