@@ -132,10 +132,9 @@ func TestYellowPagesExtractor_NoYellowPagesQueued(t *testing.T) {
 }
 
 func TestYellowPagesExtractor_RealPage30Listings(t *testing.T) {
-	path := "/tmp/claude-1001/-home-sadewa-prod-serp-scraper/34b1d1e0-2b8e-458e-a824-7095cc1f5ac6/scratchpad/dirtest/stealth/yp_noproxy_search.html"
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile("testdata/yp_search_30listings.html")
 	if err != nil {
-		t.Skip("scratchpad real page not present, skipping")
+		t.Fatalf("failed to read testdata/yp_search_30listings.html: %v", err)
 	}
 
 	e := &YellowPagesExtractor{}
