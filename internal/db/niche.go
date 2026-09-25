@@ -37,9 +37,9 @@ var nicheBuckets = []struct {
 	// word-end; every alternative in between matches as an unanchored
 	// substring (`spin` inside "spinach", `barre` inside "barrel", `hatha`/
 	// `asana` mid-word). See the 2026-09-25 gotcha entry.
-	{`\m(yoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti|yogi|yogis)\M`, "yoga"},
+	{`\m(yoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti)\M`, "yoga"},
 	{`\m(pilates|reformer)\M`, "pilates"},
-	{`\m(crossfit|bootcamp|hiit|barre|spin)\M`, "fitness"},
+	{`\m(crossfit|bootcamp|hiit|barre|spin class|spin studio|spinning class|indoor cycling)\M`, "fitness"},
 	{`\m(gym|fitness)\M`, "fitness"},
 	// fitness broadened (v0.9.8 broad-wellness scope): personal training,
 	// coaching-by-discipline, combat/dance/aquatic fitness.
@@ -66,6 +66,67 @@ var nicheBuckets = []struct {
 // these (they entered via a legacy broad-niche import). Kept in lockstep with
 // the trigger off_niche CASE. \m-prefix groups, matched against lowercased text.
 const beautyOffNichePattern = `\m(nail salon|manicure|pedicure|esthetic|aesthetic|beautician|cosmetolog|barber|hairdress|hair salon|makeup|make-up|eyelash|lash extension|eyebrow|microblad|waxing salon|tattoo)`
+
+// hardOffNicheTypes are schema.org @type values for real, verified business
+// kinds that are structurally off-target for a wellness/fitness lead list —
+// hotels, casinos, auto dealers, restaurants, and similar hospitality/food
+// venues. These win over ANY keyword evidence unconditionally: a hotel's
+// amenity copy ("fitness center & pool"), a casino's promo copy ("free
+// spins"), or a flight school named "Yogi Flight School" routinely trips a
+// wellness keyword bucket, but the business itself is not a wellness
+// business. Audited 2026-09-25 against a 59,360-row production dry-run
+// sample of the (then keyword-wins-over-@type) off_niche reclassification —
+// ~35% of a random 40-row sample were false positives of exactly this
+// shape. Kept in lockstep with the HARD off-niche @type IN(...) list inside
+// trg_normalize_enrichment's off_niche CASE (internal/db/migrate.go) — see
+// TestTriggerHardOffNicheListMatchesGoSlice (niche_wordboundary_test.go),
+// which reads migrate.go's source and asserts every entry here appears
+// there, in order.
+var hardOffNicheTypes = []string{
+	"AutoDealer", "Hotel", "Restaurant", "Dentist",
+	"RealEstateAgent", "LegalService", "HairSalon", "BeautySalon", "NailSalon",
+	"TravelAgency", "LodgingBusiness", "GeneralContractor",
+	"RoofingContractor", "HomeAndConstructionBusiness",
+	// 2026-09-26 false-positive audit: lodging/hospitality + food & drink
+	// venues added — same amenity/promo-keyword false-positive class as
+	// Hotel (spa/fitness amenities, "spin" promos, cafe "brew"/"roast" copy,
+	// bakery "healthy" copy, winery/brewery "wellness retreat" copy).
+	"Resort", "Hostel", "BedAndBreakfast", "Motel", "Campground", "Casino",
+	"BarOrPub", "CafeOrCoffeeShop", "FastFoodRestaurant", "Bakery", "Winery", "Brewery",
+}
+
+// contentCommerceOffNicheTypes are schema.org @type values for page
+// structure, media, and commerce content — never a wellness business lead
+// on their own, regardless of incidental keyword matches (e.g. a "yoga mat
+// shop" Product page, or a "spin class" blog post). Used by
+// ReclassifyOffNicheByKeyword's predicate (buildReclassifyPredicateSQL) to
+// keep these rows off_niche=TRUE even when their business_name/page_title/
+// description carries niche keyword evidence — a superset of the trigger's
+// own content/media IN(...) list (migrate.go) extended with commerce/
+// interactive @type values the trigger's forward-going classification
+// doesn't need to special-case (it only ever sees a fresh page visit, never
+// the historical data shapes this one-time reclassify sweep targets).
+var contentCommerceOffNicheTypes = []string{
+	"Article", "BlogPosting", "NewsArticle", "TechArticle", "FAQPage", "QAPage",
+	"Review", "AggregateRating", "Product", "product", "ProductGroup", "Recipe",
+	"HowTo", "VideoObject", "Movie", "Book", "Dataset", "SoftwareApplication",
+	"WebApplication", "MobileApplication", "VideoGame", "JobPosting",
+	"DiscussionForumPosting", "CreativeWork", "CreativeWorkSeries", "Course",
+	"Event", "Offer", "Store", "OnlineStore",
+}
+
+// sqlQuotedList renders vals as a single-quoted, comma-separated SQL IN(...)
+// body, e.g. []string{"A","B"} -> `'A','B'`. Safe only because no caller
+// value may contain a quote or a '%' — TestOffNicheTypeListsAreSQLSafe
+// asserts that invariant for both slices above, so this never needs
+// per-call escaping.
+func sqlQuotedList(vals []string) string {
+	quoted := make([]string, len(vals))
+	for i, v := range vals {
+		quoted[i] = "'" + v + "'"
+	}
+	return strings.Join(quoted, ",")
+}
 
 // buildNicheCaseSQL renders the niche CASE over an already-lowercased text
 // expression, e.g. buildNicheCaseSQL("LOWER(q.text)"). No pattern contains a
@@ -316,15 +377,33 @@ func BackfillNicheTaxonomyV2(ctx context.Context, db *sql.DB) {
 const reclassifyLowerTextExpr = `LOWER(COALESCE(business_name,'') || ' ' || COALESCE(page_title,'') || ' ' || COALESCE(description,''))`
 
 // buildReclassifyPredicateSQL renders the shared WHERE predicate: an
-// off_niche=TRUE row with no beauty/grooming evidence (that exclusion is
-// intentional and stays) AND at least one niche keyword bucket match. Reused
-// by the count (dry-run) and UPDATE (write) SQL builders below and by the
-// backup INSERT so all three windows agree on exactly the same row set.
+// off_niche=TRUE row with
+//   - no beauty/grooming evidence (that exclusion is intentional and stays),
+//   - a category NOT in the HARD off-niche @type list (hardOffNicheTypes —
+//     a hotel/casino/restaurant/etc. stays off_niche=TRUE even if its page
+//     copy carries incidental keyword evidence; see the 2026-09-25 false-
+//     positive audit in niche.go's hardOffNicheTypes doc comment),
+//   - a category NOT in the content/commerce @type list
+//     (contentCommerceOffNicheTypes — an Article/Product/Review/etc. page is
+//     never a business lead on its own, regardless of keyword matches), and
+//   - at least one niche keyword bucket match.
+//
+// COALESCE'ing category to the empty string before NOT IN (rather than a
+// bare NOT IN, which is NULL — and so drops the row entirely — whenever
+// category IS NULL) makes both exclusions apply only to rows that actually
+// carry one of those @type values; a NULL-category row is unaffected by
+// either NOT IN and still requires keyword evidence via the final IS NOT
+// NULL clause.
+//
+// Reused by the count (dry-run) and UPDATE (write) SQL builders below and by
+// the backup INSERT so all three windows agree on exactly the same row set.
 func buildReclassifyPredicateSQL() string {
 	nicheCase := buildNicheCaseSQL(reclassifyLowerTextExpr)
 	return fmt.Sprintf(
-		"off_niche = TRUE AND %s !~ '%s' AND %s IS NOT NULL",
-		reclassifyLowerTextExpr, beautyOffNichePattern, nicheCase,
+		"off_niche = TRUE AND %s !~ '%s' AND COALESCE(category,'') NOT IN (%s) AND COALESCE(category,'') NOT IN (%s) AND %s IS NOT NULL",
+		reclassifyLowerTextExpr, beautyOffNichePattern,
+		sqlQuotedList(hardOffNicheTypes), sqlQuotedList(contentCommerceOffNicheTypes),
+		nicheCase,
 	)
 }
 
@@ -393,13 +472,20 @@ func nicheReclassifyDryRunEnabled() bool {
 const offNicheKeywordReclassifyVersion = "2026_09_25_offniche_keyword_reclassify"
 
 // ReclassifyOffNicheByKeyword flips off_niche back to FALSE for existing rows
-// that were wrongly excluded by a stale schema.org @type (Article,
-// ContactPage, Hotel, Physician, ...) even though the page's own
+// that were wrongly excluded by a stale schema.org @type (ContactPage,
+// Physician, MedicalClinic, ...) even though the page's own
 // business_name/page_title/description carries clear niche keyword evidence.
 // See the "2026-09-25 — off_niche keyword reclassification" block comment
-// above for the root cause. Never touches beauty/grooming off_niche rows
-// (intentionally sticky) and never touches rows with no keyword evidence —
-// those may be genuinely off-niche, a human decision, not this migration's.
+// above for the root cause. Conservative by construction (2026-09-26
+// false-positive audit tightening — buildReclassifyPredicateSQL): never
+// touches beauty/grooming off_niche rows (intentionally sticky), never
+// touches a row whose category is in the HARD off-niche @type list
+// (hardOffNicheTypes — Hotel, Casino, Restaurant, ... win over keyword
+// evidence regardless, same as the trigger), never touches a row whose
+// category is content/commerce noise (contentCommerceOffNicheTypes —
+// Article, Product, Review, ...), and never touches rows with no keyword
+// evidence at all — those may be genuinely off-niche, a human decision, not
+// this migration's.
 //
 // Dry-run gated via nicheReclassifyDryRunEnabled (default ON): in dry-run,
 // logs the bounded per-window count of rows that WOULD change and does NOT

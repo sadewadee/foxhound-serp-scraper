@@ -291,7 +291,7 @@ const idxBlReenrichScoreDDL = `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_re
 // than the binary's — it does NOT upgrade stale binaries; those still need
 // a real deploy.
 const enqueueTriggerVersion = 20260925
-const normalizeTriggerVersion = 20260925
+const normalizeTriggerVersion = 20260926
 
 // trgEnqueueEnrichmentFnBody is the trg_enqueue_enrichment CREATE OR REPLACE
 // statement, with a %d placeholder for enqueueTriggerVersion — the single
@@ -374,9 +374,9 @@ const trgNormalizeEnrichmentFnBody = `
 		    -- patterns, same precedence (first match wins).
 		    niche_text := LOWER(COALESCE(NEW.raw_business_name,'') || ' ' || COALESCE(NEW.raw_page_title,'') || ' ' || COALESCE(NEW.raw_description,''));
 		    niche_bucket := CASE
-		      WHEN niche_text ~ '\m(yoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti|yogi|yogis)\M' THEN 'yoga'
+		      WHEN niche_text ~ '\m(yoga|asana|vinyasa|ashtanga|kundalini|iyengar|hatha|bikram|jivamukti)\M' THEN 'yoga'
 		      WHEN niche_text ~ '\m(pilates|reformer)\M' THEN 'pilates'
-		      WHEN niche_text ~ '\m(crossfit|bootcamp|hiit|barre|spin)\M' THEN 'fitness'
+		      WHEN niche_text ~ '\m(crossfit|bootcamp|hiit|barre|spin class|spin studio|spinning class|indoor cycling)\M' THEN 'fitness'
 		      WHEN niche_text ~ '\m(gym|fitness)\M' THEN 'fitness'
 		      WHEN niche_text ~ '\m(personal train|strength coach|conditioning coach|functional train|kickbox|boxing|martial art|swimming|zumba|pole danc|pole fit|pole instructor|dance)' THEN 'fitness'
 		      WHEN niche_text ~ '\m(meditation|mindfulness|breathwork)\M' THEN 'meditation'
@@ -399,10 +399,12 @@ const trgNormalizeEnrichmentFnBody = `
 		    --    had no path at all — extracted then dropped on the floor.
 		    --
 		    -- Niche classifier inlined here (no Go code, per design):
-		    --   • off_niche = TRUE for known off-niche schema.org @type values
-		    --     (AutoDealer, Hotel, Restaurant, Dentist, ...) OR meta-keyword
-		    --     soup (raw_category length > 100). These are the patterns
-		    --     observed polluting business_listings.category — see plan.
+		    --   • off_niche = TRUE for a HARD off-niche schema.org @type list
+		    --     (AutoDealer, Hotel, Restaurant, Casino, ...) — these win over
+		    --     keyword evidence, ALWAYS — OR meta-keyword soup (raw_category
+		    --     length > 100). These are the patterns observed polluting
+		    --     business_listings.category — see plan and the 2026-09-25/26
+		    --     off_niche precedence rewrite comment below.
 		    --   • niche_category bucketed from the union of raw_business_name +
 		    --     raw_page_title + raw_description against the same niche keyword
 		    --     whitelist used to generate queries in internal/query/wellness.go.
@@ -420,21 +422,37 @@ const trgNormalizeEnrichmentFnBody = `
 		        NEW.raw_phones[1], COALESCE(NEW.raw_phones, '{}'), NEW.url, NEW.raw_page_title, NEW.raw_social,
 		        NEW.raw_opening_hours, NEW.raw_rating, NEW.raw_tiktok, NEW.raw_youtube, NEW.raw_telegram,
 		        NEW.parent_query_id,
-		        -- off_niche (2026-09-25 precedence rewrite — see the niche_text/
-		        -- niche_bucket computation above for the incident this fixes):
+		        -- off_niche (2026-09-26 precedence rewrite — see the niche_text/
+		        -- niche_bucket computation above for the incident this fixes; see
+		        -- also hardOffNicheTypes in internal/db/niche.go, kept in lockstep
+		        -- with the IN(...) list at step 2 below via
+		        -- TestTriggerHardOffNicheListMatchesGoSlice):
 		        --   1. beauty/grooming keyword evidence -> TRUE, always (never
 		        --      overridden — off-target even if some other wellness
 		        --      keyword also appears on the page).
-		        --   2. niche_bucket IS NOT NULL -> FALSE, REGARDLESS of @type.
-		        --      A real keyword match (e.g. "physiotherapy clinic" on a
-		        --      page whose JSON-LD says Physician, or "Yoga Studio" on a
+		        --   2. else raw_category in the HARD off-niche business @type
+		        --      list (Hotel, Casino, Restaurant, ...) -> TRUE, ALWAYS —
+		        --      these @type values win over keyword evidence. Audited
+		        --      2026-09-25 against a 59,360-row production dry-run
+		        --      sample: ~35%% false positives were hotels/casinos/etc.
+		        --      whose AMENITY or PROMO copy incidentally matched a
+		        --      wellness keyword ("Hyatt Place Fremont — fitness center
+		        --      & pool", "Hero Spin Casino — free spins", "Yogi Flight
+		        --      School") even though the business itself is not a
+		        --      wellness business. This step MUST run before step 3 —
+		        --      see the 2026-09-25/26 gotcha entry ("schema.org @type
+		        --      overrides keyword niche classification" / its follow-up
+		        --      false-positive audit) for the incident this restores.
+		        --   3. else niche_bucket IS NOT NULL -> FALSE, regardless of
+		        --      any OTHER (non-hard-listed) @type. A real keyword match
+		        --      (e.g. "physiotherapy clinic" on a page whose JSON-LD
+		        --      says Physician/MedicalClinic, or "Yoga Studio" on a
 		        --      page whose JSON-LD says Article/ContactPage) is stronger
-		        --      evidence than a schema.org @type — schema.org @type must
-		        --      never override real page keyword evidence. This is the
-		        --      core fix.
-		        --   3. else raw_category in the hard off-niche business @type
-		        --      list -> TRUE (no keyword evidence AND an explicitly
-		        --      off-target business kind).
+		        --      evidence than a GENERIC or content/page @type — but a
+		        --      HARD off-niche @type (step 2) still wins over it.
+		        --      Physician/MedicalClinic/MedicalBusiness/
+		        --      HealthAndBeautyBusiness are intentionally NOT in the
+		        --      hard list — they stay keyword-rescuable here.
 		        --   4. else raw_category is SET and >100 chars (legacy
 		        --      meta-keyword-soup garbage, e.g. an old
 		        --      <meta name="keywords"> value stuffed into raw_category)
@@ -456,13 +474,19 @@ const trgNormalizeEnrichmentFnBody = `
 		        --      off-niche signal).
 		        CASE
 		          WHEN niche_text ~ '\m(nail salon|manicure|pedicure|esthetic|aesthetic|beautician|cosmetolog|barber|hairdress|hair salon|makeup|make-up|eyelash|lash extension|eyebrow|microblad|waxing salon|tattoo)' THEN TRUE
-		          WHEN niche_bucket IS NOT NULL THEN FALSE
+		          -- Step 2: HARD off-niche @type list — wins over keyword evidence
+		          -- (see the numbered comment above). Lockstep with hardOffNicheTypes
+		          -- in internal/db/niche.go — lockstep: hardOffNicheTypes (niche.go)
+		          -- — see TestTriggerHardOffNicheListMatchesGoSlice.
 		          WHEN NEW.raw_category IN (
 		            'AutoDealer','Hotel','Restaurant','Dentist',
 		            'RealEstateAgent','LegalService','HairSalon','BeautySalon','NailSalon',
 		            'TravelAgency','LodgingBusiness','GeneralContractor',
-		            'RoofingContractor','HomeAndConstructionBusiness'
+		            'RoofingContractor','HomeAndConstructionBusiness',
+		            'Resort','Hostel','BedAndBreakfast','Motel','Campground','Casino',
+		            'BarOrPub','CafeOrCoffeeShop','FastFoodRestaurant','Bakery','Winery','Brewery'
 		          ) THEN TRUE
+		          WHEN niche_bucket IS NOT NULL THEN FALSE
 		          WHEN NEW.raw_category IS NOT NULL AND LENGTH(NEW.raw_category) > 100 THEN TRUE
 		          -- schema.org content/media/app/page-structure @type values —
 		          -- never a wellness business lead on their own.
@@ -479,10 +503,10 @@ const trgNormalizeEnrichmentFnBody = `
 		          ) THEN TRUE
 		          -- Generic business @type containers + the specific-but-too-broad
 		          -- medical/beauty umbrella types (Physician/MedicalClinic/
-		          -- MedicalBusiness/HealthAndBeautyBusiness moved here 2026-09-25
-		          -- — they no longer hard-force TRUE; niche_bucket at step 2
-		          -- already rescues a real physio/chiro/spa business with page
-		          -- keyword evidence).
+		          -- MedicalBusiness/HealthAndBeautyBusiness) — these stay
+		          -- keyword-rescuable (step 3 above already rescues a real
+		          -- physio/chiro/spa business with page keyword evidence); they
+		          -- only land TRUE here when no keyword evidence was found.
 		          WHEN NEW.raw_category IN (
 		            'Organization','organization','LocalBusiness','Corporation','Store',
 		            'OnlineStore','Service','ProfessionalService','EducationalOrganization',
@@ -551,15 +575,29 @@ const trgNormalizeEnrichmentFnBody = `
 		        tiktok        = COALESCE(EXCLUDED.tiktok, business_listings.tiktok),
 		        youtube       = COALESCE(EXCLUDED.youtube, business_listings.youtube),
 		        telegram      = COALESCE(EXCLUDED.telegram, business_listings.telegram),
-		        -- off_niche (2026-09-25): fresh page evidence of a niche bucket
-		        -- (EXCLUDED.niche_category IS NOT NULL) takes EXCLUDED.off_niche
-		        -- outright — letting a re-enrich that now finds real keyword
-		        -- evidence flip a previously-wrong TRUE back to FALSE (off_niche
-		        -- was unconditionally sticky via OR before this fix, so a wrong
-		        -- TRUE could never self-heal). Safe even for the beauty pattern:
-		        -- beauty text forces EXCLUDED.off_niche=TRUE regardless of
-		        -- niche_bucket (see the off_niche CASE above), so a beauty row
-		        -- that also matches a niche keyword still lands on TRUE here.
+		        -- off_niche (2026-09-25, precedence documented 2026-09-26): fresh
+		        -- page evidence of a niche bucket (EXCLUDED.niche_category IS NOT
+		        -- NULL) takes EXCLUDED.off_niche OUTRIGHT (whatever this row's
+		        -- off_niche CASE above computed, TRUE or FALSE) — letting a
+		        -- re-enrich that now finds real keyword evidence flip a
+		        -- previously-wrong TRUE back to FALSE (off_niche was
+		        -- unconditionally sticky via OR before this fix, so a wrong TRUE
+		        -- could never self-heal). This is correct, not just "safe", for
+		        -- BOTH rows the off_niche CASE forces TRUE even with
+		        -- niche_category set:
+		        --   • beauty pattern rows — beauty text forces
+		        --     EXCLUDED.off_niche=TRUE regardless of niche_bucket (off_niche
+		        --     CASE step 1, above), so a beauty row that also matches a
+		        --     niche keyword still lands on TRUE here.
+		        --   • HARD off-niche @type rows (off_niche CASE step 2, above) —
+		        --     e.g. raw_category='Hotel' with niche_text matching "spa":
+		        --     niche_bucket='spa' so niche_category is still computed and
+		        --     EXCLUDED.niche_category IS NOT NULL, but EXCLUDED.off_niche
+		        --     is TRUE (the hard-type check wins in the CASE above, before
+		        --     the niche_bucket check) — so this ON CONFLICT branch also
+		        --     takes EXCLUDED.off_niche=TRUE outright. A hard-type row
+		        --     never gets accidentally rescued back to FALSE by its own
+		        --     (harmless, still-computed) niche_category.
 		        -- Otherwise (no fresh bucket this pass) fall back to the old
 		        -- sticky-OR so a genuinely off-niche row never silently flips
 		        -- back to in-niche just because THIS visit found no keyword.
