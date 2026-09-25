@@ -21,9 +21,9 @@ import (
 // database: the batch is bounded, runs under a statement timeout, and completion
 // no longer depends on a recency window.
 func TestReconcileSQLShape(t *testing.T) {
-	src, err := os.ReadFile("serp.go")
+	src, err := os.ReadFile("serp_reconcile.go")
 	if err != nil {
-		t.Fatalf("read serp.go: %v", err)
+		t.Fatalf("read serp_reconcile.go: %v", err)
 	}
 	body := string(src)
 
