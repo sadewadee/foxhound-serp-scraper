@@ -140,6 +140,9 @@ func TestIsSkipDomain_Allowed(t *testing.T) {
 		"www.yogahaven.co.uk",
 		"www.smallbiz.com",
 
+		// Re-enabled directory aggregators
+		"www.yellowpages.com",
+
 		// Tricky: contains common substrings but should NOT match patterns
 		// (we don't have ".forum" without a dot before, but verify "form" alone
 		//  doesn't accidentally match "forum.")
