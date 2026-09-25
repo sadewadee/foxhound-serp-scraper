@@ -40,6 +40,9 @@ type SERPStage struct {
 	timing    *behavior.Timing
 	lifecycle *scraper.BrowserLifecycle
 	engines   []scraper.SearchEngine
+	// enginesByName indexes engines for job lookup — the static registry in
+	// scraper.GetEngine has no configured SearXNG engine.
+	enginesByName map[string]scraper.SearchEngine
 
 	browser       *fetch.CamoufoxFetcher
 	browserMu     sync.Mutex
@@ -85,6 +88,7 @@ func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPSt
 		queryRepo:      query.NewRepositoryWithRedis(database, dd.Client()),
 		timing:         behavior.NewTiming(behavior.CarefulProfile().Timing),
 		engines:        engines,
+		enginesByName:  engineLookup(engines),
 		circuitBreaker: scraper.NewCircuitBreaker(cfg),
 		fatigue:        scraper.NewSessionFatigue(cfg),
 	}
@@ -390,25 +394,13 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			job.Engine = "google"
 		}
 
-		eng := scraper.GetEngine(job.Engine)
+		// Resolve against the stage's configured engines, not the static
+		// registry: a configured SearXNG engine exists only here.
+		eng := s.enginesByName[job.Engine]
 		if eng == nil {
-			slog.Warn("serp: unknown engine, skipping", "engine", job.Engine, "job", job.ID)
-			continue
-		}
-
-		// Guard: refuse jobs whose engine is not in the configured set. Legacy
-		// rows (e.g. Google jobs from before SERP_ENGINES was narrowed) still
-		// live in serp_jobs and would otherwise burn browser time on reCAPTCHA.
-		engineEnabled := false
-		for _, e := range s.engines {
-			if e.Name() == job.Engine {
-				engineEnabled = true
-				break
-			}
-		}
-		if !engineEnabled {
-			slog.Warn("serp: engine disabled, marking dead", "engine", job.Engine, "job", job.ID)
-			s.db.Exec(`UPDATE serp_jobs SET status='dead', error_msg='engine disabled in SERP_ENGINES', locked_by=NULL, updated_at=NOW() WHERE id=$1`, job.ID)
+			slog.Warn("serp: engine not in configured set, marking dead",
+				"engine", job.Engine, "job", job.ID)
+			s.db.Exec(`UPDATE serp_jobs SET status='dead', error_msg='engine not in configured SERP_ENGINES', locked_by=NULL, updated_at=NOW() WHERE id=$1`, job.ID)
 			s.redis.Del(ctx, "serp:lock:"+job.ID)
 			continue
 		}

@@ -49,3 +49,19 @@ func resolveEngines(cfg *config.Config) []scraper.SearchEngine {
 	}
 	return enabled
 }
+
+// engineLookup indexes the stage's configured engines by name.
+//
+// The static scraper.GetEngine registry cannot be used here: by design it
+// never holds a configured SearXNG engine, so resolving a searxng job through
+// it returned nil and every such job was skipped in prod
+// ("serp: unknown engine, skipping engine=searxng").
+func engineLookup(engines []scraper.SearchEngine) map[string]scraper.SearchEngine {
+	m := make(map[string]scraper.SearchEngine, len(engines))
+	for _, e := range engines {
+		if e != nil {
+			m[e.Name()] = e
+		}
+	}
+	return m
+}

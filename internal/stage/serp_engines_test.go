@@ -18,6 +18,38 @@ func hasEngine(engines []scraper.SearchEngine, name string) bool {
 	return false
 }
 
+// TestTabWorkerLookupResolvesConfiguredSearxng is the regression test for the
+// prod incident where every searxng job was skipped: tabWorker resolved the
+// job engine through the static scraper.GetEngine registry, which never holds
+// a *configured* SearXNG engine. The lookup must come from the stage's
+// configured engine set instead, carrying the configured URL.
+func TestTabWorkerLookupResolvesConfiguredSearxng(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SERP.Engines = "searxng,duckduckgo"
+	cfg.SERP.SearXNGURL = "http://searxng:8080"
+	cfg.SERP.SearXNGMaxPages = 2
+
+	// Exact lookup path tabWorker uses: resolve once, index by name.
+	byName := engineLookup(resolveEngines(cfg))
+
+	eng, ok := byName["searxng"]
+	if !ok || eng == nil {
+		t.Fatal("tabWorker lookup misses searxng — jobs would be skipped again")
+	}
+	sx, ok := eng.(*scraper.SearXNGEngine)
+	if !ok {
+		t.Fatalf("lookup returned %T, want *scraper.SearXNGEngine", eng)
+	}
+	if got := sx.BuildURL("day spa honolulu", 0, 10, "us", "en"); got[:21] != "http://searxng:8080/s" {
+		t.Errorf("BuildURL = %q, want it rooted at the configured SEARXNG_URL", got)
+	}
+
+	// Unknown engines resolve to nothing: the caller dead-letters the job.
+	if _, ok := byName["google"]; ok {
+		t.Error("google resolves despite not being in SERP_ENGINES — legacy jobs would run")
+	}
+}
+
 func TestResolveEngines_DropsSearxngWhenURLEmpty(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.SERP.Engines = "searxng,duckduckgo"
