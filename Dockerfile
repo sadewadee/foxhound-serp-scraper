@@ -66,30 +66,46 @@ RUN pip3 install --break-system-packages camoufox \
 # DOWNLOAD_HOST alone cannot fix this — it only changes which dead mirror
 # playwright-go's zip downloader hits.
 #
-# Workaround: install the *same-version* `playwright` npm package straight
-# into the driver cache dir playwright-go expects (npm's registry is healthy
-# and unaffected by the CDN outage), so DownloadDriver()'s up-to-date check
-# finds a working driver and skips the dead zip fetch entirely. The Firefox
-# *browser* binary itself downloads fine through that driver's own (currently
-# healthy) cdn.playwright.dev resolution — no host override needed there,
-# though we pin PLAYWRIGHT_DOWNLOAD_HOST to the same CDN the task asked for,
-# for determinism. PLAYWRIGHT_NODEJS_PATH points the driver at system Node
-# instead of requiring one bundled inside the (no-longer-downloaded) zip.
+# Workaround, built to be structurally identical to what the retired zip used
+# to produce (driver dir = LICENSE + node + package/), so nothing downstream
+# (foxhound's playwright.Run(), the runtime image) has to change:
+#   1. Install the *same-version* `playwright` npm package (npm's registry is
+#      healthy, unaffected by the CDN outage) into the driver cache dir
+#      playwright-go expects, so DownloadDriver()'s up-to-date check finds a
+#      working driver and skips the dead zip fetch entirely.
+#   2. Download the official Node.js binary the zip used to bundle, verify it
+#      against nodejs.org's published SHASUMS256.txt (build fails on
+#      mismatch), and place it at .../<version>/node — the exact path/name
+#      playwright-go's default getNodeExecutable() looks for, so no
+#      PLAYWRIGHT_NODEJS_PATH override is needed anywhere, build or runtime.
+# The Firefox *browser* binary itself downloads fine through the driver's own
+# (currently healthy) cdn.playwright.dev resolution; PLAYWRIGHT_DOWNLOAD_HOST
+# is pinned below for determinism, scoped to just that install step.
 COPY go.mod /tmp/go.mod
-RUN apt-get update && apt-get install -y --no-install-recommends golang unzip nodejs npm \
+RUN apt-get update && apt-get install -y --no-install-recommends golang unzip \
     && PWGO_VER=$(grep -oE 'playwright-community/playwright-go v[0-9]+\.[0-9]+\.[0-9.]+' /tmp/go.mod | awk '{print $2}') \
     && go install github.com/playwright-community/playwright-go/cmd/playwright@${PWGO_VER} \
     && PW_VER=$(grep -oE 'playwrightCliVersion = "[0-9]+\.[0-9]+\.[0-9]+"' /root/go/pkg/mod/github.com/playwright-community/playwright-go@${PWGO_VER}/run.go | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') \
     && DRIVER_DIR=/root/.cache/ms-playwright-go/${PW_VER} \
     && mkdir -p "${DRIVER_DIR}/package/node_modules" \
-    && npm install --no-save --prefix /tmp/pw-npm playwright@${PW_VER} \
+    && NODE_VER=v24.11.1 \
+    && curl -fsSL -o /tmp/node.tar.gz "https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-linux-x64.tar.gz" \
+    && curl -fsSL -o /tmp/node.SHASUMS256.txt "https://nodejs.org/dist/${NODE_VER}/SHASUMS256.txt" \
+    && EXPECTED_SHA=$(grep " node-${NODE_VER}-linux-x64.tar.gz\$" /tmp/node.SHASUMS256.txt | awk '{print $1}') \
+    && ACTUAL_SHA=$(sha256sum /tmp/node.tar.gz | awk '{print $1}') \
+    && [ -n "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" = "$ACTUAL_SHA" ] \
+    && tar -xzf /tmp/node.tar.gz -C /tmp \
+    && /tmp/node-${NODE_VER}-linux-x64/bin/node /tmp/node-${NODE_VER}-linux-x64/bin/npm \
+       install --no-save --prefix /tmp/pw-npm playwright@${PW_VER} \
     && cp -a /tmp/pw-npm/node_modules/playwright/. "${DRIVER_DIR}/package/" \
     && cp -a /tmp/pw-npm/node_modules/playwright-core "${DRIVER_DIR}/package/node_modules/playwright-core" \
-    && rm -rf /tmp/pw-npm \
-    && PLAYWRIGHT_NODEJS_PATH=/usr/bin/node \
-       PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.playwright.dev/dbazure/download/playwright \
+    && cp /tmp/node-${NODE_VER}-linux-x64/bin/node "${DRIVER_DIR}/node" \
+    && chmod 755 "${DRIVER_DIR}/node" \
+    && cp /tmp/node-${NODE_VER}-linux-x64/LICENSE "${DRIVER_DIR}/LICENSE" \
+    && rm -rf /tmp/pw-npm /tmp/node.tar.gz /tmp/node.SHASUMS256.txt /tmp/node-${NODE_VER}-linux-x64 \
+    && PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.playwright.dev/dbazure/download/playwright \
        /root/go/bin/playwright install --with-deps firefox \
-    && apt-get purge -y golang nodejs npm \
+    && apt-get purge -y golang \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /root/go/pkg /tmp/go.mod
 
@@ -115,7 +131,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     libatk1.0-0t64 libcairo2 libcups2t64 libgdk-pixbuf-2.0-0 \
     libpango-1.0-0 libx11-xcb1 \
     fonts-liberation fonts-noto fonts-noto-cjk \
-    ca-certificates tzdata curl nodejs \
+    ca-certificates tzdata curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 1001 scraper && \
@@ -141,10 +157,6 @@ USER scraper
 WORKDIR /home/scraper
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/scraper/.cache/ms-playwright
-# The driver cache no longer bundles its own Node.js binary (see the browser
-# stage's npm-bootstrap workaround for the retired driver CDN) — point
-# playwright-go at the system Node.js installed above instead.
-ENV PLAYWRIGHT_NODEJS_PATH=/usr/bin/node
 
 EXPOSE 8080 9090
 
