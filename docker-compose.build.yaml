@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.10-niche localhost:32769/foxhound-serp-scraper:v0.9.10-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.10-niche
+#   hachibi: docker tag …:v0.9.11-niche localhost:32769/foxhound-serp-scraper:v0.9.11-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.11-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.27 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.10-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.11-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -206,14 +206,27 @@
 #     version 20260926.
 #   DEPLOY BOTH HOSTS (hachibi stack + kurawa /home/sadewa/serpscraper-remote).
 #
-# Deploy: set IMAGE_TAG=v0.9.10-niche on the serp stack and redeploy.
+# v0.9.11-niche = v0.9.10 + SERP data quality (#52, #53, #54):
+#   • #53 relevance guard: Bing (stealth HTTP) serves "poisoned" SERPs (query echoed,
+#     organic results unrelated, HTTP 200, no captcha). Pages with relevance ratio <
+#     SERP_RELEVANCE_MIN (0.3) are soft-blocked (fail after 3 attempts, no tab sleep);
+#     only relevant results are inserted. ParseResults returns URL+title+snippet.
+#     Honest counts: `new` = RowsAffected. Retry counters now atomic SQL (Invariant #1).
+#   • #54 reconciler: bounded completion of stuck 'processing' queries (500/tick),
+#     zombie = zero serp_jobs only (no more re-scraping finished queries),
+#     disabled-engine jobs → dead; idx_serp_claim_engine (CONCURRENTLY, self-healing).
+#   • #52 YellowPages re-enabled (verified reachable 2026-09-25), 3x duplicate fix,
+#     only the business's own website is queued for enrichment.
+#   DEPLOY BOTH HOSTS (hachibi stack + kurawa /home/sadewa/serpscraper-remote).
+#
+# Deploy: set IMAGE_TAG=v0.9.11-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.10-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.11-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
