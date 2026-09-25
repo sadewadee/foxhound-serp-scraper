@@ -56,16 +56,18 @@ type RedisConfig struct {
 }
 
 type SERPConfig struct {
-	PagesPerQuery         int    `yaml:"pages_per_query"`
-	ResultsPerPage        int    `yaml:"results_per_page"`
-	DelayBetweenPagesMs   int    `yaml:"delay_between_pages_ms"`
-	DelayBetweenQueriesMs int    `yaml:"delay_between_queries_ms"`
-	Concurrency           int    `yaml:"concurrency"`      // number of tabs (goroutines)
-	SERPDelayMs           int    `yaml:"serp_delay_ms"`    // inter-page delay override (0 = use timing profile)
-	Engines               string `yaml:"engines"`          // "all", "google", "bing", "duckduckgo" (default: "all")
-	GoogleMaxPages        int    `yaml:"google_max_pages"` // default 3
-	BingMaxPages          int    `yaml:"bing_max_pages"`   // default 5
-	DDGMaxPages           int    `yaml:"ddg_max_pages"`    // default 1
+	PagesPerQuery         int     `yaml:"pages_per_query"`
+	ResultsPerPage        int     `yaml:"results_per_page"`
+	DelayBetweenPagesMs   int     `yaml:"delay_between_pages_ms"`
+	DelayBetweenQueriesMs int     `yaml:"delay_between_queries_ms"`
+	Concurrency           int     `yaml:"concurrency"`      // number of tabs (goroutines)
+	SERPDelayMs           int     `yaml:"serp_delay_ms"`    // inter-page delay override (0 = use timing profile)
+	Engines               string  `yaml:"engines"`          // "all", "google", "bing", "duckduckgo" (default: "all")
+	GoogleMaxPages        int     `yaml:"google_max_pages"` // default 3
+	BingMaxPages          int     `yaml:"bing_max_pages"`   // default 5
+	DDGMaxPages           int     `yaml:"ddg_max_pages"`    // default 1
+	RelevanceMin          float64 `yaml:"relevance_min"`    // default 0.3
+	RelevanceGuard        bool    `yaml:"relevance_guard"`  // default true ("1", "0" disables)
 }
 
 type WebsiteConfig struct {
@@ -183,6 +185,8 @@ func LoadFromEnv() (*Config, error) {
 			GoogleMaxPages: parseEnvInt("GOOGLE_MAX_PAGES", 0),
 			BingMaxPages:   parseEnvInt("BING_MAX_PAGES", 0),
 			DDGMaxPages:    parseEnvInt("DDG_MAX_PAGES", 0),
+			RelevanceMin:   parseEnvFloat("SERP_RELEVANCE_MIN", 0.3),
+			RelevanceGuard: os.Getenv("SERP_RELEVANCE_GUARD") != "0",
 		},
 		Fetch: FetchConfig{
 			Headless:             true,
@@ -275,6 +279,14 @@ func setDefaults(cfg *Config) {
 	if cfg.SERP.DDGMaxPages == 0 {
 		cfg.SERP.DDGMaxPages = 3
 	}
+	if cfg.SERP.RelevanceMin == 0 {
+		cfg.SERP.RelevanceMin = 0.3
+	}
+	if os.Getenv("SERP_RELEVANCE_GUARD") == "0" {
+		cfg.SERP.RelevanceGuard = false
+	} else if !cfg.SERP.RelevanceGuard && os.Getenv("SERP_RELEVANCE_GUARD") != "0" {
+		cfg.SERP.RelevanceGuard = true
+	}
 	if cfg.Website.Concurrency == 0 {
 		cfg.Website.Concurrency = 5
 	}
@@ -351,6 +363,19 @@ func parseIntList(s string) []int64 {
 		}
 	}
 	return result
+}
+
+// parseEnvFloat reads a float64 from an environment variable, returning defaultVal if unset or invalid.
+func parseEnvFloat(key string, defaultVal float64) float64 {
+	s := os.Getenv(key)
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		return defaultVal
+	}
+	return v
 }
 
 // DSN returns the Postgres DSN, trying env var POSTGRES_DSN if config is empty.

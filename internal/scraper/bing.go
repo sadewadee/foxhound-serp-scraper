@@ -37,21 +37,22 @@ func (b *BingEngine) BuildURL(query string, page, perPage int, gl, hl string) st
 	)
 }
 
-func (b *BingEngine) ParseResults(body []byte) ([]string, error) {
+func (b *BingEngine) ParseResults(body []byte) ([]SERPResult, error) {
 	resp := &foxhound.Response{Body: body}
 	doc, err := parse.NewDocument(resp)
 	if err != nil {
 		return nil, fmt.Errorf("bing: parsing HTML: %w", err)
 	}
 
-	var urls []string
+	var results []SERPResult
 	seen := make(map[string]bool)
 
 	// Bing organic results: anchor inside h2 inside li.b_algo.
 	// Picking the first a[href] picks tracking/sitelinks; h2 a is the title link.
 	// Bing wraps real URLs in /ck/a?...&u=a1<base64>&ntb=1 — decode to get target.
-	doc.Each("li.b_algo h2 a", func(_ int, s *goquery.Selection) {
-		href, exists := s.Attr("href")
+	doc.Each("li.b_algo", func(_ int, s *goquery.Selection) {
+		a := s.Find("h2 a").First()
+		href, exists := a.Attr("href")
 		if !exists || href == "" {
 			return
 		}
@@ -72,11 +73,20 @@ func (b *BingEngine) ParseResults(body []byte) ([]string, error) {
 		}
 		if !seen[href] {
 			seen[href] = true
-			urls = append(urls, href)
+			title := strings.TrimSpace(a.Text())
+			if title == "" {
+				title = strings.TrimSpace(s.Find("h2").First().Text())
+			}
+			snippet := strings.TrimSpace(s.Find(".b_caption p, .b_algoSlug, p").First().Text())
+			results = append(results, SERPResult{
+				URL:     href,
+				Title:   title,
+				Snippet: snippet,
+			})
 		}
 	})
 
-	return urls, nil
+	return results, nil
 }
 
 // unwrapBingRedirect decodes the actual URL from a Bing /ck/a? tracking link.

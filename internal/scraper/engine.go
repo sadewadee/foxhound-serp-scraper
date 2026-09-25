@@ -19,8 +19,8 @@ type SearchEngine interface {
 	// gl = geo/country code (e.g. "us"), hl = language code (e.g. "en").
 	BuildURL(query string, page, perPage int, gl, hl string) string
 
-	// ParseResults extracts organic result URLs from the raw HTML body.
-	ParseResults(body []byte) ([]string, error)
+	// ParseResults extracts organic search results from the raw HTML body.
+	ParseResults(body []byte) ([]SERPResult, error)
 
 	// FetchSteps returns browser automation steps to execute after page load
 	// (e.g. consent banner dismissal, wait for results). Empty for non-browser engines.
