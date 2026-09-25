@@ -257,6 +257,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_category_stats_category ON category_stats 
 CREATE INDEX IF NOT EXISTS idx_category_stats_biz_count ON category_stats (biz_count DESC);
 `
 
+// idxBlReenrichScoreDDL backs the reenrich eligibility query: WHERE
+// re_enriched_at IS NULL AND completeness_score < $1 (partial on the
+// shrinking un-reenriched set). Referenced from TWO call sites in
+// runMigrations, so the definition can never drift between them:
+//  1. The early read-path CONCURRENTLY block — on a brand-new database this
+//     attempt fails and logs a warning, because re_enriched_at doesn't exist
+//     yet (it's only added later by the reenrichColVersion migration).
+//  2. Immediately after that reenrichColVersion ALTER guarantees the column
+//     exists (see the call site there) — CONCURRENTLY + IF NOT EXISTS makes
+//     the retry a fast no-op once the index already exists, and it runs
+//     unconditionally so a database that skipped it (e.g. reenrichColVersion
+//     was already recorded by an older binary that predates this retry)
+//     self-heals on its next boot instead of running without the index
+//     forever.
+const idxBlReenrichScoreDDL = `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_reenrich_score ON business_listings (completeness_score) WHERE re_enriched_at IS NULL`
+
 // runMigrations applies incremental schema changes that are safe to re-run.
 func runMigrations(db *sql.DB) error {
 	// Enable pgcrypto for SHA-256 hashing in triggers.
@@ -504,7 +520,11 @@ func runMigrations(db *sql.DB) error {
 		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_be_source ON business_emails (source, business_id) WHERE source <> 'enrichment'`,
 		// Backs the reenrich eligibility query: WHERE re_enriched_at IS NULL AND
 		// completeness_score < $1. Partial on the (shrinking) un-reenriched set.
-		`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_reenrich_score ON business_listings (completeness_score) WHERE re_enriched_at IS NULL`,
+		// On a fresh database this attempt is expected to fail and log below —
+		// re_enriched_at doesn't exist yet at this point in runMigrations. It
+		// is retried (and self-heals) right after the reenrichColVersion ALTER
+		// further down guarantees the column exists — see idxBlReenrichScoreDDL.
+		idxBlReenrichScoreDDL,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			slog.Warn("db: read-path index CREATE CONCURRENTLY failed — continuing without it (planner will fall back to PK scan)",
@@ -1106,6 +1126,22 @@ func runMigrations(db *sql.DB) error {
 				reenrichColVersion, "add re_enriched_at to business_listings for autonomous reenrich worker")
 			slog.Info("db: reenrich col migration applied")
 		}
+	}
+
+	// Retry idx_bl_reenrich_score now that re_enriched_at is guaranteed to
+	// exist (the ALTER immediately above, or an earlier boot's copy of it).
+	// The FIRST attempt lives up in the early read-path CONCURRENTLY block —
+	// on a brand-new database that attempt runs before re_enriched_at exists
+	// and fails/logs (expected, non-fatal). This retry self-heals that case,
+	// and also self-heals any existing database that recorded
+	// reenrichColVersion under an older binary that predated this retry (this
+	// runs unconditionally, NOT gated by schema_migrations). CONCURRENTLY +
+	// IF NOT EXISTS makes it a fast no-op once the index already exists.
+	// Outside any transaction, same as every other CONCURRENTLY statement in
+	// this file — CONCURRENTLY is illegal inside a tx block.
+	if _, err := db.Exec(idxBlReenrichScoreDDL); err != nil {
+		slog.Warn("db: idx_bl_reenrich_score CREATE CONCURRENTLY retry failed — continuing without it (planner will fall back to PK scan)",
+			"stmt", idxBlReenrichScoreDDL, "error", err)
 	}
 
 	// re_enrich_locked_at: claim sentinel for multi-worker coordination.
