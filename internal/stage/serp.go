@@ -799,58 +799,9 @@ func (s *SERPStage) reconciler(ctx context.Context) {
 			}
 		}
 
-		// 2. Mark queries completed when all their serp_jobs are done.
-		completedRes, _ := s.db.Exec(`
-			UPDATE queries SET
-				status = 'completed',
-				result_count = sub.total_results,
-				updated_at = NOW()
-			FROM (
-				SELECT s.parent_job_id, SUM(s.result_count) AS total_results
-				FROM serp_jobs s
-				WHERE s.parent_job_id IN (
-					SELECT DISTINCT parent_job_id FROM serp_jobs
-					WHERE status IN ('completed', 'failed')
-					  AND updated_at > NOW() - INTERVAL '2 minutes'
-					LIMIT 200
-				)
-				GROUP BY s.parent_job_id
-				HAVING COUNT(*) FILTER (WHERE s.status IN ('new', 'processing')) = 0
-			) sub
-			WHERE queries.id = sub.parent_job_id
-			  AND queries.status = 'processing'
-		`)
-		if completedRes != nil {
-			if n, _ := completedRes.RowsAffected(); n > 0 {
-				slog.Info("serp: reconciler marked queries completed", "count", n)
-			}
-		}
-
-		// 3. Requeue zombie processing queries.
-		// Use bounded count to avoid scanning millions of ancient recycled rows.
-		var pendingCount int
-		s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM serp_jobs WHERE status = 'new' AND created_at > NOW() - INTERVAL '6 hours' LIMIT 5001) sub`).Scan(&pendingCount)
-		if pendingCount < 5000 {
-			stuckQRes, _ := s.db.Exec(`
-				UPDATE queries SET status = 'pending', updated_at = NOW()
-				WHERE id IN (
-					SELECT q.id FROM queries q
-					WHERE q.status = 'processing'
-					  AND q.updated_at < NOW() - INTERVAL '10 minutes'
-					  AND NOT EXISTS (
-						SELECT 1 FROM serp_jobs s
-						WHERE s.parent_job_id = q.id AND s.status IN ('new', 'processing')
-					)
-					LIMIT 500
-				)
-			`)
-			if stuckQRes != nil {
-				if n, _ := stuckQRes.RowsAffected(); n > 0 {
-					slog.Info("serp: reconciler requeued stuck queries", "count", n)
-					s.requeuePendingQueriesToRedis(ctx)
-				}
-			}
-		}
+		// 2. Reconcile processing queries: complete finished queries, fail exhausted queries,
+		// and requeue true zombies (0 serp_jobs), decoupled from the pendingCount gate.
+		s.reconcileProcessingQueries(ctx)
 
 		// 4. Auto-expand completed queries.
 		s.expandCompletedQueries()
@@ -1020,6 +971,28 @@ func (s *SERPStage) requeuePendingQueriesToRedis(ctx context.Context) {
 	}
 	if n > 0 {
 		slog.Info("serp: pushed pending queries to redis", "count", n)
+	}
+}
+
+func (s *SERPStage) reconcileProcessingQueries(ctx context.Context) {
+	enabledEngines := make([]string, 0, len(s.engines))
+	for _, e := range s.engines {
+		if e != nil && e.Name() != "" {
+			enabledEngines = append(enabledEngines, e.Name())
+		}
+	}
+	if len(enabledEngines) == 0 {
+		enabledEngines = []string{"bing", "duckduckgo"}
+	}
+
+	res, err := ReconcileProcessingQueries(ctx, s.db, enabledEngines)
+	if err != nil {
+		slog.Warn("serp: reconcile processing queries failed", "error", err)
+		return
+	}
+
+	if res.Requeued > 0 {
+		s.requeuePendingQueriesToRedis(ctx)
 	}
 }
 
