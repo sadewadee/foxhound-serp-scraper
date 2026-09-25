@@ -57,7 +57,8 @@ type SuspensionDecision struct {
 // searxngSuspensionProbe is the subset of the SearXNG response that decides
 // whether the instance is rate-limiting us.
 type searxngSuspensionProbe struct {
-	UnresponsiveEngines [][]string `json:"unresponsive_engines"`
+	Results             []json.RawMessage `json:"results"`
+	UnresponsiveEngines [][]string        `json:"unresponsive_engines"`
 }
 
 // ClassifySearXNGOutcome decides how a SearXNG fetch result should be treated.
@@ -67,8 +68,9 @@ type searxngSuspensionProbe struct {
 // error, if any.
 //
 // A status of 429 or 503 is SearXNG refusing service, not a fault in the job.
-// A 200 carrying valid JSON with a non-empty unresponsive_engines list is the
-// same condition expressed in the body. Anything else that failed — a
+// A 200 carrying valid JSON with zero results and a non-empty
+// unresponsive_engines list is the same condition expressed in the body.
+// Anything else that failed — a
 // non-JSON body, a dead connection, a DNS error, a timeout — is genuine.
 func ClassifySearXNGOutcome(statusCode int, body []byte, fetchErr error) SuspensionDecision {
 	// SearXNG itself refusing service.
@@ -106,7 +108,10 @@ func ClassifySearXNGOutcome(statusCode int, body []byte, fetchErr error) Suspens
 		}
 	}
 
-	if len(probe.UnresponsiveEngines) > 0 {
+	// An unresponsive list alone is NOT a suspension: SearXNG routinely
+	// reports one engine down (e.g. duckduckgo CAPTCHA) while the others
+	// still return results. Suspension is zero results AND somebody missing.
+	if len(probe.Results) == 0 && len(probe.UnresponsiveEngines) > 0 {
 		names := make([]string, 0, len(probe.UnresponsiveEngines))
 		for _, pair := range probe.UnresponsiveEngines {
 			if len(pair) == 0 {

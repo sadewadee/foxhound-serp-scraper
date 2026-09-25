@@ -82,6 +82,7 @@ func TestClassifySearXNGOutcome_Success(t *testing.T) {
 		body string
 	}{
 		{"results present", `{"results":[{"url":"https://spa.example.com"}],"unresponsive_engines":[]}`},
+		{"results present but one engine down", `{"results":[{"url":"https://spa.example.com"}],"unresponsive_engines":[["duckduckgo","CAPTCHA"]]}`},
 		{"empty page, no unresponsive engines", `{"results":[],"unresponsive_engines":[]}`},
 		{"unresponsive list absent", `{"results":[]}`},
 	}
