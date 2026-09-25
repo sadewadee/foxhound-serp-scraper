@@ -51,8 +51,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Camoufox browser binary.
-RUN pip3 install --break-system-packages camoufox \
-    && python3 -m camoufox fetch
+#
+# Pinned deliberately. Unpinned `pip3 install camoufox` grabs whatever's
+# latest on PyPI (0.5.6 today), which switched its on-disk cache layout to a
+# nested browsers/official/<hash>/ path — foxhound v0.0.27's
+# findCamoufoxBinary() only knows the old flat ~/.cache/camoufox/camoufox
+# layout, so it silently falls back to plain Firefox (no anti-fingerprint)
+# and gets a reCAPTCHA on Google instead of results.
+#
+# camoufox==0.4.11 keeps the flat layout, but its own `fetch` always resolves
+# "latest GitHub release in range" too — with no CLI flag or env var to pin a
+# browser version (checked pkgman.py's CamoufoxFetcher/GitHubDownloader: the
+# only inputs are the live GitHub releases API response). Newer releases
+# (beta.26+) are well-formed and would now win that "latest" race, same
+# problem one layer down. So we bypass fetch_latest() entirely: construct the
+# fetcher without invoking GitHub API resolution and hand it the exact
+# beta.24 asset URL (the version already deployed in v0.9.8-niche,
+# version.json {"version":"135.0.1","release":"beta.24"}) so `install()` -
+# same download/extract/version.json logic camoufox itself uses - produces a
+# deterministic, byte-identical result on every build.
+RUN pip3 install --break-system-packages camoufox==0.4.11 \
+    && python3 -c "\
+import camoufox.pkgman as pkgman; \
+from camoufox.addons import DefaultAddons, maybe_download_addons; \
+f = object.__new__(pkgman.CamoufoxFetcher); \
+f._version_obj = pkgman.Version(release='beta.24', version='135.0.1'); \
+f._url = 'https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip'; \
+f.install(); \
+maybe_download_addons(list(DefaultAddons))"
 
 # Playwright Firefox driver (version from go.mod).
 #
