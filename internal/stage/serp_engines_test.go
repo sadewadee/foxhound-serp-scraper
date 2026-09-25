@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sadewadee/serp-scraper/internal/config"
+	"github.com/sadewadee/serp-scraper/internal/feeder"
 	"github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
@@ -16,6 +17,67 @@ func hasEngine(engines []scraper.SearchEngine, name string) bool {
 		}
 	}
 	return false
+}
+
+// TestBufferKeysAreEngineScoped locks the per-host isolation of the Redis
+// buffer: hachibi and kurawa share one Redis, so a single global list let a
+// host consume (and then release) jobs of an engine it cannot run. Every key
+// returned must belong to an engine this stage actually serves — plus the
+// legacy shared key, always last, so a deploy on top of a non-empty old buffer
+// drains it instead of stranding those jobs.
+func TestBufferKeysAreEngineScoped(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SERP.Engines = "searxng,duckduckgo"
+	cfg.SERP.SearXNGURL = "http://searxng:8080"
+
+	s := &SERPStage{cfg: cfg, enginesByName: engineLookup(resolveEngines(cfg))}
+	s.engines = resolveEngines(cfg)
+
+	keys := s.bufferKeys()
+	if len(keys) != 3 {
+		t.Fatalf("bufferKeys() = %v, want 2 engine keys + the legacy key", keys)
+	}
+	want := map[string]bool{"serp:buffer:searxng": true, "serp:buffer:duckduckgo": true}
+	for _, k := range keys[:2] {
+		if !want[k] {
+			t.Errorf("bufferKeys() = %q, want one of the configured engines", k)
+		}
+	}
+	if last := keys[len(keys)-1]; last != feeder.SERPBufferKey {
+		t.Errorf("last buffer key = %q, want the legacy %q so it drains", last, feeder.SERPBufferKey)
+	}
+}
+
+// TestTabWorkerLookupResolvesConfiguredSearxng is the regression test for the
+// prod incident where every searxng job was skipped: tabWorker resolved the
+// job engine through the static scraper.GetEngine registry, which never holds
+// a *configured* SearXNG engine. The lookup must come from the stage's
+// configured engine set instead, carrying the configured URL.
+func TestTabWorkerLookupResolvesConfiguredSearxng(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.SERP.Engines = "searxng,duckduckgo"
+	cfg.SERP.SearXNGURL = "http://searxng:8080"
+	cfg.SERP.SearXNGMaxPages = 2
+
+	// Exact lookup path tabWorker uses: resolve once, index by name.
+	byName := engineLookup(resolveEngines(cfg))
+
+	eng, ok := byName["searxng"]
+	if !ok || eng == nil {
+		t.Fatal("tabWorker lookup misses searxng — jobs would be skipped again")
+	}
+	sx, ok := eng.(*scraper.SearXNGEngine)
+	if !ok {
+		t.Fatalf("lookup returned %T, want *scraper.SearXNGEngine", eng)
+	}
+	if got := sx.BuildURL("day spa honolulu", 0, 10, "us", "en"); got[:21] != "http://searxng:8080/s" {
+		t.Errorf("BuildURL = %q, want it rooted at the configured SEARXNG_URL", got)
+	}
+
+	// Unknown engines resolve to nothing: the caller dead-letters the job.
+	if _, ok := byName["google"]; ok {
+		t.Error("google resolves despite not being in SERP_ENGINES — legacy jobs would run")
+	}
 }
 
 func TestResolveEngines_DropsSearxngWhenURLEmpty(t *testing.T) {

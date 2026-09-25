@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,9 @@ type SERPStage struct {
 	timing    *behavior.Timing
 	lifecycle *scraper.BrowserLifecycle
 	engines   []scraper.SearchEngine
+	// enginesByName indexes engines for job lookup — the static registry in
+	// scraper.GetEngine has no configured SearXNG engine.
+	enginesByName map[string]scraper.SearchEngine
 
 	browser       *fetch.CamoufoxFetcher
 	browserMu     sync.Mutex
@@ -85,6 +89,7 @@ func NewSERPStage(cfg *config.Config, database *sql.DB, dd *dedup.Store) *SERPSt
 		queryRepo:      query.NewRepositoryWithRedis(database, dd.Client()),
 		timing:         behavior.NewTiming(behavior.CarefulProfile().Timing),
 		engines:        engines,
+		enginesByName:  engineLookup(engines),
 		circuitBreaker: scraper.NewCircuitBreaker(cfg),
 		fatigue:        scraper.NewSessionFatigue(cfg),
 	}
@@ -341,6 +346,26 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 	}
 }
 
+// bufferKeys returns the per-engine Redis LISTs this host feeds and reads.
+// The keys are scoped per engine because hachibi and kurawa share one Redis
+// but serve different engines: a single global list let a host consume jobs it
+// cannot run, and every one of them was dead-lettered.
+func (s *SERPStage) bufferKeys() []string {
+	keys := make([]string, 0, len(s.engines))
+	for _, e := range s.engines {
+		if e != nil && e.Name() != "" {
+			keys = append(keys, feeder.BufferKeyForEngine(e.Name()))
+		}
+	}
+	// Always drain the legacy shared list last: a deploy landing on top of a
+	// non-empty old `serp:buffer` would otherwise strand its items. Foreign
+	// items popped from there hit the release-on-miss path, which is safe.
+	if len(keys) == 0 || !slices.Contains(keys, feeder.SERPBufferKey) {
+		keys = append(keys, feeder.SERPBufferKey)
+	}
+	return keys
+}
+
 // tabWorker pops from serp:buffer (Redis LIST), fetches SERP pages,
 // and writes results directly to DB.
 func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
@@ -368,8 +393,9 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		default:
 		}
 
-		// BLPOP from serp:buffer.
-		result, err := s.redis.BLPop(ctx, 5*time.Second, feeder.SERPBufferKey).Result()
+		// BLPOP from this host's per-engine lists only — never from another
+		// host's engines (the feeder claims per engine from the same sets).
+		result, err := s.redis.BLPop(ctx, 5*time.Second, s.bufferKeys()...).Result()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -390,25 +416,20 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			job.Engine = "google"
 		}
 
-		eng := scraper.GetEngine(job.Engine)
+		// Resolve against the stage's configured engines, not the static
+		// registry: a configured SearXNG engine exists only here.
+		//
+		// A miss means this HOST cannot run the job — never that the job is
+		// globally dead. It is released untouched (no attempt increment) so a
+		// host whose SERP_ENGINES includes it can pick it up: hachibi and
+		// kurawa share the same serp_jobs table with different engine sets.
+		eng := s.enginesByName[job.Engine]
 		if eng == nil {
-			slog.Warn("serp: unknown engine, skipping", "engine", job.Engine, "job", job.ID)
-			continue
-		}
-
-		// Guard: refuse jobs whose engine is not in the configured set. Legacy
-		// rows (e.g. Google jobs from before SERP_ENGINES was narrowed) still
-		// live in serp_jobs and would otherwise burn browser time on reCAPTCHA.
-		engineEnabled := false
-		for _, e := range s.engines {
-			if e.Name() == job.Engine {
-				engineEnabled = true
-				break
-			}
-		}
-		if !engineEnabled {
-			slog.Warn("serp: engine disabled, marking dead", "engine", job.Engine, "job", job.ID)
-			s.db.Exec(`UPDATE serp_jobs SET status='dead', error_msg='engine disabled in SERP_ENGINES', locked_by=NULL, updated_at=NOW() WHERE id=$1`, job.ID)
+			slog.Warn("serp: engine not served by this host — releasing",
+				"engine", job.Engine, "job", job.ID)
+			s.db.Exec(`UPDATE serp_jobs SET status='new', next_attempt_at = NOW() + interval '30 seconds',
+				error_msg='engine not served by this host', locked_by=NULL, locked_at=NULL, picked_at=NULL, updated_at=NOW()
+				WHERE id=$1`, job.ID)
 			s.redis.Del(ctx, "serp:lock:"+job.ID)
 			continue
 		}
@@ -1048,17 +1069,14 @@ func (s *SERPStage) requeuePendingQueriesToRedis(ctx context.Context) {
 }
 
 func (s *SERPStage) reconcileProcessingQueries(ctx context.Context) {
-	enabledEngines := make([]string, 0, len(s.engines))
-	for _, e := range s.engines {
-		if e != nil && e.Name() != "" {
-			enabledEngines = append(enabledEngines, e.Name())
-		}
-	}
-	if len(enabledEngines) == 0 {
-		enabledEngines = []string{"bing", "duckduckgo"}
+	// The retire list is GLOBAL, not this host's engine set: a host must never
+	// dead-letter jobs of an engine another host still runs.
+	retired := ParseRetiredEngines(s.cfg.SERP.RetiredEngines)
+	if len(retired) == 0 {
+		retired = []string{"google"}
 	}
 
-	res, err := ReconcileProcessingQueries(ctx, s.db, enabledEngines)
+	res, err := ReconcileProcessingQueries(ctx, s.db, retired)
 	if err != nil {
 		slog.Warn("serp: reconcile processing queries failed", "error", err)
 		return

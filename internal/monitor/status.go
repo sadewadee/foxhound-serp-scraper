@@ -45,6 +45,13 @@ func GetStatus(db *sql.DB, redisClient *redis.Client) (*Status, error) {
 		var depth int64
 		if q == "serp:queue:queries" {
 			depth, _ = redisClient.ZCard(ctx, q).Result()
+		} else if q == "serp:buffer" {
+			// The buffer is sharded per engine (serp:buffer:<engine>), with the
+			// legacy global key drained first during the transition.
+			for _, k := range bufferKeys(ctx, redisClient) {
+				n, _ := redisClient.LLen(ctx, k).Result()
+				depth += n
+			}
 		} else {
 			depth, _ = redisClient.LLen(ctx, q).Result()
 		}
@@ -52,6 +59,16 @@ func GetStatus(db *sql.DB, redisClient *redis.Client) (*Status, error) {
 	}
 
 	return s, nil
+}
+
+// bufferKeys lists the sharded SERP buffers actually present in Redis, plus
+// the legacy global key while pre-shard items are still draining.
+func bufferKeys(ctx context.Context, r *redis.Client) []string {
+	keys, _ := r.Keys(ctx, "serp:buffer:*").Result()
+	if len(keys) == 0 {
+		return []string{"serp:buffer"}
+	}
+	return keys
 }
 
 func getTableStatus(db *sql.DB, table string) TableStatus {

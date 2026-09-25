@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/lib/pq"
 )
@@ -17,15 +18,33 @@ type ReconcileResult struct {
 	Active    int
 }
 
+// ParseRetiredEngines splits a SERP_RETIRED_ENGINES value ("google,bing")
+// into a normalized name list. Untagged pure logic, shared by the stage and
+// tested without a database.
+func ParseRetiredEngines(csv string) []string {
+	var out []string
+	for _, name := range strings.Split(csv, ",") {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // ReconcileProcessingQueries resolves a batch of up to 500 'processing' queries:
-//   - Marks jobs for disabled engines as 'dead'.
-//   - Marks queries 'completed' if all enabled-engine jobs are terminal and SUM(result_count) > 0.
-//   - Marks queries 'failed' if all enabled-engine jobs are terminal and SUM(result_count) == 0.
+//   - Marks jobs for globally retired engines as 'dead'. A host's SERP_ENGINES
+//     only says what that host can process, so engines that are merely absent
+//     from this host's set (served by another host against the same tables)
+//     are never touched here.
+//   - Marks queries 'completed' / 'failed' only when all jobs of every
+//     non-retired engine are terminal (an engine active on one host counts as
+//     active everywhere — reconciles run on all hosts).
 //   - Marks queries 'pending' (requeued) if they have 0 serp_jobs (true zombies).
 //   - Touches updated_at on active queries so the queue scans forward.
-func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, enabledEngines []string) (ReconcileResult, error) {
-	if len(enabledEngines) == 0 {
-		enabledEngines = []string{"google", "bing", "duckduckgo"}
+func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, retiredEngines []string) (ReconcileResult, error) {
+	if len(retiredEngines) == 0 {
+		retiredEngines = []string{"google"}
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -82,17 +101,19 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, enabledEngines 
 	}
 
 	pqQueryIDs := pq.Array(queryIDs)
-	pqEnabled := pq.Array(enabledEngines)
+	pqRetired := pq.Array(retiredEngines)
 
-	// 2. Mark any new/processing jobs for disabled engines as dead for these queries.
+	// 2. Retire only globally-retired engines. Jobs of engines that simply run
+	// on another host (bing on kurawa, searxng on hachibi) must never be
+	// touched by a host that cannot itself run them.
 	if deadRes, err := tx.ExecContext(ctx, `
-		UPDATE serp_jobs SET status = 'dead', error_msg = 'engine disabled in SERP_ENGINES', updated_at = NOW()
+		UPDATE serp_jobs SET status = 'dead', error_msg = 'engine retired globally (SERP_RETIRED_ENGINES)', updated_at = NOW()
 		WHERE parent_job_id = ANY($1)
-		  AND engine != ALL($2)
+		  AND engine = ANY($2)
 		  AND status IN ('new', 'processing')
-	`, pqQueryIDs, pqEnabled); err == nil {
+	`, pqQueryIDs, pqRetired); err == nil {
 		if n, _ := deadRes.RowsAffected(); n > 0 {
-			slog.Info("serp: reconciler retired disabled-engine jobs to dead", "count", n)
+			slog.Info("serp: reconciler retired retired-engine jobs to dead", "count", n)
 		}
 	}
 
@@ -108,12 +129,12 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, enabledEngines 
 		SELECT
 			s.parent_job_id,
 			COUNT(s.id) AS total_jobs,
-			COUNT(s.id) FILTER (WHERE s.status IN ('new', 'processing') AND s.engine = ANY($2)) AS active_jobs,
+			COUNT(s.id) FILTER (WHERE s.status IN ('new', 'processing') AND NOT (s.engine = ANY($2))) AS active_jobs,
 			COALESCE(SUM(s.result_count), 0) AS total_results
 		FROM serp_jobs s
 		WHERE s.parent_job_id = ANY($1)
 		GROUP BY s.parent_job_id
-	`, pqQueryIDs, pqEnabled)
+	`, pqQueryIDs, pqRetired)
 	if err != nil {
 		return ReconcileResult{}, fmt.Errorf("serp: query job stats: %w", err)
 	}

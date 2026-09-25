@@ -50,6 +50,10 @@ services:
 
       # ── SERP engines + timing ──
       SERP_ENGINES: "${SERP_ENGINES:-all}"
+      # Engines retired GLOBALLY (across every host) — jobs of these are
+      # dead-lettered by the reconciler. Different from SERP_ENGINES, which only
+      # says what THIS host can process.
+      SERP_RETIRED_ENGINES: "${SERP_RETIRED_ENGINES:-google}"
       SERP_DELAY_MS: "${SERP_DELAY_MS:-3000}"
       GOOGLE_MAX_PAGES: "${GOOGLE_MAX_PAGES:-3}"
       BING_MAX_PAGES: "${BING_MAX_PAGES:-5}"
