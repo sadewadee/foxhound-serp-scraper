@@ -33,18 +33,19 @@ func (d *DuckDuckGoEngine) BuildURL(query string, page, perPage int, gl, hl stri
 	)
 }
 
-func (d *DuckDuckGoEngine) ParseResults(body []byte) ([]string, error) {
+func (d *DuckDuckGoEngine) ParseResults(body []byte) ([]SERPResult, error) {
 	resp := &foxhound.Response{Body: body}
 	doc, err := parse.NewDocument(resp)
 	if err != nil {
 		return nil, fmt.Errorf("ddg: parsing HTML: %w", err)
 	}
 
-	var urls []string
+	var results []SERPResult
 	seen := make(map[string]bool)
 
-	doc.Each(".web-result .result__a[href]", func(_ int, s *goquery.Selection) {
-		href, exists := s.Attr("href")
+	doc.Each(".web-result", func(_ int, s *goquery.Selection) {
+		a := s.Find(".result__a[href]").First()
+		href, exists := a.Attr("href")
 		if !exists || href == "" {
 			return
 		}
@@ -67,11 +68,17 @@ func (d *DuckDuckGoEngine) ParseResults(body []byte) ([]string, error) {
 		}
 		if !seen[realURL] {
 			seen[realURL] = true
-			urls = append(urls, realURL)
+			title := strings.TrimSpace(s.Find(".result__title, .result__a").First().Text())
+			snippet := strings.TrimSpace(s.Find(".result__snippet").First().Text())
+			results = append(results, SERPResult{
+				URL:     realURL,
+				Title:   title,
+				Snippet: snippet,
+			})
 		}
 	})
 
-	return urls, nil
+	return results, nil
 }
 
 func (d *DuckDuckGoEngine) FetchSteps() []foxhound.JobStep {

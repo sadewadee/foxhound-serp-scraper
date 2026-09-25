@@ -58,7 +58,7 @@ func (g *GoogleEngine) BuildURL(query string, page, perPage int, gl, hl string) 
 	)
 }
 
-func (g *GoogleEngine) ParseResults(body []byte) ([]string, error) {
+func (g *GoogleEngine) ParseResults(body []byte) ([]SERPResult, error) {
 	return ParseSERPResults(body)
 }
 
@@ -95,15 +95,15 @@ func BuildSERPURL(query string, page, resultsPerPage int) string {
 	)
 }
 
-// ParseSERPResults extracts organic result URLs from a Google SERP HTML page.
-func ParseSERPResults(body []byte) ([]string, error) {
+// ParseSERPResults extracts organic result items from a Google SERP HTML page.
+func ParseSERPResults(body []byte) ([]SERPResult, error) {
 	resp := &foxhound.Response{Body: body}
 	doc, err := parse.NewDocument(resp)
 	if err != nil {
 		return nil, fmt.Errorf("serp: parsing HTML: %w", err)
 	}
 
-	var urls []string
+	var results []SERPResult
 	seen := make(map[string]bool)
 
 	// Multiple CSS selectors for Google SERP organic results.
@@ -136,12 +136,29 @@ func ParseSERPResults(body []byte) ([]string, error) {
 			}
 			if !seen[href] {
 				seen[href] = true
-				urls = append(urls, href)
+				title := strings.TrimSpace(s.Find("h3").First().Text())
+				if title == "" {
+					title = strings.TrimSpace(s.ParentsFiltered("div.g, div[data-sokoban-container]").Find("h3").First().Text())
+				}
+				if title == "" {
+					title = strings.TrimSpace(s.Text())
+				}
+
+				snippet := strings.TrimSpace(s.ParentsFiltered("div.g, div[data-sokoban-container]").Find("div[data-sncf], .VwiC3b, p").First().Text())
+				if snippet == "" {
+					snippet = strings.TrimSpace(s.Find("div[data-sncf], .VwiC3b, p").First().Text())
+				}
+
+				results = append(results, SERPResult{
+					URL:     href,
+					Title:   title,
+					Snippet: snippet,
+				})
 			}
 		})
 	}
 
-	return urls, nil
+	return results, nil
 }
 
 // cleanSERPURL extracts the actual URL from Google's redirect wrapper.

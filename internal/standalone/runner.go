@@ -169,14 +169,15 @@ func (r *Runner) runSERP(ctx context.Context) {
 			continue
 		}
 
-		urls, err := scraper.ParseSERPResults(body)
+		results, err := scraper.ParseSERPResults(body)
 		if err != nil {
 			slog.Warn("serp: parse failed", "page", page+1, "error", err)
 			continue
 		}
 
 		newCount := 0
-		for _, u := range urls {
+		for _, res := range results {
+			u := res.URL
 			hash := dedup.HashURL(u)
 			if _, loaded := r.urlSeen.LoadOrStore(hash, true); loaded {
 				continue
@@ -186,7 +187,7 @@ func (r *Runner) runSERP(ctx context.Context) {
 		}
 
 		r.serpURLs.Add(int64(newCount))
-		slog.Info("serp: page done", "page", page+1, "found", len(urls), "new", newCount)
+		slog.Info("serp: page done", "page", page+1, "found", len(results), "new", newCount)
 
 		// Human-like delay between SERP pages — careful profile uses longer pauses.
 		if page < r.cfg.SERP.PagesPerQuery-1 {
