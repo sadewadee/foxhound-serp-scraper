@@ -640,13 +640,25 @@ func runMigrations(db *sql.DB) error {
 		        --   3. else raw_category in the hard off-niche business @type
 		        --      list -> TRUE (no keyword evidence AND an explicitly
 		        --      off-target business kind).
-		        --   4. else no category signal at all (NULL/blank/>100 chars
-		        --      meta-keyword soup) -> TRUE.
+		        --   4. else raw_category is SET and >100 chars (legacy
+		        --      meta-keyword-soup garbage, e.g. an old
+		        --      <meta name="keywords"> value stuffed into raw_category)
+		        --      -> TRUE. NULL / blank / whitespace-only raw_category does
+		        --      NOT match here — "no category info" is NOT off-niche
+		        --      evidence. Many legit contact pages carry no JSON-LD @type
+		        --      at all; their niche is filled later from the SOURCE QUERY
+		        --      by BackfillListingNicheInherit (internal/db/niche.go),
+		        --      which only touches off_niche IS NOT TRUE rows — wrongly
+		        --      forcing NULL category to TRUE here would permanently
+		        --      exclude those rows (2026-09-25 review fix — NULL used to
+		        --      fall through to ELSE FALSE before this file's first pass
+		        --      at this CASE regressed it to TRUE).
 		        --   5. else raw_category is schema.org content/page noise, or a
 		        --      generic business container with no keyword evidence
 		        --      -> TRUE.
-		        --   6. else FALSE (an unrecognized-but-specific @type, or no
-		        --      @type at all, with no positive off-niche signal).
+		        --   6. else FALSE (NULL/blank/whitespace-only category, or an
+		        --      unrecognized-but-specific @type, with no positive
+		        --      off-niche signal).
 		        CASE
 		          WHEN niche_text ~ '\m(nail salon|manicure|pedicure|esthetic|aesthetic|beautician|cosmetolog|barber|hairdress|hair salon|makeup|make-up|eyelash|lash extension|eyebrow|microblad|waxing salon|tattoo)' THEN TRUE
 		          WHEN niche_bucket IS NOT NULL THEN FALSE
@@ -656,7 +668,7 @@ func runMigrations(db *sql.DB) error {
 		            'TravelAgency','LodgingBusiness','GeneralContractor',
 		            'RoofingContractor','HomeAndConstructionBusiness'
 		          ) THEN TRUE
-		          WHEN NEW.raw_category IS NULL OR NEW.raw_category = '' OR LENGTH(NEW.raw_category) > 100 THEN TRUE
+		          WHEN NEW.raw_category IS NOT NULL AND LENGTH(NEW.raw_category) > 100 THEN TRUE
 		          -- schema.org content/media/app/page-structure @type values —
 		          -- never a wellness business lead on their own.
 		          WHEN NEW.raw_category IN (

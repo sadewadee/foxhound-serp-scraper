@@ -341,6 +341,66 @@ func TestPickJSONLDCategory_SpecificityOverFirstWins(t *testing.T) {
 	}
 }
 
+// TestPickJSONLDCategory_StructuralValueTypesNeverWin covers the 2026-09-25
+// review fix: categoryTier defaulted every UNRECOGNIZED @type to tier 1
+// (specific), so schema.org structural/value nodes that legitimately appear
+// as top-level @graph members (PostalAddress, GeoCoordinates, ContactPoint,
+// ...) or content families reachable only by suffix (DanceEvent, "Event")
+// would outrank a real business @type sitting right next to them.
+func TestPickJSONLDCategory_StructuralValueTypesNeverWin(t *testing.T) {
+	cases := []struct {
+		name  string
+		nodes []map[string]any
+		want  string
+	}{
+		{
+			"PostalAddress top-level graph member loses to LocalBusiness",
+			[]map[string]any{
+				{"@type": "PostalAddress", "streetAddress": "1 Main St"},
+				{"@type": "LocalBusiness", "name": "Acme"},
+			},
+			"LocalBusiness",
+		},
+		{
+			"DanceEvent (suffix rule: ends in Event) loses to Organization",
+			[]map[string]any{
+				{"@type": "Organization", "name": "Studio Co"},
+				{"@type": "DanceEvent", "name": "Friday Social"},
+			},
+			"Organization",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pick := pickJSONLDCategory(tc.nodes)
+			if pick == nil {
+				t.Fatalf("pickJSONLDCategory returned nil; want %q", tc.want)
+			}
+			if pick.category != tc.want {
+				t.Errorf("category = %q; want %q", pick.category, tc.want)
+			}
+		})
+	}
+}
+
+// TestExtractContacts_JSONLD_TypeArray_SpecificOverGeneric is a regression
+// guard for the array-@type path specifically (as opposed to the
+// multi-node @graph path above): a single node with @type
+// ["LocalBusiness","ExerciseGym"] must still pick the specific member
+// (ExerciseGym) even after the 2026-09-25 categoryTier review fix.
+func TestExtractContacts_JSONLD_TypeArray_SpecificOverGeneric(t *testing.T) {
+	html := `<html><head>
+<script type="application/ld+json">
+{"@type": ["LocalBusiness", "ExerciseGym"], "name": "Iron Works Gym"}
+</script>
+</head><body></body></html>`
+
+	cd := ExtractContacts([]byte(html))
+	if cd.BusinessCategory != "ExerciseGym" {
+		t.Errorf("BusinessCategory = %q; want %q", cd.BusinessCategory, "ExerciseGym")
+	}
+}
+
 // TestFlattenJSONLDNodes_NestedGraph verifies @graph arrays (including a
 // nested array-of-arrays edge case some generators emit) are fully expanded
 // to a flat list, and that a node with no @graph is passed through as-is.

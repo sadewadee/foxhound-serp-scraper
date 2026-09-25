@@ -263,6 +263,35 @@ var jsonLDNeverCategoryTypes = map[string]bool{
 	"ContactPage": true, "SearchResultsPage": true, "SiteNavigationElement": true,
 	"ImageGallery": true, "WPHeader": true, "WPFooter": true, "WPSidebar": true,
 	"Person": true, "Place": true, "contao:Page": true, "Offer": true, "Event": true,
+	// 2026-09-25 (review fix): schema.org structural/value types that
+	// legitimately appear as TOP-LEVEL @graph members on real pages (a
+	// PostalAddress or ContactPoint node sitting alongside the business
+	// node in the same @graph) — these are never a business category and
+	// must never outrank an actual LocalBusiness subtype just because
+	// categoryTier() defaults unknown types to tier 1.
+	"PostalAddress": true, "GeoCoordinates": true, "ContactPoint": true,
+	"OpeningHoursSpecification": true, "ListItem": true, "EntryPoint": true,
+	"Thing": true, "Brand": true, "Rating": true, "AggregateOffer": true,
+	"PriceSpecification": true, "MonetaryAmount": true, "PropertyValue": true,
+	"Language": true, "SpeakableSpecification": true, "Question": true,
+	"Answer": true, "Comment": true, "HowToStep": true, "Menu": true,
+	"MenuItem": true, "Country": true, "City": true, "State": true,
+	"AdministrativeArea": true, "VirtualLocation": true, "Duration": true,
+	"QuantitativeValue": true, "Audience": true, "Certification": true,
+	"Occupation": true, "EducationalOccupationalCredential": true,
+	"Schedule": true, "WebContent": true, "WebPageElement": true,
+	"MediaObject": true, "AudioObject": true,
+}
+
+// jsonLDNeverCategorySuffixes catches structural/value/content @type
+// families by name shape instead of an exhaustive enumeration — schema.org
+// keeps minting new "FooPage"/"FooAction"/"FooArticle"/"FooEvent"/
+// "FooSpecification"/"FooElement" subtypes (e.g. DanceEvent, MusicEvent,
+// ReserveAction, ItemPage) that jsonLDNeverCategoryTypes can't practically
+// enumerate one by one. No real business-category @type ends in any of
+// these suffixes, so the rule is safe and stays small.
+var jsonLDNeverCategorySuffixes = []string{
+	"Page", "Action", "Article", "Event", "Specification", "Element",
 }
 
 // jsonLDGenericCategoryTypes are business-container @type values that carry
@@ -298,6 +327,11 @@ func categoryTier(t string) int {
 	}
 	if jsonLDGenericCategoryTypes[t] {
 		return 2
+	}
+	for _, suffix := range jsonLDNeverCategorySuffixes {
+		if strings.HasSuffix(t, suffix) {
+			return 3
+		}
 	}
 	return 1
 }
