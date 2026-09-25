@@ -10,9 +10,11 @@ package db
 //  2. The grouped key is the EFFECTIVE category — niche_category (keyword
 //     classifier bucket) first, raw category as fallback.
 //
-// Also asserts the boot schema embeds the shared categoryStatsSelect const,
-// so the schema and the versioned redefinition migration cannot drift apart
-// (the 2026-05-25 trigger-vs-backfill drift class).
+// Also asserts categoryStatsBootstrapDDL — the fresh-DB bootstrap that runs in
+// runMigrations after the niche_category/off_niche columns exist — embeds the
+// shared categoryStatsSelect const, so the bootstrap DDL and the versioned
+// redefinition migration cannot drift apart (the 2026-05-25 trigger-vs-backfill
+// drift class).
 
 import (
 	"strings"
@@ -26,7 +28,7 @@ func TestCategoryStatsDefinition(t *testing.T) {
 	if !strings.Contains(categoryStatsSelect, "COALESCE(NULLIF(bl.niche_category, ''), bl.category)") {
 		t.Error("category_stats must group by the effective category (niche_category first, raw category fallback)")
 	}
-	if !strings.Contains(schema, categoryStatsSelect) {
-		t.Error("boot schema must embed categoryStatsSelect — never inline a second copy of the matview body")
+	if !strings.Contains(categoryStatsBootstrapDDL, categoryStatsSelect) {
+		t.Error("categoryStatsBootstrapDDL must embed categoryStatsSelect — never inline a second copy of the matview body")
 	}
 }

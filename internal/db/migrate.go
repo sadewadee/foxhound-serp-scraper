@@ -223,6 +223,30 @@ CREATE TABLE IF NOT EXISTS workers (
 -- RefreshCategoryStatsLoop seeds and refreshes it off the request path.
 -- Definition body lives in categoryStatsSelect (shared with the redefinition
 -- migration — keep using the const, never inline a second copy).
+--
+-- NOTE: the CREATE MATERIALIZED VIEW itself (+ its two indexes) does NOT live
+-- in this const anymore — see categoryStatsBootstrapDDL below. This schema
+-- block runs BEFORE runMigrations' ALTER TABLE ... ADD COLUMN niche_category /
+-- off_niche statements, so on a brand-new database categoryStatsSelect would
+-- reference columns that don't exist yet (the fresh-DB bootstrap failure fixed
+-- 2026-09). categoryStatsBootstrapDDL runs the identical IF NOT EXISTS DDL
+-- later in runMigrations, once those columns exist.
+`
+
+// categoryStatsBootstrapDDL creates category_stats (+ the index REFRESH
+// MATERIALIZED VIEW CONCURRENTLY requires, + the biz_count sort index) on a
+// database that doesn't have it yet. It used to live inline in the schema
+// const above, but schema runs before runMigrations' ALTER TABLE ... ADD
+// COLUMN niche_category / off_niche statements — so on a brand-new empty
+// Postgres, categoryStatsSelect (which references bl.niche_category /
+// bl.off_niche) failed with "column does not exist". This const is executed
+// in runMigrations AFTER those ALTERs run (see the call site below), so the
+// columns always exist first. IF NOT EXISTS throughout makes it a no-op on
+// every existing deploy — they already have category_stats either from the
+// original boot schema (older deploys) or from the versioned redefinition
+// migration further down in this file (categoryStatsNicheVersion), which is
+// left untouched and keeps behaving exactly as before.
+const categoryStatsBootstrapDDL = `
 CREATE MATERIALIZED VIEW IF NOT EXISTS category_stats AS` + categoryStatsSelect + `
 WITH NO DATA;
 
@@ -383,6 +407,13 @@ func runMigrations(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
 		}
+	}
+
+	// Bootstrap category_stats on a fresh database now that niche_category /
+	// off_niche exist (see categoryStatsBootstrapDDL doc comment). IF NOT
+	// EXISTS makes this a no-op on any existing deploy.
+	if _, err := db.Exec(categoryStatsBootstrapDDL); err != nil {
+		return fmt.Errorf("db: category_stats bootstrap: %w", err)
 	}
 
 	// Niche indexes — created CONCURRENTLY outside any tx (CLAUDE.md /
