@@ -1,0 +1,44 @@
+<!doctype html>
+<!--
+  SYNTHETIC FIXTURE — NOT a captured Yelp page.
+
+  Yelp currently returns a DataDome 403 to every fetch method (plain HTTP,
+  stealth HTTP through a datacenter proxy, and a browser with a captcha
+  extension), so this module has never parsed a real Yelp response. This
+  markup is modeled on Yelp's documented public structure to exercise the
+  selectors in internal/directory/yelp.go. Every business name, address,
+  phone, and URL here is invented. The "To verify on activation" checklist in
+  docs/directory-datadome.md lists what must be confirmed against live pages
+  before DIRECTORY_DATADOME_ENABLED=1.
+-->
+<html>
+<body>
+  <main>
+    <div class="search-results">
+      <div data-testid="serp-ia-card">
+        <a class="business-name" href="/biz/day-spa-honolulu">
+          <h3><a class="css-1m051bw">Day Spa Honolulu</a></h3>
+        </a>
+        <div class="secondary-attributes">
+          <address>1650 Liliha St, Honolulu, HI 96817</address>
+          <p class="category-str-list"><a class="css-1ud8x">Day Spas</a></p>
+          <span class="rating-large" aria-label="4.5 stars">4.5</span>
+        </div>
+        <a class="biz_redir" href="/biz_redir?url=https%3A%2F%2Fdayspahonolulu.example%2F">Website</a>
+      </div>
+
+      <div data-testid="serp-ia-card">
+        <a class="business-name" href="/biz/quiet-studio-ubud">
+          <h3><a class="css-1m051bw">Quiet Studio Ubud</a></h3>
+        </a>
+        <div class="secondary-attributes">
+          <address>Jl. Raya Ubud, Gianyar, Bali</address>
+          <p class="category-str-list"><a class="css-1ud8x">Massage</a></p>
+        </div>
+        <!-- No website link: the extractor must leave URL empty rather than
+             queue the yelp.com /biz/ page. -->
+      </div>
+    </div>
+  </main>
+</body>
+</html>

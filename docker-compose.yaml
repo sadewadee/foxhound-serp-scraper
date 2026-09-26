@@ -219,6 +219,13 @@ services:
       BROWSER_TIMEOUT_SEC: "${BROWSER_TIMEOUT_SEC:-60}"
       # ── Beta features (foxhound v0.0.7) — set to "1" to enable ──
       BETA_FEATURES: "${BETA_FEATURES:-0}"
+      # ── DataDome directory module (Yelp, TripAdvisor) — OFF until a
+      # residential proxy is available. See docs/directory-datadome.md. ──
+      DIRECTORY_DATADOME_ENABLED: "${DIRECTORY_DATADOME_ENABLED:-0}"
+      DIRECTORY_PROXY_URL: "${DIRECTORY_PROXY_URL:-}"
+      DIRECTORY_PROXY_STICKY: "${DIRECTORY_PROXY_STICKY:-1}"
+      DATADOME_SOLVER: "${DATADOME_SOLVER:-none}"
+      CAPSOLVER_API_KEY: "${CAPSOLVER_API_KEY:-}"
       # ── Persister (batch flush Redis→DB) ──
       PERSIST_INTERVAL_MS: "${PERSIST_INTERVAL_MS:-5000}"
       PERSIST_BATCH_SIZE: "${PERSIST_BATCH_SIZE:-500}"

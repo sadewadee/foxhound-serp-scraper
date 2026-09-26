@@ -459,6 +459,16 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 	stealthCount := 0
 	stealthRecycleAfter := c.cfg.Fetch.StealthRecycleAfter
 
+	// Pooled DataDome directory browser, created lazily: Yelp/TripAdvisor must
+	// be fetched through the residential proxy, never through the default
+	// no-proxy paths below. One instance per worker (Invariant #5).
+	var datadomeBrowser *fetch.CamoufoxFetcher
+	defer func() {
+		if datadomeBrowser != nil {
+			datadomeBrowser.Close()
+		}
+	}()
+
 	defer stealth.Close()
 
 	redisClient := c.dedup.Client()
@@ -525,50 +535,88 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		c.db.Exec(`UPDATE enrichment_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW() WHERE url_hash = $2 AND status = 'pending'`,
 			workerIDStr, urlHash)
 
-		// Fetch page.
-		timeout := time.Duration(c.cfg.Enrich.TimeoutMs) * time.Millisecond
-		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
-
-		c.browserMu.Lock()
-		currentBrowser := c.sharedBrowser
-		c.browserMu.Unlock()
+		// DataDome directory sites (Yelp, TripAdvisor) are blocked by default
+		// and only routed through the module's residential proxy while it is
+		// actually active (flag on AND proxy configured). With the shipped
+		// default the whole module is inert and this skip is today's behaviour.
+		datadomeSite := c.dataDomeActive() && directory.IsDataDomeDirectorySite(domain)
+		if isSkipDomain(domain) && !datadomeSite {
+			c.db.Exec(`UPDATE enrichment_jobs SET status = 'dead', error_msg = $1, updated_at = NOW() WHERE url_hash = $2`,
+				"blocked domain: "+domain, urlHash)
+			continue
+		}
 
 		var body string
-		if c.domainScorer != nil && currentBrowser != nil {
-			action := c.domainScorer.Recommend(domain)
-			switch action {
-			case fetch.ActionBrowserDirect:
-				c.betaDSBrowser.Add(1)
-				body, err = internalScraper.FetchWithBrowserString(fetchCtx, currentBrowser, pageURL, job.ID)
-				if err == nil {
-					c.domainScorer.RecordBrowser(domain, false)
-				} else {
-					c.domainScorer.RecordBrowser(domain, true)
+		if datadomeSite {
+			// Pooled module browser on the residential proxy: never the shared
+			// enrich browser, never the no-proxy stealth path.
+			if datadomeBrowser == nil {
+				datadomeBrowser, err = newDataDomeBrowser(c.cfg)
+				if err != nil {
+					slog.Warn("enrich: datadome browser unavailable — failing job", "url", pageURL, "error", err)
+					c.db.Exec(`UPDATE enrichment_jobs SET status = 'failed', attempt_count = attempt_count + 1, error_msg = $1, updated_at = NOW() WHERE url_hash = $2`,
+						"datadome browser unavailable: "+err.Error(), urlHash)
+					redisClient.Del(ctx, "enrich:lock:"+urlHash)
+					continue
 				}
-			case fetch.ActionStaticCautious:
-				c.betaDSCaution.Add(1)
-				cautionCtx, cautionCancel := context.WithTimeout(fetchCtx, 5*time.Second)
-				body, err = internalScraper.FetchPage(cautionCtx, stealth, currentBrowser, pageURL, job.ID)
-				cautionCancel()
-				blocked := err != nil
-				c.domainScorer.RecordStatic(domain, blocked)
-			default:
-				c.betaDSStatic.Add(1)
-				body, err = internalScraper.FetchPage(fetchCtx, stealth, currentBrowser, pageURL, job.ID)
-				blocked := err != nil
-				c.domainScorer.RecordStatic(domain, blocked)
 			}
-		} else if currentBrowser != nil {
-			body, err = internalScraper.FetchPage(fetchCtx, stealth, currentBrowser, pageURL, job.ID)
+			var outcome datadomeOutcome
+			body, outcome, err = handleDataDomeFetch(ctx, c, datadomeBrowser, pageURL, domain, urlHash)
+			if outcome == datadomeBlocked {
+				// The job row is already settled for this backoff window.
+				redisClient.Del(ctx, "enrich:lock:"+urlHash)
+				continue
+			}
 		} else {
-			body, err = fetchStealthOnly(fetchCtx, stealth, pageURL, job.ID)
-		}
-		cancel()
+			// Fetch page.
+			timeout := time.Duration(c.cfg.Enrich.TimeoutMs) * time.Millisecond
+			fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
-		if currentBrowser != nil && c.lifecycle.IncrementAndCheck() {
+			c.browserMu.Lock()
+			currentBrowser := c.sharedBrowser
+			c.browserMu.Unlock()
+
+			if c.domainScorer != nil && currentBrowser != nil {
+				action := c.domainScorer.Recommend(domain)
+				switch action {
+				case fetch.ActionBrowserDirect:
+					c.betaDSBrowser.Add(1)
+					body, err = internalScraper.FetchWithBrowserString(fetchCtx, currentBrowser, pageURL, job.ID)
+					if err == nil {
+						c.domainScorer.RecordBrowser(domain, false)
+					} else {
+						c.domainScorer.RecordBrowser(domain, true)
+					}
+				case fetch.ActionStaticCautious:
+					c.betaDSCaution.Add(1)
+					cautionCtx, cautionCancel := context.WithTimeout(fetchCtx, 5*time.Second)
+					body, err = internalScraper.FetchPage(cautionCtx, stealth, currentBrowser, pageURL, job.ID)
+					cautionCancel()
+					blocked := err != nil
+					c.domainScorer.RecordStatic(domain, blocked)
+				default:
+					c.betaDSStatic.Add(1)
+					body, err = internalScraper.FetchPage(fetchCtx, stealth, currentBrowser, pageURL, job.ID)
+					blocked := err != nil
+					c.domainScorer.RecordStatic(domain, blocked)
+				}
+			} else if currentBrowser != nil {
+				body, err = internalScraper.FetchPage(fetchCtx, stealth, currentBrowser, pageURL, job.ID)
+			} else {
+				body, err = fetchStealthOnly(fetchCtx, stealth, pageURL, job.ID)
+			}
+			cancel()
+		}
+
+		// Browser-lifecycle rotation applies only to the shared enrich browser;
+		// the module's pooled browser is per worker and has its own lifetime.
+		c.browserMu.Lock()
+		rotating := c.sharedBrowser
+		c.browserMu.Unlock()
+		if !datadomeSite && rotating != nil && c.lifecycle.IncrementAndCheck() {
 			slog.Info("enrich: page reuse limit reached, restarting browser", "worker", workerID)
 			c.browserMu.Lock()
-			if c.sharedBrowser != currentBrowser {
+			if c.sharedBrowser != rotating {
 				c.browserMu.Unlock()
 			} else {
 				oldBrowser := c.sharedBrowser

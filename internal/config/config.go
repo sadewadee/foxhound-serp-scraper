@@ -24,6 +24,30 @@ type Config struct {
 	Telegram            TelegramConfig     `yaml:"telegram"`
 	ReenrichWorkerCount int                `yaml:"reenrich_worker_count"` // number of reenrich workers (default 1)
 	ReenrichScore       int                `yaml:"reenrich_score"`        // completeness score threshold (default 90)
+	Directory           DirectoryConfig    `yaml:"directory"`
+}
+
+// DirectoryConfig configures the DataDome-protected directory module (Yelp,
+// TripAdvisor).
+//
+// The module ships DISABLED. As of 2026-09-25 both sites return a DataDome 403
+// to every method available (plain HTTP, stealth HTTP through a datacenter
+// proxy, browser with a captcha extension), so the module is built but never
+// runs until a residential proxy is available. Enabling it without a proxy is
+// a misconfiguration and falls open to off with a warning.
+type DirectoryConfig struct {
+	// DataDomeEnabled turns the module on. "1" enables; anything else is off.
+	DataDomeEnabled bool `yaml:"datadome_enabled"`
+	// ProxyURL is the residential proxy for these sites. Empty keeps the module
+	// off even when DataDomeEnabled is true.
+	ProxyURL string `yaml:"proxy_url"`
+	// ProxySticky reuses one exit IP for the whole session.
+	ProxySticky bool `yaml:"proxy_sticky"`
+	// Solver is "none" (default) or "capsolver".
+	Solver string `yaml:"solver"`
+	// CapsolverAPIKey is a secret. It is never logged and never printed by any
+	// error path.
+	CapsolverAPIKey string `yaml:"capsolver_api_key"`
 }
 
 type APIConfig struct {
@@ -238,6 +262,13 @@ func LoadFromEnv() (*Config, error) {
 		},
 		ReenrichWorkerCount: parseEnvInt("REENRICH_WORKER_COUNT", 1),
 		ReenrichScore:       parseEnvInt("REENRICH_SCORE", 90),
+		Directory: DirectoryConfig{
+			DataDomeEnabled: os.Getenv("DIRECTORY_DATADOME_ENABLED") == "1",
+			ProxyURL:        os.Getenv("DIRECTORY_PROXY_URL"),
+			ProxySticky:     os.Getenv("DIRECTORY_PROXY_STICKY") == "1",
+			Solver:          os.Getenv("DATADOME_SOLVER"),
+			CapsolverAPIKey: os.Getenv("CAPSOLVER_API_KEY"),
+		},
 	}
 	setDefaults(cfg)
 	return cfg, nil
@@ -310,6 +341,9 @@ func setDefaults(cfg *Config) {
 		cfg.SERP.RelevanceGuard = false
 	} else if !cfg.SERP.RelevanceGuard && os.Getenv("SERP_RELEVANCE_GUARD") != "0" {
 		cfg.SERP.RelevanceGuard = true
+	}
+	if cfg.Directory.Solver == "" {
+		cfg.Directory.Solver = "none"
 	}
 	if cfg.Website.Concurrency == 0 {
 		cfg.Website.Concurrency = 5

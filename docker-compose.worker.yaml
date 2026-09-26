@@ -48,6 +48,14 @@ services:
       # ── Beta features DISABLED — circuit breaker skips proxy too aggressively ──
       BETA_FEATURES: "0"
 
+      # ── DataDome directory module (Yelp, TripAdvisor) — OFF until a
+      # residential proxy is available. See docs/directory-datadome.md. ──
+      DIRECTORY_DATADOME_ENABLED: "${DIRECTORY_DATADOME_ENABLED:-0}"
+      DIRECTORY_PROXY_URL: "${DIRECTORY_PROXY_URL:-}"
+      DIRECTORY_PROXY_STICKY: "${DIRECTORY_PROXY_STICKY:-1}"
+      DATADOME_SOLVER: "${DATADOME_SOLVER:-none}"
+      CAPSOLVER_API_KEY: "${CAPSOLVER_API_KEY:-}"
+
       # ── SERP engines + timing ──
       SERP_ENGINES: "${SERP_ENGINES:-all}"
       # Engines retired GLOBALLY (across every host) — jobs of these are

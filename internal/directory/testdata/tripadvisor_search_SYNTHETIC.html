@@ -1,0 +1,34 @@
+<!doctype html>
+<!--
+  SYNTHETIC FIXTURE — NOT a captured TripAdvisor page.
+
+  TripAdvisor currently returns a DataDome 403 to every fetch method (plain
+  HTTP, stealth HTTP through a datacenter proxy, and a browser with a captcha
+  extension), so this module has never parsed a real TripAdvisor response.
+  This markup is modeled on TripAdvisor's documented public structure to
+  exercise the selectors in internal/directory/tripadvisor.go. Every business
+  name, address, phone, and URL here is invented. The "To verify on
+  activation" checklist in docs/directory-datadome.md lists what must be
+  confirmed against live pages before DIRECTORY_DATADOME_ENABLED=1.
+-->
+<html>
+<body>
+  <div data-test-target="restaurants-list">
+    <div>
+      <a class="property_title result-title" href="/Restaurant_Review-g294343-d12345">Spice Garden Ubud</a>
+      <div class="address-row result-location-separate"><span class="address">Jl. Hanoman 1, Ubud</span></div>
+      <div class="ui_bubble_rating bubble_45" aria-label="4.5 of 5 bubbles"></div>
+      <span class="cuisine">Indonesian</span>
+      <a aria-label="Visit Website" href="https://spicegarden.example/">Website</a>
+    </div>
+
+    <div>
+      <a class="property_title result-title" href="/Attraction_Review-g297629-d67890">Ocean View Point</a>
+      <div class="address-row result-location-separate"><span class="address">Uluwatu, Bali</span></div>
+      <div class="ui_bubble_rating bubble_50" aria-label="5 of 5 bubbles"></div>
+      <!-- No website link: the extractor must leave URL empty rather than
+           queue the tripadvisor.com review page. -->
+    </div>
+  </div>
+</body>
+</html>
