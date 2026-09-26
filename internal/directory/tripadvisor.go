@@ -10,6 +10,13 @@ import (
 )
 
 // TripAdvisorExtractor extracts business listings from TripAdvisor.
+//
+// NOTE (correctness): TripAdvisor serves us a DataDome 403 on every fetch
+// method as of 2026-09-25, so no real TripAdvisor page has ever been parsed by
+// this code. The HTML selectors below are modeled on TripAdvisor's documented
+// structure and are covered only by synthetic fixtures. Only Listing.URLs that
+// point at the business's OWN website are ever queued for enrichment — never
+// a tripadvisor.com URL — mirroring the YellowPages pattern from #52.
 type TripAdvisorExtractor struct{}
 
 func (e *TripAdvisorExtractor) Name() string { return "tripadvisor" }
@@ -27,6 +34,7 @@ func (e *TripAdvisorExtractor) Extract(body []byte) []Listing {
 	for _, ld := range jsonlds {
 		listing := extractFromJSONLD(ld, "tripadvisor")
 		if listing.Name != "" {
+			listing.URL = businessWebsite(listing.URL, "tripadvisor.com")
 			listings = append(listings, listing)
 		}
 	}
@@ -45,18 +53,22 @@ func (e *TripAdvisorExtractor) Extract(body []byte) []Listing {
 		}
 		seen[name] = true
 
-		href, _ := s.Find("a[href*='/Restaurant_Review'], a[href*='/Attraction_Review'], a[href*='/Hotel_Review']").First().Attr("href")
-		if href != "" && !strings.HasPrefix(href, "http") {
-			href = "https://www.tripadvisor.com" + href
+		// Prefer the business's own website link. TripAdvisor cards show an
+		// off-site "Website" link alongside the internal review link.
+		website := ""
+		if href, ok := s.Find("a[href*='website'], a[aria-label*='Website']").First().Attr("href"); ok {
+			website = absURL(href, "https://www.tripadvisor.com")
 		}
 
 		address := strings.TrimSpace(s.Find("[class*='address']").First().Text())
 		rating := strings.TrimSpace(s.Find("[class*='bubble'], [aria-label*='bubbles']").First().AttrOr("aria-label", ""))
 		category := strings.TrimSpace(s.Find("[class*='cuisine'], [class*='category']").First().Text())
+		phone := strings.TrimSpace(s.Find("[class*='phone']").First().Text())
 
 		listings = append(listings, Listing{
 			Name:     name,
-			URL:      href,
+			URL:      businessWebsite(website, "tripadvisor.com"),
+			Phone:    phone,
 			Address:  address,
 			Category: category,
 			Rating:   rating,
