@@ -546,9 +546,12 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		// whatever another worker already swapped in — a double restart, the
 		// close-while-in-use pattern behind the PagePool panic.
 		var currentBrowser *fetch.CamoufoxFetcher
-		// The skip above guarantees that any DataDome directory site reaching
-		// this point is eligible for module routing.
-		datadomeSite := directory.IsDataDomeDirectorySite(domain)
+		// The skip above guarantees that any blocklisted DataDome directory
+		// site reaching this point is eligible for module routing. The active
+		// gate matters too: non-blocklisted subdomains like es.yelp.com pass
+		// the skip and must take the normal fetch path while the module is
+		// off, or they would burn an attempt on a browser that cannot exist.
+		datadomeSite := c.dataDomeActive() && directory.IsDataDomeDirectorySite(domain)
 		if datadomeSite {
 			// Pooled module browser on the residential proxy: never the shared
 			// enrich browser, never the no-proxy stealth path.

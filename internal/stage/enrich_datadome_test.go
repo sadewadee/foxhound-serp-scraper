@@ -19,6 +19,16 @@ func skipViaSharedPredicate(domain string, stage *EnrichStage) bool {
 		domain)
 }
 
+// routeViaSharedBranch drives the exact branch decision the enrich worker
+// uses after the skip: only an active module routes a DataDome site to its
+// own browser. In particular, a NON-blocklisted subdomain such as es.yelp.com
+// passes the early skip and must still reach the normal fetch path while the
+// module is off — routing it to the DataDome branch would burn an attempt on
+// a browser that cannot be built.
+func routeViaSharedBranch(domain string, stage *EnrichStage) bool {
+	return stage.dataDomeActive() && directory.IsDataDomeDirectorySite(domain)
+}
+
 // TestDataDomeRouting_FlagOffKeepsSitesBlocked is the regression that matters
 // most: with the module shipped disabled — the default in every compose file —
 // Yelp and TripAdvisor must stay blocked exactly as they are today, so the
@@ -86,5 +96,30 @@ func TestDataDomeSessionID(t *testing.T) {
 	cfg.Directory.ProxySticky = true
 	if a, b := dataDomeSessionID(cfg, "https://www.yelp.com/biz/x"), dataDomeSessionID(cfg, "https://www.yelp.com/biz/x"); a != b {
 		t.Errorf("sticky sessions must match for the same URL: %q vs %q", a, b)
+	}
+}
+
+// TestDataDomeRouting_NonBlocklistedSubdomainStaysNormal is the regression for
+// the flag-off behaviour that matters most: blockedDomains lists exact hosts
+// (www.yelp.com, m.yelp.com, …), so es.yelp.com and bare yelp.com are NOT
+// blocklisted. They passed the early skip even before this module existed and
+// took the normal fetch path; with the module off they must keep doing so.
+func TestDataDomeRouting_NonBlocklistedSubdomainStaysNormal(t *testing.T) {
+	off := &EnrichStage{cfg: &config.Config{}}
+	for _, d := range []string{"es.yelp.com", "yelp.com", "tripadvisor.com", "fr.tripadvisor.com"} {
+		if isSkipDomain(d) {
+			continue // blocklisted exact host: skipping it is correct
+		}
+		if routeViaSharedBranch(d, off) {
+			t.Errorf("%s routed to the DataDome branch while the module is off — it must take the normal fetch path", d)
+		}
+	}
+
+	// With the module on, those same hosts are the ones the module serves.
+	on := &EnrichStage{cfg: &config.Config{}}
+	on.cfg.Directory.DataDomeEnabled = true
+	on.cfg.Directory.ProxyURL = "http://residential.example:8080"
+	if !routeViaSharedBranch("es.yelp.com", on) {
+		t.Error("es.yelp.com must route to the module once it is active")
 	}
 }
