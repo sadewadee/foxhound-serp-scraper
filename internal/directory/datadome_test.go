@@ -146,3 +146,34 @@ func TestUnwrapRedirectURL(t *testing.T) {
 		t.Errorf("non-http target accepted: %q", got)
 	}
 }
+
+// TestShouldSkipDomain locks the one shared skip decision: a blocklisted
+// DataDome directory site is admitted only while the module is active.
+// Both the SERP pre-INSERT filter and the enrich early skip call this, so the
+// two sites can never disagree about a domain.
+func TestShouldSkipDomain(t *testing.T) {
+	tests := []struct {
+		name     string
+		domain   string
+		block    bool
+		active   bool
+		wantSkip bool
+	}{
+		{"yelp blocked, module off", "www.yelp.com", true, false, true},
+		{"yelp blocked, module on", "www.yelp.com", true, true, false},
+		{"tripadvisor blocked, module off", "www.tripadvisor.com", true, false, true},
+		{"tripadvisor blocked, module on", "www.tripadvisor.com", true, true, false},
+		{"not blocklisted, module on", "www.smallbiz.com", false, true, false},
+		{"not blocklisted, module off", "www.smallbiz.com", false, false, false},
+		{"blocklisted non-directory, module on", "www.linkedin.com", true, true, true},
+		{"subdomain of a module site", "fr.yelp.com", true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ShouldSkipDomain(tt.block, tt.active, tt.domain); got != tt.wantSkip {
+				t.Errorf("ShouldSkipDomain(block=%v, active=%v, %q) = %v, want %v",
+					tt.block, tt.active, tt.domain, got, tt.wantSkip)
+			}
+		})
+	}
+}

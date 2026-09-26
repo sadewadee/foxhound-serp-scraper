@@ -9,6 +9,16 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/directory"
 )
 
+// skipViaSharedPredicate drives the exact predicate both the SERP
+// pre-INSERT filter (serp.go) and the enrich early skip (enrich.go) use:
+// the plain blocklist verdict unless the module is active and the domain is
+// one of its sites.
+func skipViaSharedPredicate(domain string, stage *EnrichStage) bool {
+	return directory.ShouldSkipDomain(isSkipDomain(domain),
+		directory.ModuleActive(stage.cfg.Directory.DataDomeEnabled, stage.cfg.Directory.ProxyURL),
+		domain)
+}
+
 // TestDataDomeRouting_FlagOffKeepsSitesBlocked is the regression that matters
 // most: with the module shipped disabled — the default in every compose file —
 // Yelp and TripAdvisor must stay blocked exactly as they are today, so the
@@ -25,7 +35,7 @@ func TestDataDomeRouting_FlagOffKeepsSitesBlocked(t *testing.T) {
 			t.Errorf("%s not recognised as a DataDome directory site", d)
 		}
 		// The gate is off, so the site must still be skipped, exactly as before.
-		if skipped := isSkipDomain(d) && !(stage.dataDomeActive() && directory.IsDataDomeDirectorySite(d)); !skipped {
+		if !skipViaSharedPredicate(d, stage) {
 			t.Errorf("%s is no longer skipped with the module off — the module must be inert by default", d)
 		}
 	}
@@ -56,9 +66,13 @@ func TestDataDomeRouting_FlagOnUnblocksOnlyWithProxy(t *testing.T) {
 			if got := stage.dataDomeActive(); got != tt.active {
 				t.Fatalf("dataDomeActive() = %v, want %v", got, tt.active)
 			}
-			skipped := isSkipDomain("www.yelp.com") && !(stage.dataDomeActive() && directory.IsDataDomeDirectorySite("www.yelp.com"))
+			skipped := skipViaSharedPredicate("www.yelp.com", stage)
 			if skipped == tt.unblocks {
 				t.Errorf("%s: yelp skipped = %v, want skipped = %v", tt.name, skipped, !tt.unblocks)
+			}
+			// A site the module never serves is untouched either way.
+			if skipViaSharedPredicate("www.smallbiz.com", stage) {
+				t.Errorf("%s: unrelated domain skipped — the module must not widen the blocklist", tt.name)
 			}
 		})
 	}

@@ -23,6 +23,7 @@ import (
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
+	"github.com/sadewadee/serp-scraper/internal/directory"
 	"github.com/sadewadee/serp-scraper/internal/feeder"
 	"github.com/sadewadee/serp-scraper/internal/query"
 	"github.com/sadewadee/serp-scraper/internal/scraper"
@@ -771,8 +772,11 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			// Pre-INSERT filter: drop off-niche / non-business hosts so the
 			// trigger never spawns enrichment jobs we'd just skip later.
 			// Without this, isSkipDomain only fires after a worker picks up
-			// the locked job — wasted lifecycle.
-			if isSkipDomain(domain) {
+			// the locked job — wasted lifecycle. DataDome directory sites are
+			// admitted only while that module is active (flag on AND proxy
+			// configured); the shipped default keeps this byte-for-byte the
+			// plain blocklist verdict.
+			if directory.ShouldSkipDomain(isSkipDomain(domain), directory.ModuleActive(s.cfg.Directory.DataDomeEnabled, s.cfg.Directory.ProxyURL), domain) {
 				skippedBlocked++
 				continue
 			}

@@ -209,6 +209,23 @@ func ModuleActive(enabled bool, proxyURL string) bool {
 	return enabled && strings.TrimSpace(proxyURL) != ""
 }
 
+// ShouldSkipDomain is the ONE DataDome-aware blocklist verdict, shared by the
+// SERP pre-INSERT filter and the enrich early skip so the two sites can never
+// disagree: a blocklisted domain is skipped exactly as before unless the
+// DataDome module is active AND the domain is one of its directory sites.
+// datadomeActive should be directory.ModuleActive(flag, proxy). With the
+// shipped default (flag off) this is byte-for-byte the plain isSkipDomain
+// verdict used before the module existed.
+//
+// NOTE: isSkipDomain itself lives in the stage package (test-gated); this
+// helper takes its verdict so the DataDome half stays pure and untagged.
+func ShouldSkipDomain(blocklisted, datadomeActive bool, domain string) bool {
+	if !blocklisted {
+		return false
+	}
+	return !(datadomeActive && IsDataDomeDirectorySite(domain))
+}
+
 // IsDataDomeDirectorySite reports whether a host is one of the directory
 // sites this module exists for.
 func IsDataDomeDirectorySite(domain string) bool {

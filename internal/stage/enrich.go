@@ -518,8 +518,11 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			urlHash = dedup.HashURL(pageURL)
 		}
 
-		// Skip blocked domains — mark dead.
-		if isSkipDomain(domain) {
+		// Skip blocked domains — mark dead. A blocklisted DataDome directory
+		// site (Yelp/TripAdvisor) is admitted only while the module is active
+		// (flag on AND proxy configured); with the shipped default this is
+		// byte-for-byte the plain blocklist verdict.
+		if directory.ShouldSkipDomain(isSkipDomain(domain), c.dataDomeActive(), domain) {
 			c.db.Exec(`UPDATE enrichment_jobs SET status = 'dead', error_msg = $1, updated_at = NOW() WHERE url_hash = $2`,
 				"blocked domain: "+domain, urlHash)
 			continue
@@ -535,18 +538,17 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 		c.db.Exec(`UPDATE enrichment_jobs SET status = 'processing', locked_by = $1, locked_at = NOW(), updated_at = NOW() WHERE url_hash = $2 AND status = 'pending'`,
 			workerIDStr, urlHash)
 
-		// DataDome directory sites (Yelp, TripAdvisor) are blocked by default
-		// and only routed through the module's residential proxy while it is
-		// actually active (flag on AND proxy configured). With the shipped
-		// default the whole module is inert and this skip is today's behaviour.
-		datadomeSite := c.dataDomeActive() && directory.IsDataDomeDirectorySite(domain)
-		if isSkipDomain(domain) && !datadomeSite {
-			c.db.Exec(`UPDATE enrichment_jobs SET status = 'dead', error_msg = $1, updated_at = NOW() WHERE url_hash = $2`,
-				"blocked domain: "+domain, urlHash)
-			continue
-		}
-
 		var body string
+		// currentBrowser is captured before the fetch (and stays nil for the
+		// DataDome branch, which uses its own browser): the rotation guard
+		// below must compare against the browser THIS fetch actually used.
+		// Reading c.sharedBrowser after the fetch instead would restart
+		// whatever another worker already swapped in — a double restart, the
+		// close-while-in-use pattern behind the PagePool panic.
+		var currentBrowser *fetch.CamoufoxFetcher
+		// The skip above guarantees that any DataDome directory site reaching
+		// this point is eligible for module routing.
+		datadomeSite := directory.IsDataDomeDirectorySite(domain)
 		if datadomeSite {
 			// Pooled module browser on the residential proxy: never the shared
 			// enrich browser, never the no-proxy stealth path.
@@ -573,7 +575,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 
 			c.browserMu.Lock()
-			currentBrowser := c.sharedBrowser
+			currentBrowser = c.sharedBrowser
 			c.browserMu.Unlock()
 
 			if c.domainScorer != nil && currentBrowser != nil {
@@ -610,13 +612,15 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 
 		// Browser-lifecycle rotation applies only to the shared enrich browser;
 		// the module's pooled browser is per worker and has its own lifetime.
-		c.browserMu.Lock()
-		rotating := c.sharedBrowser
-		c.browserMu.Unlock()
-		if !datadomeSite && rotating != nil && c.lifecycle.IncrementAndCheck() {
+		// The guard compares against currentBrowser — the browser this fetch
+		// used — not against a fresh read of c.sharedBrowser (see the comment
+		// at the declaration): IncrementAndCheck stays true for every worker
+		// once the limit is hit until a Restart resets it, so the identity
+		// comparison is the only thing preventing duplicate restarts.
+		if !datadomeSite && currentBrowser != nil && c.lifecycle.IncrementAndCheck() {
 			slog.Info("enrich: page reuse limit reached, restarting browser", "worker", workerID)
 			c.browserMu.Lock()
-			if c.sharedBrowser != rotating {
+			if c.sharedBrowser != currentBrowser {
 				c.browserMu.Unlock()
 			} else {
 				oldBrowser := c.sharedBrowser
