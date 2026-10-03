@@ -244,9 +244,9 @@ func (c *MordibouncerClient) FetchBulkResults(ctx context.Context, jobID int64) 
 
 // BackfillValidation scans existing emails with pending validation status
 // and validates them via Mordibouncer bulk API.
-// Flow: fetch 500 pending → submit bulk → poll until done → fetch results → write DB.
+// Flow: fetch 100 pending → submit bulk → poll until done → fetch results → write DB.
 func BackfillValidation(ctx context.Context, db *sql.DB, client *MordibouncerClient) {
-	const batchSize = 500
+	const batchSize = 100
 
 	slog.Info("backfill: starting email validation (bulk mode)")
 
