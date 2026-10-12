@@ -1,0 +1,226 @@
+package prodir
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/lib/pq"
+
+	"github.com/sadewadee/serp-scraper/internal/db"
+	"github.com/sadewadee/serp-scraper/internal/testpg"
+)
+
+// writeSyntheticState writes one ACE trainer (with a parsed profile), one ACE
+// trainer without a profile and two ICF coaches (one fetched, one missing).
+func writeSyntheticState(t *testing.T, dir string) {
+	t.Helper()
+	toks, err := tokenizeACE(readFixture(t, "ace_profile_SYNTHETIC.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prof, _ := marshalLine(struct {
+		ID     string  `json:"id"`
+		URL    string  `json:"url"`
+		Tokens []Token `json:"tokens"`
+	}{"AcE1", ACEBase + "/pro/AcE1/", toks})
+	if err := os.WriteFile(filepath.Join(dir, "ace_profiles.jsonl"), prof, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeLines(t, filepath.Join(dir, "ace_list.jsonl"),
+		`{"EncryptedCustomerNumber":"AcE1","ProfileURL":"/pro/AcE1/","FullName":"Jane Q. Fixture","City":"Exampleville","StateCode":"NY","CountryName":"US","CertDisplay":"x","_page":1}`,
+		`{"EncryptedCustomerNumber":"AcE2","ProfileURL":"/pro/AcE2/","FullName":"No Profile Fixture","City":"Placeholder","StateCode":"","CountryName":"Atlantis","CertDisplay":"ACE Certified Health Coach","_page":1}`,
+	)
+
+	writeLines(t, filepath.Join(dir, "icf_list.jsonl"),
+		`{"key":"IcF1","fullName":"Coach One Fixture","headline":"A headline","description":"","location":"Exampletown, NY UNITED STATES"}`,
+		`{"key":"IcF2","fullName":"Coach Two Fixture","headline":"Another headline","description":"Real description","location":"Placeholder City, SOUTH AFRICA"}`,
+	)
+	writeLines(t, filepath.Join(dir, "icf_profiles.jsonl"),
+		`{"key":"IcF1","url":"u","fields":{"Phone":["+1 555 010 0188"]},"email":"Coach.Fixture@Gmail.com","phone":"+1 555 010 0188","website":"http://www.fixture-coaching.example","location":"Exampletown, NY UNITED STATES"}`,
+		`{"key":"IcF2","url":"u","missing":true}`,
+	)
+	b, _ := os.ReadFile("testdata/icf_countries.json")
+	if err := os.WriteFile(filepath.Join(dir, "icf_countries.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func count(t *testing.T, d *sql.DB, q string) int {
+	t.Helper()
+	var n int
+	if err := d.QueryRow(q).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestLoadMapping(t *testing.T) {
+	d := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_prodir_"}).DB()
+	defer d.Close()
+	if err := db.Migrate(d); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	dir := t.TempDir()
+	writeSyntheticState(t, dir)
+
+	load := func() {
+		t.Helper()
+		for _, src := range []string{"ace", "icf"} {
+			ls, err := Listings(src, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code := Load(context.Background(), d, src, ls); code != ExitOK {
+				t.Fatalf("%s load exit code %d", src, code)
+			}
+		}
+	}
+	load()
+
+	type row struct {
+		name, contact, category, niche, url, website, loc, desc, social string
+		phone, addr, city, country, cc, ns, gs                          sql.NullString
+		phones                                                          []string
+		off                                                             bool
+		reEnriched                                                      bool
+		score                                                           sql.NullFloat64
+	}
+	get := func(domain string) row {
+		t.Helper()
+		var r row
+		var phones pq.StringArray
+		err := d.QueryRow(`SELECT business_name, contact_name, category, niche_category, url, website,
+			COALESCE(location,''), COALESCE(description,''), social_links::text,
+			phone, address, city, country, country_code::text, niche_source, geo_source, phones,
+			off_niche, re_enriched_at IS NOT NULL, completeness_score
+			FROM business_listings WHERE domain=$1`, domain).Scan(
+			&r.name, &r.contact, &r.category, &r.niche, &r.url, &r.website, &r.loc, &r.desc, &r.social,
+			&r.phone, &r.addr, &r.city, &r.country, &r.cc, &r.ns, &r.gs, &phones, &r.off, &r.reEnriched, &r.score)
+		if err != nil {
+			t.Fatalf("%s: %v", domain, err)
+		}
+		r.phones = phones
+		return r
+	}
+	eq := func(what, got, want string) {
+		t.Helper()
+		if got != want {
+			t.Errorf("%s = %q, want %q", what, got, want)
+		}
+	}
+
+	a := get("ace1.pro.acefitness.org")
+	eq("ace name", a.name, "Jane Q. Fixture")
+	eq("ace contact", a.contact, "Jane Q. Fixture")
+	eq("ace category", a.category, "acefitness")
+	eq("ace niche", a.niche, "fitness")
+	eq("ace website (own)", a.website, "http://www.fixture-fitness.example")
+	eq("ace location", a.loc, "Exampleville, NY")
+	eq("ace city", a.city.String, "Exampleville")
+	eq("ace phone", a.phone.String, "(555) 010-0199")
+	eq("ace address", a.addr.String, "EXAMPLEVILLE, NY US 10001")
+	eq("ace country", a.country.String, "United States")
+	eq("ace country_code", a.cc.String, "US")
+	eq("ace description", a.desc, "Synthetic fixture bio. Second paragraph of the bio.")
+	eq("ace phones", strings.Join(a.phones, "|"), "(555) 010-0199")
+	var social map[string]string
+	if err := json.Unmarshal([]byte(a.social), &social); err != nil || social["instagram"] != "https://www.instagram.com/fixture_fit" || len(social) != 1 {
+		t.Errorf("ace social_links = %s", a.social)
+	}
+	if a.off || !a.reEnriched || a.ns.Valid || a.gs.Valid || a.score.Valid {
+		t.Errorf("ace flags: off=%v re_enriched=%v niche_source=%v geo_source=%v score=%v", a.off, a.reEnriched, a.ns, a.gs, a.score)
+	}
+
+	// No profile: loads from listing data; website falls back to the profile URL; unknown country stays NULL.
+	b := get("ace2.pro.acefitness.org")
+	eq("ace2 niche", b.niche, "coaching")
+	eq("ace2 website", b.website, ACEBase+"/pro/AcE2/")
+	eq("ace2 url", b.url, ACEBase+"/pro/AcE2/")
+	if b.phone.Valid || b.addr.Valid || b.country.Valid || b.cc.Valid || len(b.phones) != 0 {
+		t.Errorf("ace2 should have NULL phone/address/country, got %+v", b)
+	}
+
+	i1 := get("icf1.coach.coachingfederation.org")
+	eq("icf niche", i1.niche, "coaching")
+	eq("icf category", i1.category, "icfcoaching")
+	eq("icf website", i1.website, "http://www.fixture-coaching.example")
+	eq("icf location", i1.loc, "Exampletown, NY UNITED STATES")
+	eq("icf city", i1.city.String, "Exampletown")
+	eq("icf country", i1.country.String, "United States")
+	eq("icf country_code", i1.cc.String, "US")
+	eq("icf description (headline fallback)", i1.desc, "A headline")
+	eq("icf social_links", i1.social, "{}")
+	eq("icf phones", strings.Join(i1.phones, "|"), "+1 555 010 0188")
+	if i1.addr.Valid {
+		t.Error("icf address must be NULL")
+	}
+	i2 := get("icf2.coach.coachingfederation.org")
+	eq("icf2 website", i2.website, icfProfileURL("IcF2"))
+	eq("icf2 description", i2.desc, "Real description")
+	eq("icf2 country_code", i2.cc.String, "ZA")
+
+	// Emails: ICF only, lower-cased, free_email flagged, linked with source icfcoaching.
+	if n := count(t, d, `SELECT COUNT(*) FROM emails`); n != 1 {
+		t.Errorf("%d emails, want 1 (ACE exposes none)", n)
+	}
+	var email string
+	var free bool
+	var src string
+	if err := d.QueryRow(`SELECT e.email, e.free_email, be.source FROM emails e
+		JOIN business_emails be ON be.email_id = e.id
+		JOIN business_listings bl ON bl.id = be.business_id AND bl.domain='icf1.coach.coachingfederation.org'`).Scan(&email, &free, &src); err != nil {
+		t.Fatal(err)
+	}
+	eq("email", email, "coach.fixture@gmail.com")
+	eq("source", src, "icfcoaching")
+	if !free {
+		t.Error("gmail.com should be free_email")
+	}
+
+	// Idempotent: same counts after a second identical load.
+	before := [3]int{count(t, d, `SELECT COUNT(*) FROM business_listings`), count(t, d, `SELECT COUNT(*) FROM emails`), count(t, d, `SELECT COUNT(*) FROM business_emails`)}
+	load()
+	after := [3]int{count(t, d, `SELECT COUNT(*) FROM business_listings`), count(t, d, `SELECT COUNT(*) FROM emails`), count(t, d, `SELECT COUNT(*) FROM business_emails`)}
+	if before != after || before != [3]int{4, 1, 1} {
+		t.Errorf("counts before=%v after=%v, want [4 1 1] both", before, after)
+	}
+
+	// An empty new value never blanks an existing one; a new non-empty value wins.
+	again := Listing{
+		Domain: "icf1.coach.coachingfederation.org", URL: icfProfileURL("IcF1"), Name: "Coach One Fixture",
+		Category: icfCategory, Niche: "coaching", Website: icfProfileURL("IcF1"), Social: map[string]string{},
+		Phone: "", Location: "Exampletown, NY UNITED STATES", Description: "A fresh description",
+	}
+	if code := Load(context.Background(), d, "icf", []Listing{again}); code != ExitOK {
+		t.Fatalf("reload exit code %d", code)
+	}
+	r := get("icf1.coach.coachingfederation.org")
+	eq("phone kept", r.phone.String, "+1 555 010 0188")
+	eq("phones kept", strings.Join(r.phones, "|"), "+1 555 010 0188")
+	eq("country kept", r.cc.String, "US")
+	eq("description updated", r.desc, "A fresh description")
+	if n := count(t, d, `SELECT COUNT(*) FROM business_emails`); n != 1 {
+		t.Errorf("email link lost: %d", n)
+	}
+}
+
+func TestPrintStats(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticState(t, dir)
+	ls, err := Listings("icf", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sb strings.Builder
+	PrintStats(&sb, "icf", ls)
+	for _, want := range []string{"records:          2", "with email:       1", "with own website: 1", "niche coaching   2", "resolved 2 (100.00%)"} {
+		if !strings.Contains(sb.String(), want) {
+			t.Errorf("stats missing %q:\n%s", want, sb.String())
+		}
+	}
+}
