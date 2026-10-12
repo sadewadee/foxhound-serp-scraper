@@ -78,6 +78,15 @@ func (r *countryResolver) resolve(raw string) (name, code string) {
 
 // ---------- source -> Listing ----------
 
+// withScheme prefixes http:// to an own website written without a scheme
+// ("www.x.com", "x.com/path"); every other writer of the column stores full URLs.
+func withScheme(w string) string {
+	if l := strings.ToLower(w); strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
+		return w
+	}
+	return "http://" + w
+}
+
 func containsFold(s, sub string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }
@@ -147,7 +156,7 @@ func aceListings(dir string, res *countryResolver) ([]Listing, error) {
 			RawCountry:  clean(l.str("CountryName")), Social: social,
 		}
 		if p.Website != "" {
-			x.Website = p.Website
+			x.Website = withScheme(p.Website)
 		}
 		x.Country, x.CountryCode = res.resolve(x.RawCountry)
 		out = append(out, x)
@@ -189,7 +198,7 @@ func icfListings(dir string, res *countryResolver) ([]Listing, error) {
 		if e.fetched() {
 			x.Phone = clean(e.prof.Phone)
 			if w := clean(e.prof.Website); w != "" {
-				x.Website, x.OwnWebsite = w, true
+				x.Website, x.OwnWebsite = withScheme(w), true
 			}
 			if em := strings.ToLower(clean(e.prof.Email)); strings.Contains(em, "@") {
 				x.Email = em
@@ -303,7 +312,8 @@ var freeMail = map[string]bool{
 // The EXCLUDED values for nullable columns are NULL when the source has no
 // value (NULLIF on insert), so COALESCE(EXCLUDED.x, current) is "a new
 // non-empty value wins, an empty one never blanks an existing value". The same
-// holds for the NOT-NULL-ish text columns via COALESCE(NULLIF(EXCLUDED.x,”), …).
+// holds for the NOT-NULL-ish text columns, where an empty-string EXCLUDED value
+// is turned into NULL first.
 //
 // re_enriched_at is set on INSERT only: these synthetic domains have no page
 // for the reenrich worker to refetch; without it they stay permanently eligible

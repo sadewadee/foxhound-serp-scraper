@@ -154,7 +154,7 @@ type poolResult struct {
 
 // runPool runs fn over items in `workers` goroutines. A run stops starting new
 // items when ctx is cancelled or when breakerLimit items in a row have failed
-// (the site is blocking us); in-flight items finish. fn returning errStopped is
+// (the source or database is failing); in-flight items finish. fn returning errStopped is
 // neither success nor failure.
 func runPool[T any](parent context.Context, items []T, workers int, label string, every int,
 	fn func(context.Context, T) error) poolResult {
@@ -201,7 +201,7 @@ func runPool[T any](parent context.Context, items []T, workers int, label string
 					slog.Warn("prodir: item failed", "stage", label, "error", err)
 					if streak >= breakerLimit && !res.tripped {
 						res.tripped = true
-						slog.Error("prodir: circuit breaker — consecutive items failed, the site appears to be blocking us; stopping (work already written is intact)",
+						slog.Error("prodir: circuit breaker — consecutive items failed; stopping (work already written is intact)",
 							"stage", label, "limit", breakerLimit, "last_error", err)
 						cancel()
 					}

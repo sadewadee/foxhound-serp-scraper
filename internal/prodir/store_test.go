@@ -224,3 +224,48 @@ func TestPrintStats(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnWebsiteScheme(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticState(t, dir)
+	appendLines := func(name string, lines ...string) {
+		f, err := os.OpenFile(filepath.Join(dir, name), os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		f.WriteString(strings.Join(lines, "\n") + "\n")
+	}
+	row := func(k string) string {
+		return `{"key":"` + k + `","fullName":"Coach ` + k + `","location":"Exampletown, NY UNITED STATES"}`
+	}
+	prof := func(k, site string) string {
+		return `{"key":"` + k + `","url":"u","fields":{"Web Site":["` + site + `"]},"email":"","phone":"","website":"` + site + `","location":""}`
+	}
+	appendLines("icf_list.jsonl", row("IcF3"), row("IcF4"), row("IcF5"))
+	appendLines("icf_profiles.jsonl", prof("IcF3", "www.fixture-bare.example"), prof("IcF4", "fixture-bare.example/path"), prof("IcF5", "HTTPS://Secure.fixture.example"))
+
+	ls, err := Listings("icf", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, l := range ls {
+		got[l.Domain] = l.Website
+	}
+	want := map[string]string{
+		"icf1.coach.coachingfederation.org": "http://www.fixture-coaching.example", // already had a scheme
+		"icf2.coach.coachingfederation.org": icfProfileURL("IcF2"),                 // profile-URL fallback untouched
+		"icf3.coach.coachingfederation.org": "http://www.fixture-bare.example",
+		"icf4.coach.coachingfederation.org": "http://fixture-bare.example/path",
+		"icf5.coach.coachingfederation.org": "HTTPS://Secure.fixture.example", // https untouched
+	}
+	for d, w := range want {
+		if got[d] != w {
+			t.Errorf("%s website = %q, want %q", d, got[d], w)
+		}
+	}
+	if withScheme("www.x.example") != "http://www.x.example" || withScheme("https://x.example") != "https://x.example" {
+		t.Error("withScheme")
+	}
+}
