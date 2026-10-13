@@ -741,3 +741,9 @@ components:
         emails_with_info: { type: array, items: { $ref: "#/components/schemas/EmailInfo" } }
         total_email_count: { type: integer }
         valid_email_count: { type: integer }
+        meta:
+          type: object
+          description: >-
+            Key/value labels from business_meta. Each key holds one or more
+            values; {} when the listing has none.
+          additionalProperties: { type: array, items: { type: string } }

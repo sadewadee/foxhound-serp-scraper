@@ -39,6 +39,9 @@ type V2BusinessListing struct {
 	EmailsWithInfo  []V2EmailInfo   `json:"emails_with_info"`
 	TotalEmailCount int             `json:"total_email_count"`
 	ValidEmailCount int             `json:"valid_email_count"`
+	// Meta is the business_meta key/value store: site-native labels, many
+	// values per key. Always non-nil in handleV2ListResults ("meta":{}).
+	Meta map[string][]string `json:"meta"`
 }
 
 // V2EmailInfo is the API response shape for a single email with all validation columns.

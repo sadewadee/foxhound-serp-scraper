@@ -25,6 +25,7 @@ CGO_ENABLED=0 go build -tags playwright,tls -ldflags="-w -s" -o serp-scraper .
 go build -o backfill-address-fields ./cmd/backfill-address-fields
 go build -o dump ./cmd/dump
 go build -o proxyforward ./cmd/proxyforward
+go build -o prodir ./cmd/prodir
 ```
 
 Run modes (all need Postgres + Redis except `scrape`):
@@ -117,6 +118,8 @@ When adding a new field to `enrichment_jobs` → `business_listings`: schema + t
 ### Directory extractors
 
 `internal/directory/` holds per-source business-listing parsers (ClassPass, Yelp, YellowPages, YogaAlliance, TripAdvisor, plus a generic JSON-LD fallback). Registry lives in `directory.go:init()`. The enrich worker dispatches to whichever extractor's `Match(domain)` returns true; otherwise falls back to the generic contact-page scraper in `internal/scraper/contact.go`.
+
+`internal/prodir/` + `cmd/prodir` crawl two curated professional directories outside the SERP pipeline — ACE Fitness "Find an ACE Pro" (~76k trainers) and the ICF coach finder (~36k coaches) — as `prodir <ace|icf> <list|profiles|export|load>`. `list`/`profiles` write append-only JSONL state (resumable; the file names and JSON shapes are those of the original Python scrapers, so a state dir is interchangeable), `export` writes the CSV, and `load` upserts `business_listings` / `emails` / `business_emails` with synthetic domains (`<id>.pro.acefitness.org`, `<key>.coach.coachingfederation.org`), `re_enriched_at` set on INSERT so the reenrich worker leaves them alone, and country codes only from the `query.CountryRows`/`CountryAliases` whitelist. `load -dry-run` prints mapping stats without a DB. Pure Go (no `playwright` tag); no proxy flag — `HTTPS_PROXY` is honoured. Exit codes: 0 ok, 1 some items failed, 2 circuit breaker tripped, 130 interrupted.
 
 ## Operational Invariants
 
