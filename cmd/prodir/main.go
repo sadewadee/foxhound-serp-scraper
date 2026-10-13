@@ -22,7 +22,8 @@
 //	ace_list.jsonl  ace_profiles.jsonl  ace_profiles_errors.jsonl
 //	icf_list.jsonl  icf_profiles.jsonl  icf_countries.json
 //
-// DB mapping for `load` (EXISTING tables — no migration):
+// DB mapping for `load` (EXISTING tables, plus business_meta which `load`
+// creates if missing via db.EnsureBusinessMeta):
 //   - business_listings ← one row per person; category='acefitness' |
 //     'icfcoaching'; niche_category='fitness' (ACE; 'coaching' for pure Health
 //     Coaches) | 'coaching' (ICF); off_niche=false; synthetic unique domain
@@ -30,6 +31,14 @@
 //     country/country_code only from the curated country whitelist.
 //   - emails            ← ICF email (UNIQUE email); ACE exposes none
 //   - business_emails   ← link, source='icfcoaching'
+//   - business_meta     ← site-native labels as (business_id, meta_key, meta_value)
+//     rows, one per value, rewritten per key on every load (a key the record
+//     does not carry keeps its old rows). ACE keys: credential (split on ";"
+//     and ","), years_ace_certified, years_in_industry, areas_of_focus,
+//     programs_and_rates and every profile section column (split on ";").
+//     ICF keys: credential, designations, standard_rate and every non-contact
+//     profile label under its CSV column name. Returned as data[].meta by
+//     GET /api/v2/results.
 //
 // Proxy: there is no proxy flag; HTTPS_PROXY / NO_PROXY are honoured.
 //

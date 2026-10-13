@@ -741,3 +741,10 @@ components:
         emails_with_info: { type: array, items: { $ref: "#/components/schemas/EmailInfo" } }
         total_email_count: { type: integer }
         valid_email_count: { type: integer }
+        meta:
+          type: object
+          description: >-
+            Label bertipe key/value dari tabel business_meta (mis. credential,
+            years_in_industry). Setiap key punya satu atau lebih value; {}
+            kalau listing tidak punya meta.
+          additionalProperties: { type: array, items: { type: string } }

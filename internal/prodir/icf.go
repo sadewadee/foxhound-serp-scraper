@@ -646,6 +646,29 @@ var (
 	icfTailCols = []string{"photo_url", "profile_url", "has_enhanced_profile", "profile_missing"}
 )
 
+// icfReserved are the fixed export columns a profile label must not shadow.
+var icfReserved = func() map[string]bool {
+	m := map[string]bool{}
+	for _, c := range append(append([]string{}, icfFixedCols...), icfTailCols...) {
+		m[c] = true
+	}
+	return m
+}()
+
+// icfLabelColumn is the export column (and business_meta key) of a profile
+// label: its slug, "field" when the slug is empty, "f_" prefixed when the slug
+// collides with a fixed column. Labels sharing a slug share a column.
+func icfLabelColumn(label string) string {
+	s := slug(label)
+	if s == "" {
+		s = "field"
+	}
+	if icfReserved[s] {
+		return "f_" + s
+	}
+	return s
+}
+
 func joinClean(vals []string) string {
 	var out []string
 	for _, v := range vals {
@@ -688,12 +711,8 @@ func ICFExport(dir, out string) error {
 		out = filepath.Join(dir, "icf_coaches.csv")
 	}
 
-	reserved := map[string]bool{}
-	for _, c := range append(append([]string{}, icfFixedCols...), icfTailCols...) {
-		reserved[c] = true
-	}
-	labelCols := map[string]string{} // slug -> column name
-	var labelOrder []string          // first-seen order
+	seenCol := map[string]bool{}
+	var labelOrder []string // first-seen order
 	for _, r := range recs {
 		p, ok := profs[r.Key]
 		if !ok {
@@ -703,16 +722,8 @@ func ICFExport(dir, out string) error {
 			if icfContactLabels[label] {
 				continue
 			}
-			s := slug(label)
-			if s == "" {
-				s = "field"
-			}
-			if _, ok := labelCols[s]; !ok {
-				col := s
-				if reserved[s] {
-					col = "f_" + s
-				}
-				labelCols[s] = col
+			if col := icfLabelColumn(label); !seenCol[col] {
+				seenCol[col] = true
 				labelOrder = append(labelOrder, col)
 			}
 		}
@@ -763,11 +774,8 @@ func ICFExport(dir, out string) error {
 				if icfContactLabels[label] {
 					continue
 				}
-				s := slug(label)
-				if s == "" {
-					s = "field"
-				}
-				merged[labelCols[s]] = append(merged[labelCols[s]], e.prof.Fields.vals[label]...)
+				col := icfLabelColumn(label)
+				merged[col] = append(merged[col], e.prof.Fields.vals[label]...)
 			}
 			for col, vals := range merged {
 				row[col] = joinClean(vals)

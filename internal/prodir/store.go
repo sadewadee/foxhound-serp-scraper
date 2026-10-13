@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/lib/pq"
+
+	appdb "github.com/sadewadee/serp-scraper/internal/db"
 	"github.com/sadewadee/serp-scraper/internal/query"
 )
 
@@ -23,6 +26,88 @@ type Listing struct {
 	Social                                  map[string]string
 	Email                                   string // lower-cased; empty = none
 	OwnWebsite                              bool
+	Meta                                    map[string][]string // business_meta: key -> values
+}
+
+// addMeta appends vals under key: cleaned, empties dropped, duplicates (within
+// the key) skipped, source order kept.
+func addMeta(m map[string][]string, key string, vals ...string) {
+	for _, v := range vals {
+		v = clean(v)
+		if v == "" {
+			continue
+		}
+		dup := false
+		for _, have := range m[key] {
+			if have == v {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			m[key] = append(m[key], v)
+		}
+	}
+}
+
+// splitMeta splits s on every separator in seps.
+func splitMeta(s string, seps ...string) []string {
+	parts := []string{s}
+	for _, sep := range seps {
+		var next []string
+		for _, p := range parts {
+			next = append(next, strings.Split(p, sep)...)
+		}
+		parts = next
+	}
+	return parts
+}
+
+// aceMetaKeys are the aceRow columns stored as meta besides the section columns.
+var aceMetaKeys = []string{"years_ace_certified", "years_in_industry", "areas_of_focus", "programs_and_rates"}
+
+// aceMeta is the business_meta of one ACE entry, built from its export row:
+// credential (the row column credentials, split on ";" and ","), the columns of
+// aceMetaKeys and every section column (split on ";").
+func aceMeta(e aceEntry) map[string][]string {
+	row := aceRow(e)
+	m := map[string][]string{}
+	addMeta(m, "credential", splitMeta(row["credentials"], ";", ",")...)
+	fixed := map[string]bool{}
+	for _, c := range append(append([]string{}, aceFixedHead...), aceFixedTail...) {
+		fixed[c] = true
+	}
+	keys := append([]string{}, aceMetaKeys...)
+	var sections []string
+	for k := range row {
+		if !fixed[k] {
+			sections = append(sections, k)
+		}
+	}
+	sort.Strings(sections)
+	for _, k := range append(keys, sections...) {
+		addMeta(m, k, splitMeta(row[k], ";")...)
+	}
+	return m
+}
+
+// icfMeta is the business_meta of one ICF entry: the list-level credential,
+// designations and standard_rate, plus every non-contact profile label of a
+// fetched profile under its export column name (labels sharing it are merged).
+func icfMeta(e icfEntry) map[string][]string {
+	m := map[string][]string{}
+	addMeta(m, "credential", e.rec.Credential)
+	addMeta(m, "designations", e.rec.Designations...)
+	addMeta(m, "standard_rate", e.rec.StandardRate)
+	if e.fetched() {
+		for _, label := range e.prof.Fields.labels {
+			if icfContactLabels[label] {
+				continue
+			}
+			addMeta(m, icfLabelColumn(label), e.prof.Fields.vals[label]...)
+		}
+	}
+	return m
 }
 
 const (
@@ -154,6 +239,7 @@ func aceListings(dir string, res *countryResolver) ([]Listing, error) {
 			Address: p.Address, Location: strings.Join(loc, ", "), City: city,
 			Description: firstNonEmpty(p.About, clean(l.str("DescriptionForWeb"))),
 			RawCountry:  clean(l.str("CountryName")), Social: social,
+			Meta: aceMeta(e),
 		}
 		if p.Website != "" {
 			x.Website = withScheme(p.Website)
@@ -194,6 +280,7 @@ func icfListings(dir string, res *countryResolver) ([]Listing, error) {
 			Website: profileURL, Location: location, City: icfCity(location, matched),
 			Description: firstNonEmpty(clean(rec.Description), clean(rec.Headline)),
 			RawCountry:  matched, Social: map[string]string{},
+			Meta: icfMeta(e),
 		}
 		if e.fetched() {
 			x.Phone = clean(e.prof.Phone)
@@ -285,6 +372,38 @@ func PrintStats(w io.Writer, source string, ls []Listing) {
 	sort.Strings(nk)
 	for _, k := range nk {
 		fmt.Fprintf(w, "niche %-10s %d\n", k, niche[k])
+	}
+
+	type metaStat struct {
+		listings, values int
+		distinct         map[string]bool
+	}
+	meta := map[string]*metaStat{}
+	for _, l := range ls {
+		for k, vals := range l.Meta {
+			if len(vals) == 0 {
+				continue
+			}
+			st := meta[k]
+			if st == nil {
+				st = &metaStat{distinct: map[string]bool{}}
+				meta[k] = st
+			}
+			st.listings++
+			st.values += len(vals)
+			for _, v := range vals {
+				st.distinct[v] = true
+			}
+		}
+	}
+	var mk []string
+	for k := range meta {
+		mk = append(mk, k)
+	}
+	sort.Strings(mk)
+	for _, k := range mk {
+		st := meta[k]
+		fmt.Fprintf(w, "meta %-40s listings %d, values %d, distinct %d\n", k, st.listings, st.values, len(st.distinct))
 	}
 }
 
@@ -391,12 +510,40 @@ func upsert(ctx context.Context, db *sql.DB, l Listing) error {
 			return fmt.Errorf("business_emails link: %w", err)
 		}
 	}
+
+	if len(l.Meta) > 0 {
+		var keys, mk, mv []string
+		for k, vals := range l.Meta {
+			keys = append(keys, k)
+			for _, v := range vals {
+				mk, mv = append(mk, k), append(mv, v)
+			}
+		}
+		// Per-key replace: the keys of this record are rewritten, keys it does
+		// not carry keep their old rows.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM business_meta WHERE business_id = $1 AND meta_key = ANY($2::text[])`,
+			bizID, pq.Array(keys)); err != nil {
+			return fmt.Errorf("business_meta delete: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO business_meta (business_id, meta_key, meta_value)
+			SELECT $1, k, v FROM unnest($2::text[], $3::text[]) AS t(k, v)
+			ON CONFLICT DO NOTHING`,
+			bizID, pq.Array(mk), pq.Array(mv)); err != nil {
+			return fmt.Errorf("business_meta insert: %w", err)
+		}
+	}
 	return tx.Commit()
 }
 
 // Load upserts the listings with loadWorkers concurrent transactions and
 // returns the process exit code. Re-running is idempotent.
 func Load(ctx context.Context, db *sql.DB, source string, ls []Listing) int {
+	if err := appdb.EnsureBusinessMeta(ctx, db); err != nil {
+		slog.Error("prodir: business_meta table", "error", err)
+		return ExitErrors
+	}
 	db.SetMaxOpenConns(loadWorkers + 2)
 	res := runPool(ctx, ls, loadWorkers, "load-"+source, 5000, func(ctx context.Context, l Listing) error {
 		if ctx.Err() != nil {

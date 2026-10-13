@@ -341,6 +341,7 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 		l.SocialLinks = json.RawMessage(socialLinksJSON)
 		l.Emails = []string{}
 		l.EmailsWithInfo = []V2EmailInfo{}
+		l.Meta = map[string][]string{}
 		// Prefer multi-phone array; fall back to single phone for old rows
 		// where the array column is empty (legacy data pre-2026-04-27).
 		if len(phones) > 0 {
@@ -412,6 +413,21 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 							listings[i].ValidEmailCount++
 						}
 					}
+				}
+			}
+		}
+	}
+
+	// Query 3: Batch-fetch business_meta for the same IDs.
+	if len(listingIDs) > 0 {
+		metaMap, err := fetchListingMeta(ctx, s.db, listingIDs)
+		if err != nil {
+			slog.Error("v2: meta fetch error", "error", err)
+			// Continue without meta — don't fail the whole response.
+		} else {
+			for i := range listings {
+				if m, ok := metaMap[listings[i].ID]; ok {
+					listings[i].Meta = m
 				}
 			}
 		}
@@ -857,4 +873,35 @@ func (s *Server) handleV2DeleteResults(w http.ResponseWriter, r *http.Request) {
 	}
 	n, _ := res.RowsAffected()
 	writeV2Single(w, map[string]int64{"deleted": n})
+}
+
+// fetchListingMeta returns business_meta grouped by business id and key, with
+// values in meta_value order. Listings without meta are absent from the map.
+func fetchListingMeta(ctx context.Context, db *sql.DB, ids []int64) (map[int64]map[string][]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT business_id, meta_key, meta_value
+		FROM business_meta
+		WHERE business_id = ANY($1)
+		ORDER BY business_id, meta_key, meta_value
+	`, pq.Array(ids))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64]map[string][]string)
+	for rows.Next() {
+		var id int64
+		var k, v string
+		if err := rows.Scan(&id, &k, &v); err != nil {
+			return nil, err
+		}
+		m := out[id]
+		if m == nil {
+			m = make(map[string][]string)
+			out[id] = m
+		}
+		m[k] = append(m[k], v)
+	}
+	return out, rows.Err()
 }

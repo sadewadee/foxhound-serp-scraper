@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -267,5 +268,114 @@ func TestOwnWebsiteScheme(t *testing.T) {
 	}
 	if withScheme("www.x.example") != "http://www.x.example" || withScheme("https://x.example") != "https://x.example" {
 		t.Error("withScheme")
+	}
+}
+
+func TestLoadMeta(t *testing.T) {
+	d := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_prodir_"}).DB()
+	defer d.Close()
+	if err := db.Migrate(d); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	// Migrate created the table and EnsureBusinessMeta is idempotent. Load must
+	// also create it when it is missing (a throwaway test DB, so removing it is
+	// safe).
+	if err := db.EnsureBusinessMeta(context.Background(), d); err != nil {
+		t.Fatalf("EnsureBusinessMeta twice: %v", err)
+	}
+	if _, err := d.Exec("DROP TABLE business_meta"); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeSyntheticState(t, dir)
+
+	loadAll := func() {
+		t.Helper()
+		for _, src := range []string{"ace", "icf"} {
+			ls, err := Listings(src, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code := Load(context.Background(), d, src, ls); code != ExitOK {
+				t.Fatalf("%s load exit code %d", src, code)
+			}
+		}
+	}
+	metaOf := func(domain string) map[string][]string {
+		t.Helper()
+		rows, err := d.Query(`SELECT m.meta_key, m.meta_value FROM business_meta m
+			JOIN business_listings bl ON bl.id = m.business_id WHERE bl.domain = $1
+			ORDER BY m.meta_key, m.meta_value`, domain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string][]string{}
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				t.Fatal(err)
+			}
+			out[k] = append(out[k], v)
+		}
+		return out
+	}
+
+	loadAll()
+	ace1 := metaOf("ace1.pro.acefitness.org")
+	if got := ace1["credential"]; !reflect.DeepEqual(got, []string{"ACE Certified Health Coach", "ACE Certified Personal Trainer"}) {
+		t.Errorf("ace1 credential = %v", got)
+	}
+	if got := ace1["areas_of_focus"]; !reflect.DeepEqual(got, []string{"Active Aging", "Strength Training", "Weight Management"}) {
+		t.Errorf("ace1 areas_of_focus = %v", got)
+	}
+	// List-only ACE record: credential only (from CertDisplay).
+	if got := metaOf("ace2.pro.acefitness.org"); !reflect.DeepEqual(got, map[string][]string{"credential": {"ACE Certified Health Coach"}}) {
+		t.Errorf("ace2 meta = %v", got)
+	}
+	// ICF fixtures carry no credential/designations/rate and no labels beyond
+	// the contact ones: no meta rows at all.
+	if got := metaOf("icf1.coach.coachingfederation.org"); len(got) != 0 {
+		t.Errorf("icf1 meta = %v, want none", got)
+	}
+
+	// A second identical load leaves the same rows.
+	total := count(t, d, `SELECT COUNT(*) FROM business_meta`)
+	if total == 0 {
+		t.Fatal("no business_meta rows written")
+	}
+	loadAll()
+	if n := count(t, d, `SELECT COUNT(*) FROM business_meta`); n != total {
+		t.Errorf("business_meta rows after reload = %d, want %d", n, total)
+	}
+
+	// A changed value list replaces that key's rows; a key the record no
+	// longer carries keeps its old rows.
+	l := Listing{
+		Domain: "ace1.pro.acefitness.org", URL: ACEBase + "/pro/AcE1/", Name: "Jane Q. Fixture", Category: aceCategory,
+		Niche: "fitness", Website: ACEBase + "/pro/AcE1/", Social: map[string]string{},
+		Meta: map[string][]string{"areas_of_focus": {"Nutrition"}, "brand_new_key": {"v1", "v2"}},
+	}
+	if code := Load(context.Background(), d, "ace", []Listing{l}); code != ExitOK {
+		t.Fatalf("reload exit code %d", code)
+	}
+	got := metaOf("ace1.pro.acefitness.org")
+	if !reflect.DeepEqual(got["areas_of_focus"], []string{"Nutrition"}) {
+		t.Errorf("areas_of_focus after replace = %v, want [Nutrition]", got["areas_of_focus"])
+	}
+	if !reflect.DeepEqual(got["brand_new_key"], []string{"v1", "v2"}) {
+		t.Errorf("brand_new_key = %v", got["brand_new_key"])
+	}
+	if !reflect.DeepEqual(got["credential"], ace1["credential"]) {
+		t.Errorf("credential (absent from the reload) = %v, want the old rows %v", got["credential"], ace1["credential"])
+	}
+	// An empty Meta touches nothing.
+	l.Meta = nil
+	before := count(t, d, `SELECT COUNT(*) FROM business_meta`)
+	if code := Load(context.Background(), d, "ace", []Listing{l}); code != ExitOK {
+		t.Fatalf("reload exit code %d", code)
+	}
+	if n := count(t, d, `SELECT COUNT(*) FROM business_meta`); n != before {
+		t.Errorf("rows after empty-Meta reload = %d, want %d", n, before)
 	}
 }

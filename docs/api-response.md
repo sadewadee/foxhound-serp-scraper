@@ -337,12 +337,22 @@ Query (semua optional, kecuali pagination):
         }
       ],
       "total_email_count": 1,
-      "valid_email_count": 1
+      "valid_email_count": 1,
+      "meta": {
+        "credential": ["ACE Certified Personal Trainer"],
+        "areas_of_focus": ["Strength Training", "Weight Management"]
+      }
     }
   ],
   "meta": {"page":1,"per_page":50,"total":500000,"total_pages":10000}
 }
 ```
+
+Catatan: `data[].meta` (di dalam tiap listing) berbeda dengan `meta` level atas
+(paginasi). `data[].meta` adalah object `key -> array string` dari tabel
+`business_meta` (label bawaan situs sumber, banyak value per key), selalu ada
+dan bernilai `{}` kalau listing tidak punya meta. Cursor mode juga
+mengembalikannya per listing.
 
 ### `GET /api/v2/results/stats`
 

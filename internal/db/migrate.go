@@ -2284,7 +2284,33 @@ func Migrate(db *sql.DB) error {
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("db: migration failed: %w", err)
 	}
+	if err := EnsureBusinessMeta(ctx, db); err != nil {
+		return err
+	}
 	return runMigrations(db)
+}
+
+// businessMetaDDL is the WordPress-postmeta-style key/value side table for
+// source-native labels (ACE credentials, ICF coaching themes, ...): one row per
+// value. No surrogate id and no extra index — the PK prefix serves the
+// per-listing read and nothing queries by key/value yet.
+const businessMetaDDL = `
+CREATE TABLE IF NOT EXISTS business_meta (
+    business_id BIGINT NOT NULL REFERENCES business_listings(id) ON DELETE CASCADE,
+    meta_key    TEXT NOT NULL,
+    meta_value  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (business_id, meta_key, meta_value)
+)`
+
+// EnsureBusinessMeta creates business_meta if missing. Migrate calls it right
+// after the schema; cmd/prodir load calls it too so a load works before the
+// stack has been redeployed. Idempotent.
+func EnsureBusinessMeta(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, businessMetaDDL); err != nil {
+		return fmt.Errorf("db: ensure business_meta: %w", err)
+	}
+	return nil
 }
 
 // categoryStatsRefreshInterval controls how often category_stats is rebuilt. The
