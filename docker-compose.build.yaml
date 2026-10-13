@@ -4,14 +4,14 @@
 # NO ROUTE FROM THE MAC, EVER (zero image bytes may transit the local machine):
 #   hachibi: cd /home/sadewa/serp-build && git fetch && git checkout -f feat/api-niche-classifier
 #   hachibi: docker compose -f docker-compose.build.yaml build
-#   hachibi: docker tag …:v0.9.16-niche localhost:32769/foxhound-serp-scraper:v0.9.16-niche
-#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.16-niche
+#   hachibi: docker tag …:v0.9.17-niche localhost:32769/foxhound-serp-scraper:v0.9.17-niche
+#   hachibi: docker push localhost:32769/foxhound-serp-scraper:v0.9.17-niche
 #          (push runs ON hachibi → no Traefik, no auth, no 60s upload timeout)
 # (Legacy kurama build path: docker save | gzip → scp kurama→hachibi → load → push.)
 #
 # Tag produced (foxhound v0.0.28 — REAL TLS-renegotiation panic fix per issue #43;
 # v0.0.22/v0.0.24 both still panicked. Plus niche feature):
-#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.16-niche
+#   ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.17-niche
 # v0.8.5-niche = v0.8.4-niche + port of #36 (v2 keyset cursor reachable #32 +
 #   honest reenrich healthcheck #28), cherry-picked from main onto the niche line.
 # v0.8.6-niche = v0.8.5-niche + #39 (drain stuck-processing queries backlog:
@@ -263,14 +263,25 @@
 #     restart guard vs pre-fetch browser). Activation checklist: docs/directory-datadome.md.
 #   • #68 CLAUDE.md: max_attempts defaults are serp 3 / enrich 5 (per migrate.go).
 #
-# Deploy: set IMAGE_TAG=v0.9.16-niche on the serp stack and redeploy.
+# v0.9.17-niche = v0.9.16 + ACE/ICF directory import + business_meta (#73):
+#   • cmd/prodir (separate binary, NOT part of this image): ACE Fitness "Find an ACE
+#     Pro" + ICF coach-finder crawlers; `load` upserts business_listings / emails /
+#     business_emails (category acefitness | icfcoaching, synthetic domains).
+#   • NEW table business_meta (business_id, meta_key, meta_value; one row per value)
+#     for site-native labels: credential, designations, coaching_themes,
+#     areas_of_focus, … Created by Migrate() and by `prodir load`. Additive: no
+#     trigger or existing-column change.
+#   • API: listings expose `meta` ({key: [values]}, {} when none) on
+#     GET /api/v2/results and the JSON download; CSV download unchanged.
+#
+# Deploy: set IMAGE_TAG=v0.9.17-niche on the serp stack and redeploy.
 
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.16-niche
+    image: ghcr.mcpke.dev/foxhound-serp-scraper:v0.9.17-niche
     # Override Dockerfile ENTRYPOINT so the container exits 0 once the image is
     # built (we only produce the image layer set here; we don't run the binary).
     entrypoint: [""]
