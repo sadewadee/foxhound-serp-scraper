@@ -379,3 +379,56 @@ func TestLoadMeta(t *testing.T) {
 		t.Errorf("rows after empty-Meta reload = %d, want %d", n, before)
 	}
 }
+
+func TestLoadEmailsPhones(t *testing.T) {
+	d := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_prodir_"}).DB()
+	defer d.Close()
+	if err := db.Migrate(d); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	l := Listing{
+		Domain: "ace9.pro.acefitness.org", URL: ACEBase + "/pro/AcE9/", Name: "Fixture Nine", Category: aceCategory,
+		Niche: "fitness", Website: "http://someone@fixture.example", Social: map[string]string{},
+		Emails: []string{"one@fixture.example", "two@gmail.com"},
+		Phones: []string{"(555) 010-0199", "555.010.0142"},
+	}
+	load := func() {
+		t.Helper()
+		if code := Load(context.Background(), d, "ace", []Listing{l}); code != ExitOK {
+			t.Fatalf("load exit code %d", code)
+		}
+	}
+	state := func() (emails, links int, phone string, phones string, website string) {
+		t.Helper()
+		emails = count(t, d, `SELECT COUNT(*) FROM emails`)
+		links = count(t, d, `SELECT COUNT(*) FROM business_emails`)
+		var ph sql.NullString
+		var arr pq.StringArray
+		if err := d.QueryRow(`SELECT phone, phones, website FROM business_listings WHERE domain=$1`, l.Domain).Scan(&ph, &arr, &website); err != nil {
+			t.Fatal(err)
+		}
+		return emails, links, ph.String, strings.Join(arr, "|"), website
+	}
+	load()
+	e, k, phone, phones, website := state()
+	if e != 2 || k != 2 || phone != "(555) 010-0199" || phones != "(555) 010-0199|555.010.0142" || website != "http://someone@fixture.example" {
+		t.Errorf("after load: emails=%d links=%d phone=%q phones=%q website=%q", e, k, phone, phones, website)
+	}
+	var free bool
+	if err := d.QueryRow(`SELECT free_email FROM emails WHERE email='two@gmail.com'`).Scan(&free); err != nil || !free {
+		t.Errorf("gmail.com free_email = %v, %v", free, err)
+	}
+
+	load() // idempotent
+	if e2, k2, p2, ps2, w2 := state(); e2 != e || k2 != k || p2 != phone || ps2 != phones || w2 != website {
+		t.Errorf("reload changed state: %d %d %q %q %q", e2, k2, p2, ps2, w2)
+	}
+
+	// The website used to be an email-shaped URL; now it is the profile URL.
+	l.Website = ACEBase + "/pro/AcE9/"
+	l.Phones = nil // an empty list never blanks the stored numbers
+	load()
+	if _, _, phone, phones, website = state(); website != l.Website || phones != "(555) 010-0199|555.010.0142" || phone != "(555) 010-0199" {
+		t.Errorf("after fix: website=%q phone=%q phones=%q", website, phone, phones)
+	}
+}

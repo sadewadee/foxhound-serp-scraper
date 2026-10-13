@@ -29,8 +29,11 @@
 //     Coaches) | 'coaching' (ICF); off_niche=false; synthetic unique domain
 //     "<id>.pro.acefitness.org" | "<key>.coach.coachingfederation.org";
 //     country/country_code only from the curated country whitelist.
-//   - emails            ← ICF email (UNIQUE email); ACE exposes none
-//   - business_emails   ← link, source='icfcoaching'
+//   - emails            ← every email found: the ICF Email value, free text in
+//     profiles / descriptions, an email typed into the ACE website field
+//   - business_emails   ← link per email, source=category
+//   - phones, social_links, website, meta other_websites / street_address ←
+//     contact details found in the same text (internal/prodir/extract.go)
 //   - business_meta     ← site-native labels as (business_id, meta_key, meta_value)
 //     rows, one per value, rewritten per key on every load (a key the record
 //     does not carry keeps its old rows). ACE keys: credential (split on ";"

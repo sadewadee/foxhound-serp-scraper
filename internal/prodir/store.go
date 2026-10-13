@@ -24,9 +24,57 @@ type Listing struct {
 	Description                             string
 	RawCountry, Country, CountryCode        string // Country/CountryCode empty = unresolved
 	Social                                  map[string]string
-	Email                                   string // lower-cased; empty = none
+	Emails                                  []string // lower-cased
+	Phones                                  []string // primary first; Phone is Phones[0]
 	OwnWebsite                              bool
 	Meta                                    map[string][]string // business_meta: key -> values
+}
+
+// addString appends v unless it is already in list.
+func addString(list []string, v string) []string {
+	for _, have := range list {
+		if have == v {
+			return list
+		}
+	}
+	return append(list, v)
+}
+
+// addPhones appends the non-empty phones whose digits are not in list yet.
+func addPhones(list []string, ps ...string) []string {
+	for _, p := range ps {
+		if p = clean(p); p != "" {
+			list = addPhone(list, p)
+		}
+	}
+	return list
+}
+
+// sameSite compares two URLs ignoring scheme, "www." and a trailing slash.
+func sameSite(a, b string) bool {
+	norm := func(u string) string {
+		u = strings.ToLower(aceSchemeRe.ReplaceAllString(strings.ToLower(clean(u)), ""))
+		return strings.TrimSuffix(strings.TrimPrefix(u, "www."), "/")
+	}
+	return norm(a) == norm(b)
+}
+
+// setWebsites decides the website column: the structured own site if there is
+// one, else the first site found in the text. The other sites found go to the
+// other_websites meta key. With neither, Website stays the profile URL.
+func (l *Listing) setWebsites(own string, found []string) {
+	own = clean(own)
+	if own == "" && len(found) > 0 {
+		own, found = found[0], found[1:]
+	}
+	if own != "" {
+		l.Website, l.OwnWebsite = withScheme(own), true
+	}
+	for _, w := range found {
+		if !sameSite(w, own) {
+			addMeta(l.Meta, "other_websites", w)
+		}
+	}
 }
 
 // addMeta appends vals under key: cleaned, empties dropped, duplicates (within
@@ -234,15 +282,41 @@ func aceListings(dir string, res *countryResolver) ([]Listing, error) {
 		x := Listing{
 			Domain: strings.ToLower(e.id) + ".pro.acefitness.org", URL: profileURL,
 			Name: name, Category: aceCategory,
-			Niche: aceNiche(firstNonEmpty(p.Credentials, l.str("CertDisplay"))),
-			Phone: p.Phone, Website: profileURL, OwnWebsite: p.Website != "",
+			Niche:   aceNiche(firstNonEmpty(p.Credentials, l.str("CertDisplay"))),
+			Website: profileURL,
 			Address: p.Address, Location: strings.Join(loc, ", "), City: city,
 			Description: firstNonEmpty(p.About, clean(l.str("DescriptionForWeb"))),
 			RawCountry:  clean(l.str("CountryName")), Social: social,
 			Meta: aceMeta(e),
 		}
-		if p.Website != "" {
-			x.Website = withScheme(p.Website)
+
+		// Everything the pro wrote anywhere in the profile: text and link targets.
+		var text strings.Builder
+		for _, t := range e.toks {
+			text.WriteString(t.Text + "\n")
+			for _, lk := range t.Links {
+				text.WriteString(lk.Href + "\n")
+			}
+		}
+		text.WriteString(clean(l.str("DescriptionForWeb")))
+		fd := extractContacts(text.String())
+
+		x.Emails = fd.Emails
+		x.Phones = addPhones(nil, p.Phone)
+		x.Phones = addPhones(x.Phones, fd.Phones...)
+		for plat, u := range fd.Social {
+			if social[plat] == "" && !aceCorporateRe.MatchString(strings.ToLower(u)) {
+				social[plat] = u
+			}
+		}
+		// The own website field sometimes holds an email instead of a site.
+		own := p.Website
+		if len(extractContacts(own).Emails) > 0 {
+			own = ""
+		}
+		x.setWebsites(own, fd.Websites)
+		for _, a := range fd.Addresses {
+			addMeta(x.Meta, "street_address", a)
 		}
 		x.Country, x.CountryCode = res.resolve(x.RawCountry)
 		out = append(out, x)
@@ -282,15 +356,34 @@ func icfListings(dir string, res *countryResolver) ([]Listing, error) {
 			RawCountry:  matched, Social: map[string]string{},
 			Meta: icfMeta(e),
 		}
+		var own string
+		var fieldText []string
 		if e.fetched() {
-			x.Phone = clean(e.prof.Phone)
-			if w := clean(e.prof.Website); w != "" {
-				x.Website, x.OwnWebsite = withScheme(w), true
+			x.Phones = splitICFPhone(e.prof.Phone)
+			if w := clean(e.prof.Website); socialPlatform(w) != "" {
+				x.Social[socialPlatform(w)] = withScheme(w) // a profile link typed into Web Site
+			} else {
+				own = w
 			}
-			if em := strings.ToLower(clean(e.prof.Email)); strings.Contains(em, "@") {
-				x.Email = em
+			fieldText = append(fieldText, e.prof.Email)
+			for _, label := range e.prof.Fields.labels {
+				fieldText = append(fieldText, e.prof.Fields.vals[label]...)
 			}
 		}
+		x.Emails = extractContacts(strings.Join(fieldText, "\n")).Emails
+
+		// The list-level description / headline are free text too.
+		fd := extractContacts(rec.Description + "\n" + rec.Headline)
+		for _, em := range fd.Emails {
+			x.Emails = addString(x.Emails, em)
+		}
+		x.Phones = addPhones(x.Phones, fd.Phones...)
+		for plat, u := range fd.Social {
+			if x.Social[plat] == "" {
+				x.Social[plat] = u
+			}
+		}
+		x.setWebsites(own, fd.Websites)
 		x.Country, x.CountryCode = res.resolve(matched)
 		out = append(out, x)
 	}
@@ -315,13 +408,23 @@ func icfCity(location, country string) string {
 // PrintStats reports what a load would write, without a database.
 func PrintStats(w io.Writer, source string, ls []Listing) {
 	var email, phone, own, haveCountry, resolved int
+	var emailTotal, multiEmail, phoneTotal int
+	social := map[string]int{}
 	niche := map[string]int{}
 	unresolved := map[string]int{}
 	for _, l := range ls {
-		if l.Email != "" {
+		if len(l.Emails) > 0 {
 			email++
 		}
-		if l.Phone != "" {
+		if len(l.Emails) > 1 {
+			multiEmail++
+		}
+		emailTotal += len(l.Emails)
+		phoneTotal += len(l.Phones)
+		for plat := range l.Social {
+			social[plat]++
+		}
+		if len(l.Phones) > 0 {
 			phone++
 		}
 		if l.OwnWebsite {
@@ -346,7 +449,9 @@ func PrintStats(w io.Writer, source string, ls []Listing) {
 	fmt.Fprintf(w, "source: %s (dry run — nothing written)\n", source)
 	fmt.Fprintf(w, "records:          %d\n", len(ls))
 	fmt.Fprintf(w, "with email:       %d (%s)\n", email, pct(email, len(ls)))
+	fmt.Fprintf(w, "emails total:     %d (%d listings with more than one)\n", emailTotal, multiEmail)
 	fmt.Fprintf(w, "with phone:       %d (%s)\n", phone, pct(phone, len(ls)))
+	fmt.Fprintf(w, "phones total:     %d\n", phoneTotal)
 	fmt.Fprintf(w, "with own website: %d (%s)\n", own, pct(own, len(ls)))
 	fmt.Fprintf(w, "country value:   %d records; resolved %d (%s), unresolved %d\n",
 		haveCountry, resolved, pct(resolved, haveCountry), haveCountry-resolved)
@@ -372,6 +477,15 @@ func PrintStats(w io.Writer, source string, ls []Listing) {
 	sort.Strings(nk)
 	for _, k := range nk {
 		fmt.Fprintf(w, "niche %-10s %d\n", k, niche[k])
+	}
+
+	var sk []string
+	for k := range social {
+		sk = append(sk, k)
+	}
+	sort.Strings(sk)
+	for _, k := range sk {
+		fmt.Fprintf(w, "social %-10s %d\n", k, social[k])
 	}
 
 	type metaStat struct {
@@ -447,7 +561,7 @@ INSERT INTO business_listings
    phone, phones, website, address, location, city, country, country_code,
    description, social_links, re_enriched_at, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6, false,
-   NULLIF($7::text,''), CASE WHEN $7::text = '' THEN '{}'::text[] ELSE ARRAY[$7::text] END,
+   NULLIF($7::text,''), COALESCE($16::text[], '{}'::text[]),
    $8, NULLIF($9::text,''), NULLIF($10::text,''), NULLIF($11::text,''),
    NULLIF($12::text,''), NULLIF($13::text,'')::char(2),
    NULLIF($14::text,''), $15::jsonb, NOW(), NOW(), NOW())
@@ -483,23 +597,37 @@ func upsert(ctx context.Context, db *sql.DB, l Listing) error {
 	}
 	defer tx.Rollback()
 
+	// phone is the primary number: Phones[0], else the single Phone.
+	phones := l.Phones
+	if len(phones) == 0 && l.Phone != "" {
+		phones = []string{l.Phone}
+	}
+	primary := ""
+	if len(phones) > 0 {
+		primary = phones[0]
+	}
+
 	var bizID int64
 	if err := tx.QueryRowContext(ctx, upsertListingSQL,
 		l.Domain, l.URL, l.Name, l.Name, l.Category, l.Niche,
-		l.Phone, l.Website, l.Address, l.Location, l.City, l.Country, l.CountryCode,
-		l.Description, string(social),
+		primary, l.Website, l.Address, l.Location, l.City, l.Country, l.CountryCode,
+		l.Description, string(social), pq.Array(phones),
 	).Scan(&bizID); err != nil {
 		return fmt.Errorf("business_listings upsert: %w", err)
 	}
 
-	if at := strings.LastIndex(l.Email, "@"); at >= 1 {
-		domain := l.Email[at+1:]
+	for _, email := range l.Emails {
+		at := strings.LastIndex(email, "@")
+		if at < 1 {
+			continue
+		}
+		domain := email[at+1:]
 		var emailID int64
 		if err := tx.QueryRowContext(ctx, `
 			INSERT INTO emails (email, domain, local_part, free_email, created_at)
 			VALUES ($1,$2,$3,$4,NOW())
 			ON CONFLICT (email) DO UPDATE SET domain = EXCLUDED.domain
-			RETURNING id`, l.Email, domain, l.Email[:at], freeMail[domain],
+			RETURNING id`, email, domain, email[:at], freeMail[domain],
 		).Scan(&emailID); err != nil {
 			return fmt.Errorf("emails upsert: %w", err)
 		}
