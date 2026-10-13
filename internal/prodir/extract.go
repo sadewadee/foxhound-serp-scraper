@@ -33,6 +33,9 @@ var (
 	// handle belongs to the last platform word before the @
 	extHandleRe   = regexp.MustCompile(`(?i)\b(?:instagram|insta|ig|tik ?tok|twitter|facebook|fb|youtube)\b[^@\n]{0,25}@([a-z0-9_][a-z0-9_.]*)`)
 	extPlatformRe = regexp.MustCompile(`(?i)\b(?:instagram|insta|ig|tik ?tok|twitter|facebook|fb|youtube)\b`)
+	// what follows a handle that is really a page name, and a platform word right after it
+	extPageNameRe      = regexp.MustCompile(`^ +& +`)
+	extPlatformStartRe = regexp.MustCompile(`(?i)^(?:instagram|insta|ig|tik ?tok|twitter|facebook|fb|youtube)\b`)
 
 	// Phone candidates: "(555) 010-0199" / "(555)010-0199", "+<digits>" with few
 	// separators, or a leading group followed by 2-5 separated groups
@@ -80,9 +83,12 @@ func urlHost(u string) string {
 // validHost needs hostname characters, a dot and an alphabetic TLD.
 func validHost(h string) bool {
 	for _, r := range h {
-		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '.') {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '.' || r == '_') {
 			return false
 		}
+	}
+	if strings.HasPrefix(h, "www.") && !strings.Contains(h[4:], ".") {
+		return false // "www.Name": a www. host needs a real domain behind it
 	}
 	i := strings.LastIndex(h, ".")
 	if i < 1 || len(h)-i-1 < 2 {
@@ -186,8 +192,19 @@ func extractContacts(text string) found {
 	// Handles next, cut out too ("@fixture.coach" is not a ".coach" domain);
 	// they only fill platforms no URL claimed.
 	handles := map[string]string{}
-	text = extHandleRe.ReplaceAllStringFunc(text, func(m string) string {
-		h := strings.TrimRight(extHandleRe.FindStringSubmatch(m)[1], ".")
+	var cut strings.Builder
+	last := 0
+	for _, loc := range extHandleRe.FindAllStringSubmatchIndex(text, -1) {
+		cut.WriteString(text[last:loc[0]])
+		cut.WriteByte(' ')
+		last = loc[1]
+		m := text[loc[0]:loc[1]]
+		h := strings.TrimRight(text[loc[2]:loc[3]], ".")
+		// "FB@Fixture & Mind Studio": a name with spaces, not a handle (unless
+		// a platform word follows the "&": "IG @a & Twitter @b").
+		if after := extPageNameRe.FindString(text[loc[1]:]); after != "" && !extPlatformStartRe.MatchString(text[loc[1]+len(after):]) {
+			continue
+		}
 		words := extPlatformRe.FindAllString(m[:strings.Index(m, "@")], -1)
 		var p, u string
 		switch strings.ToLower(strings.ReplaceAll(words[len(words)-1], " ", "")) {
@@ -205,13 +222,17 @@ func extractContacts(text string) found {
 		if p != "" && h != "" && handles[p] == "" {
 			handles[p] = u
 		}
-		return " "
-	})
+	}
+	cut.WriteString(text[last:])
+	text = cut.String()
 
 	// URLs, cut out as well so their digits are not read as phones.
 	var addURL func(m string)
 	addURL = func(m string) {
 		u := strings.TrimRight(m, ".,;:!?")
+		if strings.HasPrefix(aceSchemeRe.ReplaceAllString(strings.ToLower(u), ""), "@") {
+			return // "http://@fixture.handle": a handle, not a site
+		}
 		host := urlHost(u)
 		if !validHost(host) {
 			// "http://www,site.com", "http://?www.site.com": look for the real site inside

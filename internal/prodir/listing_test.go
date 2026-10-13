@@ -107,7 +107,8 @@ func TestACEListingsExtract(t *testing.T) {
 	}
 
 	a3 := by["ace3.pro.acefitness.org"]
-	if a3.Website != "http://fixture-text.com" || !a3.OwnWebsite || len(a3.Meta["other_websites"]) != 0 {
+	// a site mentioned in the text is never the pro's own website
+	if a3.Website != ACEBase+"/pro/AcE3/" || a3.OwnWebsite || !reflect.DeepEqual(a3.Meta["other_websites"], []string{"http://fixture-text.com"}) {
 		t.Errorf("ace3 website = %q own=%v other=%v", a3.Website, a3.OwnWebsite, a3.Meta["other_websites"])
 	}
 }
@@ -153,14 +154,14 @@ func TestICFListingsExtract(t *testing.T) {
 	if !reflect.DeepEqual(i2.Emails, []string{"list@fixture.example"}) || !reflect.DeepEqual(i2.Phones, []string{"+1 555 010 0177"}) {
 		t.Errorf("icf2 emails=%v phones=%v", i2.Emails, i2.Phones)
 	}
-	// description is scanned before headline, so its site comes first
-	if i2.Website != "http://other-list.com" || !i2.OwnWebsite {
+	// sites in description / headline are never the website column
+	if i2.Website != icfProfileURL("IcF2") || i2.OwnWebsite {
 		t.Errorf("icf2 website = %q own=%v", i2.Website, i2.OwnWebsite)
 	}
 	if i2.Social["linkedin"] != "https://www.linkedin.com/in/fixture-two" {
 		t.Errorf("icf2 linkedin = %v", i2.Social)
 	}
-	if got := i2.Meta["other_websites"]; !reflect.DeepEqual(got, []string{"http://www.fixture-list.com"}) {
+	if got := i2.Meta["other_websites"]; !reflect.DeepEqual(got, []string{"http://other-list.com", "http://www.fixture-list.com"}) {
 		t.Errorf("icf2 other_websites = %v", got)
 	}
 }
@@ -194,6 +195,22 @@ func TestACEWebsiteField(t *testing.T) {
 		{"http://https//www.fixture-a.com", "http://www.fixture-a.com", nil, nil},
 		{"http://Ihttp://fixture-a.wix.com/fit", "http://fixture-a.wix.com/fit", nil, nil},
 		{"http://www.fixture-a.com.", "http://www.fixture-a.com", nil, nil},
+		// junk before the first site: somebody else's domain
+		{"http://fixture fitness.com", "", nil, nil},
+		{"http://unveiling fixture.com", "", nil, nil},
+		{"http://www.FixtureName's Work-Out.com", "", nil, nil},
+		{"http://www.fixturename coach.com", "", nil, nil},
+		{"http://www.fixturename .com", "", nil, nil},
+		{"http://www.FixtureFellowshipOf Fitness", "", nil, nil},
+		{"http://www.fixturename centres", "", nil, nil},
+		{"http://www.FixtureName", "", nil, nil},
+		{"http://@fixture.handle.xx", "", nil, nil},
+		{"http://@fixture.handle.com", "", nil, nil},
+		{"http://www. fixture-a.com", "http://www.fixture-a.com", nil, nil},
+		{"http://tp://www.fixture-a.com", "http://www.fixture-a.com", nil, nil},
+		{"http://https:\\\\www.fixture-a.com", "http://www.fixture-a.com", nil, nil},
+		{"http://www.fixture_name.com", "http://www.fixture_name.com", nil, nil},
+		{"http://www.fixture.app/@user", "http://www.fixture.app/@user", nil, nil},
 		// a social page typed into the website field
 		{"http://http:/www.facebook.com/fixturepage", "", nil, map[string]string{"facebook": "http://www.facebook.com/fixturepage"}},
 		{"http://www.facebook.com/fixturepage", "", nil, map[string]string{"facebook": "http://www.facebook.com/fixturepage"}},
@@ -287,5 +304,31 @@ func TestICFListingsRound2(t *testing.T) {
 	}
 	if len(i1.Phones) != 0 || len(i1.Social) != 0 || i1.OwnWebsite {
 		t.Errorf("icf1 phones=%v social=%v own=%v, want none", i1.Phones, i1.Social, i1.OwnWebsite)
+	}
+}
+
+func TestACEWebsiteFieldEmail(t *testing.T) {
+	for _, in := range []string{"http://someone@fixture.example", "http://email: someone@fixture.example"} {
+		own, f := aceWebsiteField(in)
+		if own != "" || !reflect.DeepEqual(f.Emails, []string{"someone@fixture.example"}) {
+			t.Errorf("%q: own=%q emails=%v", in, own, f.Emails)
+		}
+	}
+}
+
+func TestACEFieldNotScannedTwice(t *testing.T) {
+	dir := t.TempDir()
+	writeLines(t, filepath.Join(dir, "ace_list.jsonl"),
+		`{"EncryptedCustomerNumber":"AcE1","ProfileURL":"/pro/AcE1/","FullName":"Fixture AcE1","City":"Exampleville","StateCode":"NY","CountryName":"US","CertDisplay":"ACE Certified Personal Trainer","_page":1}`)
+	writeACEToks(t, dir, map[string][]Token{
+		"AcE1": {{Kind: "h2", Text: "Name"}, {Kind: "text", Text: "EXAMPLEVILLE, NY US 10001\nhttp://fixture fitness.com\n", Links: []Link{{"http://fixture fitness.com", "w"}}},
+			{Kind: "hr"}, {Kind: "h4", Text: "About"}, {Kind: "text", Text: "Bio."}},
+	})
+	ls, err := Listings("ace", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := ls[0]; l.OwnWebsite || len(l.Meta["other_websites"]) != 0 {
+		t.Errorf("website=%q own=%v other=%v, want the junk field found nowhere", l.Website, l.OwnWebsite, l.Meta["other_websites"])
 	}
 }

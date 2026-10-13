@@ -73,10 +73,12 @@ func mergeSocial(dst, src map[string]string) {
 var aceHTTPRe = regexp.MustCompile(`(?i)^https?://`)
 
 // aceWebsiteField reads the ACE Website value. The site prepends "http://" to
-// whatever was typed, so it can hold a handle, a profile page, two sites or no
-// site at all. A value that already is one plain URL is the own website as is;
-// anything else is scanned like free text: the first site found is the own
-// website, the rest and any social links come back in found.
+// whatever was typed, so it can hold a handle, a profile page, two sites, an
+// email or no site at all. A value that already is one plain URL is the own
+// website as is; anything else is scanned like free text. A site only counts
+// when nothing but glued junk comes before the first one ("fixture fitness.com"
+// is not fitness.com); the first site found is the own website, f carries the
+// rest plus any emails and social links.
 func aceWebsiteField(v string) (own string, f found) {
 	v = clean(v)
 	if v == "" {
@@ -85,26 +87,32 @@ func aceWebsiteField(v string) (own string, f found) {
 	if !strings.ContainsAny(v, " \t@,;") && validHost(urlHost(v)) && socialPlatform(v) == "" {
 		return v, found{}
 	}
-	f = extractContacts(aceHTTPRe.ReplaceAllString(v, ""))
+	rest := aceHTTPRe.ReplaceAllString(v, "")
+	if len(rest) > 4 && strings.EqualFold(rest[:5], "www. ") {
+		rest = "www." + strings.TrimLeft(rest[5:], " ") // a lone "www. " before the domain
+	}
+	f = extractContacts(rest)
+	first, _, _ := strings.Cut(rest, " ")
+	if len(extractContacts(first).Websites) == 0 || strings.HasPrefix(rest, "@") {
+		f.Websites = nil
+	}
 	if len(f.Websites) > 0 {
 		own, f.Websites = f.Websites[0], f.Websites[1:]
 	}
 	return own, f
 }
 
-// setWebsites decides the website column: the structured own site if there is
-// one, else the first site found in the text. The other sites found go to the
-// other_websites meta key. With neither, Website stays the profile URL.
+// setWebsites decides the website column: only the structured own site, else
+// Website stays the profile URL. Every site found in free text goes to the
+// other_websites meta key, except the own site itself: a bio that mentions a
+// magazine is not the pro's website.
 func (l *Listing) setWebsites(own string, sites []string) {
 	own = clean(own)
-	if own == "" && len(sites) > 0 {
-		own, sites = sites[0], sites[1:]
-	}
 	if own != "" {
 		l.Website, l.OwnWebsite = withScheme(own), true
 	}
 	for _, w := range sites {
-		if !sameSite(w, own) {
+		if own == "" || !sameSite(w, own) {
 			addMeta(l.Meta, "other_websites", w)
 		}
 	}
@@ -324,11 +332,19 @@ func aceListings(dir string, res *countryResolver) ([]Listing, error) {
 		}
 
 		// Everything the pro wrote anywhere in the profile: text and link targets.
+		// The Website field is scanned on its own below, not as free text.
+		field := clean(p.Website)
 		var text strings.Builder
 		for _, t := range e.toks {
-			text.WriteString(t.Text + "\n")
+			for _, ln := range strings.Split(t.Text, "\n") {
+				if field == "" || clean(ln) != field {
+					text.WriteString(ln + "\n")
+				}
+			}
 			for _, lk := range t.Links {
-				text.WriteString(lk.Href + "\n")
+				if field == "" || clean(lk.Href) != field {
+					text.WriteString(lk.Href + "\n")
+				}
 			}
 		}
 		text.WriteString(clean(l.str("DescriptionForWeb")))
@@ -337,10 +353,13 @@ func aceListings(dir string, res *countryResolver) ([]Listing, error) {
 		x.Emails = fd.Emails
 		x.Phones = addPhones(nil, structuredPhone(p.Phone))
 		x.Phones = addPhones(x.Phones, fd.Phones...)
-		own, field := aceWebsiteField(p.Website)
-		mergeSocial(social, field.Social)
+		own, wf := aceWebsiteField(p.Website)
+		for _, em := range wf.Emails {
+			x.Emails = addString(x.Emails, em)
+		}
+		mergeSocial(social, wf.Social)
 		mergeSocial(social, fd.Social)
-		x.setWebsites(own, append(field.Websites, fd.Websites...))
+		x.setWebsites(own, append(wf.Websites, fd.Websites...))
 		address := strings.ToLower(clean(p.Address))
 		for _, a := range fd.Addresses {
 			if !strings.Contains(address, strings.ToLower(a)) { // already in the contact block

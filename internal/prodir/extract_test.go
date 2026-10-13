@@ -200,3 +200,30 @@ func TestStructuredEmailKeepsOwnDomain(t *testing.T) {
 		t.Errorf("free text must still drop the directory's own domain: %v", got)
 	}
 }
+
+func TestExtractHandlePageName(t *testing.T) {
+	f := extractContacts("FB@Fixture & Mind Studio ~ Instagram@fixturestudio")
+	if len(f.Social) != 1 || f.Social["instagram"] != "https://www.instagram.com/fixturestudio" {
+		t.Errorf("page name: social=%v, want only the instagram handle", f.Social)
+	}
+	f = extractContacts("IG @fixture_a & Twitter @fixture_b")
+	if f.Social["instagram"] == "" || f.Social["twitter"] == "" {
+		t.Errorf("two platforms: social=%v", f.Social)
+	}
+}
+
+func TestExtractURLValidityRound3(t *testing.T) {
+	for _, in := range []string{"http://www.FixtureName", "see http://@fixture.handle.xx", "www.FixtureName"} {
+		if f := extractContacts(in); len(f.Websites) != 0 {
+			t.Errorf("%q: websites=%v, want none", in, f.Websites)
+		}
+	}
+	for _, c := range []struct{ in, want string }{
+		{"https://www.fixture.app/@user", "https://www.fixture.app/@user"},
+		{"http://www.fixture_name.com", "http://www.fixture_name.com"},
+	} {
+		if f := extractContacts(c.in); len(f.Websites) != 1 || f.Websites[0] != c.want {
+			t.Errorf("%q: websites=%v, want %s", c.in, f.Websites, c.want)
+		}
+	}
+}
