@@ -741,6 +741,7 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 			l.SocialLinks = json.RawMessage(socialLinksJSON)
 			l.Emails = []string{}
 			l.EmailsWithInfo = []V2EmailInfo{}
+			l.Meta = map[string][]string{}
 			if len(phones) > 0 {
 				l.Phones = []string(phones)
 			} else if phone != "" {
@@ -795,6 +796,21 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 						if e.Status == "valid" {
 							batch[i].ValidEmailCount++
 						}
+					}
+				}
+			}
+		}
+
+		// Batch-fetch business_meta (JSON only: the CSV has no meta column).
+		if format == "json" {
+			metaMap, err := fetchListingMeta(ctx, s.db, batchIDs)
+			if err != nil {
+				slog.Error("v2: download meta fetch error", "error", err)
+				// Continue without meta — don't abort the stream.
+			} else {
+				for i := range batch {
+					if m, ok := metaMap[batch[i].ID]; ok {
+						batch[i].Meta = m
 					}
 				}
 			}

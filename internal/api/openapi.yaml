@@ -744,7 +744,6 @@ components:
         meta:
           type: object
           description: >-
-            Label bertipe key/value dari tabel business_meta (mis. credential,
-            years_in_industry). Setiap key punya satu atau lebih value; {}
-            kalau listing tidak punya meta.
+            Key/value labels from business_meta. Each key holds one or more
+            values; {} when the listing has none.
           additionalProperties: { type: array, items: { type: string } }
