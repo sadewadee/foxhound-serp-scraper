@@ -332,3 +332,35 @@ func TestACEFieldNotScannedTwice(t *testing.T) {
 		t.Errorf("website=%q own=%v other=%v, want the junk field found nowhere", l.Website, l.OwnWebsite, l.Meta["other_websites"])
 	}
 }
+
+func TestICFWebSiteHostValidated(t *testing.T) {
+	dir := t.TempDir()
+	b, _ := os.ReadFile("testdata/icf_countries.json")
+	if err := os.WriteFile(filepath.Join(dir, "icf_countries.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sites := map[string]string{
+		"IcF1": "http://www.fixturename", "IcF2": "http://www.com", "IcF3": "https://www.linkedin/in/fixture_name",
+		"IcF4": "http://www.fixturename/some/path", "IcF5": "http://www.fixture_name.com",
+	}
+	var list, profs []string
+	for k, w := range sites {
+		list = append(list, `{"key":"`+k+`","fullName":"Coach","location":"Exampletown, NY UNITED STATES"}`)
+		profs = append(profs, `{"key":"`+k+`","url":"u","fields":{},"email":"","phone":"","website":"`+w+`","location":""}`)
+	}
+	writeLines(t, filepath.Join(dir, "icf_list.jsonl"), list...)
+	writeLines(t, filepath.Join(dir, "icf_profiles.jsonl"), profs...)
+	ls, err := Listings("icf", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range ls {
+		own := x.OwnWebsite
+		if want := x.Domain == "icf5.coach.coachingfederation.org"; own != want {
+			t.Errorf("%s: own=%v website=%q", x.Domain, own, x.Website)
+		}
+		if !own && x.Website != x.URL {
+			t.Errorf("%s: website=%q, want the profile URL", x.Domain, x.Website)
+		}
+	}
+}

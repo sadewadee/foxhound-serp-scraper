@@ -412,7 +412,7 @@ func icfListings(dir string, res *countryResolver) ([]Listing, error) {
 				if socialProfile(w) { // a profile link typed into Web Site
 					x.Social[socialPlatform(w)] = withScheme(w)
 				}
-			} else {
+			} else if validHost(urlHost(w)) { // not "http://www.fixturename"
 				own = w
 			}
 			// The Email field is authoritative: its address stays even at the
