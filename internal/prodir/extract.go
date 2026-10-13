@@ -25,14 +25,23 @@ var (
 	extEmailRe  = regexp.MustCompile(`(?i)(?:https?://)?(?:www\.)?[a-z0-9][a-z0-9._%+\-]*@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}`)
 	extAssetTLD = map[string]bool{"png": true, "jpg": true, "jpeg": true, "gif": true, "webp": true, "svg": true}
 
-	extURLRe = regexp.MustCompile(`(?i)\bhttps?://[^\s<>"'()\[\]]+|\bwww\.[^\s<>"'()\[\]]+|` +
+	// scheme URL, "www." + a real domain, or a bare domain with a known TLD
+	extURLRe = regexp.MustCompile(`(?i)\bhttps?://[^\s<>"'()\[\]]+|\bwww\.[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)+[^\s<>"'()\[\]]*|` +
 		`\b[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)*\.(?:com|net|org|fit|us|ca|co\.uk|info|biz|me|io|health|coach|life|studio|fitness)\b(?:/[^\s<>"'()\[\]]*)?`)
 
-	// platform word, up to ~25 characters on the same line, then @handle
-	extHandleRe = regexp.MustCompile(`(?i)\b(instagram|insta|ig|tik ?tok|twitter|facebook|fb|youtube)\b[^@\n]{0,25}@([a-z0-9_][a-z0-9_.]*)`)
+	// platform word, up to ~25 characters on the same line, then @handle; the
+	// handle belongs to the last platform word before the @
+	extHandleRe   = regexp.MustCompile(`(?i)\b(?:instagram|insta|ig|tik ?tok|twitter|facebook|fb|youtube)\b[^@\n]{0,25}@([a-z0-9_][a-z0-9_.]*)`)
+	extPlatformRe = regexp.MustCompile(`(?i)\b(?:instagram|insta|ig|tik ?tok|twitter|facebook|fb|youtube)\b`)
 
-	// leading group, then 2-5 separated groups: "(555) 010-0199", "+1 555 010 0100"
-	extPhoneRe = regexp.MustCompile(`\+?\(?\d{1,4}\)?(?:[ .\-]{1,2}\(?\d{1,5}\)?){2,5}`)
+	// Phone candidates: "(555) 010-0199" / "(555)010-0199", "+<digits>" with few
+	// separators, or a leading group followed by 2-5 separated groups
+	// ("555.010.0142"). A separator is one space or dot, or a dash with optional
+	// spaces; ". " after digits is a sentence end, never a separator.
+	extPhoneSep = `(?: ?- ?|[ .])`
+	extPhoneRe  = regexp.MustCompile(`\(\d{1,4}\)[ .\-]?\d{1,5}(?:` + extPhoneSep + `\d{1,5}){1,4}` +
+		`|\+\d(?:` + extPhoneSep + `?\(?\d+\)?){1,5}` +
+		`|\d{1,5}(?:` + extPhoneSep + `\(?\d{1,5}\)?){2,5}`)
 
 	extStreet = `(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Highway|Hwy|Parkway|Pkwy|Place|Pl|Circle|Cir)`
 	// house number, 1-4 capitalised words, suffix, optional unit, optional ", City, ST 12345"
@@ -68,8 +77,13 @@ func urlHost(u string) string {
 	return h
 }
 
-// validHost needs a dot and an alphabetic TLD.
+// validHost needs hostname characters, a dot and an alphabetic TLD.
 func validHost(h string) bool {
+	for _, r := range h {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '.') {
+			return false
+		}
+	}
 	i := strings.LastIndex(h, ".")
 	if i < 1 || len(h)-i-1 < 2 {
 		return false
@@ -82,6 +96,34 @@ func validHost(h string) bool {
 	return true
 }
 
+// sentenceBoundary reports a scheme-less, www-less domain whose TLD is
+// capitalised while the host is not all upper-case: two sentences glued together
+// ("Ms.Fit", "dancer.Fitness"), not a site. "FIXTUREMOM.COM" is a site.
+func sentenceBoundary(u string) bool {
+	h := u
+	if i := strings.IndexAny(h, "/?#"); i >= 0 {
+		h = h[:i]
+	}
+	tld := h[strings.LastIndex(h, ".")+1:]
+	return tld != "" && unicode.IsUpper([]rune(tld)[0]) && h != strings.ToUpper(h)
+}
+
+// socialProfile reports whether a social URL points at a profile: it needs a
+// path ("linkedin.com/" alone is no profile), and YouTube video links
+// ("youtube.com/watch?v=...", "youtu.be/...") are no channel.
+func socialProfile(u string) bool {
+	rest := aceSchemeRe.ReplaceAllString(strings.ToLower(u), "")
+	host, path, _ := strings.Cut(rest, "/")
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	path = strings.Trim(path, "/")
+	if path == "" || host == "youtu.be" || strings.HasSuffix(host, ".youtu.be") {
+		return false
+	}
+	return !(strings.HasSuffix(host, "youtube.com") && path == "watch")
+}
+
 // digitsOf keeps the ASCII digits of s.
 func digitsOf(s string) string {
 	return strings.Map(func(r rune) rune {
@@ -92,6 +134,45 @@ func digitsOf(s string) string {
 	}, s)
 }
 
+// cutEmails returns text with every email replaced by a space, and the emails
+// (lower-cased, first-seen order). Addresses at the directories' own domains and
+// asset-looking ones ("logo@2x.png") are dropped unless keepAll: the structured
+// Email value of a profile keeps whatever address it holds.
+func cutEmails(text string, keepAll bool) (string, []string) {
+	var emails []string
+	seen := map[string]bool{}
+	text = extEmailRe.ReplaceAllStringFunc(text, func(m string) string {
+		at := strings.LastIndex(m, "@")
+		local, domain := strings.ToLower(m[:at]), strings.ToLower(m[at+1:])
+		local = strings.TrimPrefix(strings.TrimPrefix(local, "https://"), "http://")
+		local = strings.TrimPrefix(local, "www.")
+		if !keepAll && (isOwnDomain(domain) || extAssetTLD[domain[strings.LastIndex(domain, ".")+1:]]) {
+			return " "
+		}
+		if addr := local + "@" + domain; !seen[addr] {
+			seen[addr] = true
+			emails = append(emails, addr)
+		}
+		return " "
+	})
+	return text, emails
+}
+
+// structuredEmails are the addresses in a structured Email value.
+func structuredEmails(v string) []string {
+	_, emails := cutEmails(v, true)
+	return emails
+}
+
+// structuredPhone is a structured phone value, or "" when it has fewer than 7
+// digits ("n/a", "-", "+44").
+func structuredPhone(v string) string {
+	if v = clean(v); len(digitsOf(v)) < 7 {
+		return ""
+	}
+	return v
+}
+
 // extractContacts finds emails, phones, social links, websites and street
 // addresses in free text.
 func extractContacts(text string) found {
@@ -100,30 +181,16 @@ func extractContacts(text string) found {
 
 	// Emails first and cut out, so an email domain is never a website and
 	// name@gmail.com is never a handle.
-	seenEmail := map[string]bool{}
-	text = extEmailRe.ReplaceAllStringFunc(text, func(m string) string {
-		at := strings.LastIndex(m, "@")
-		local, domain := strings.ToLower(m[:at]), strings.ToLower(m[at+1:])
-		local = strings.TrimPrefix(strings.TrimPrefix(local, "https://"), "http://")
-		local = strings.TrimPrefix(local, "www.")
-		if isOwnDomain(domain) || extAssetTLD[domain[strings.LastIndex(domain, ".")+1:]] {
-			return " "
-		}
-		if addr := local + "@" + domain; !seenEmail[addr] {
-			seenEmail[addr] = true
-			f.Emails = append(f.Emails, addr)
-		}
-		return " "
-	})
+	text, f.Emails = cutEmails(text, false)
 
 	// Handles next, cut out too ("@fixture.coach" is not a ".coach" domain);
 	// they only fill platforms no URL claimed.
 	handles := map[string]string{}
 	text = extHandleRe.ReplaceAllStringFunc(text, func(m string) string {
-		sub := extHandleRe.FindStringSubmatch(m)
-		h := strings.TrimRight(sub[2], ".")
+		h := strings.TrimRight(extHandleRe.FindStringSubmatch(m)[1], ".")
+		words := extPlatformRe.FindAllString(m[:strings.Index(m, "@")], -1)
 		var p, u string
-		switch strings.ToLower(strings.ReplaceAll(sub[1], " ", "")) {
+		switch strings.ToLower(strings.ReplaceAll(words[len(words)-1], " ", "")) {
 		case "instagram", "insta", "ig":
 			p, u = "instagram", "https://www.instagram.com/"+h
 		case "tiktok":
@@ -142,25 +209,41 @@ func extractContacts(text string) found {
 	})
 
 	// URLs, cut out as well so their digits are not read as phones.
-	text = extURLRe.ReplaceAllStringFunc(text, func(m string) string {
+	var addURL func(m string)
+	addURL = func(m string) {
 		u := strings.TrimRight(m, ".,;:!?")
 		host := urlHost(u)
-		if !validHost(host) || isOwnDomain(host) {
-			return " "
+		if !validHost(host) {
+			// "http://www,site.com", "http://?www.site.com": look for the real site inside
+			if rest := aceSchemeRe.ReplaceAllString(strings.TrimLeft(m, " "), ""); rest != m {
+				for _, in := range extURLRe.FindAllString(rest, -1) {
+					addURL(in)
+				}
+			}
+			return
+		}
+		if !aceURLRe.MatchString(u) && sentenceBoundary(u) {
+			return // "improvement.Health": a sentence boundary without its space
+		}
+		if isOwnDomain(host) {
+			return
 		}
 		if p := socialPlatform(u); p != "" {
-			if f.Social[p] == "" {
+			if socialProfile(u) && f.Social[p] == "" {
 				f.Social[p] = withScheme(u)
 			}
-			return " "
+			return
 		}
 		w := withScheme(u)
 		for _, have := range f.Websites {
 			if strings.EqualFold(have, w) {
-				return " "
+				return
 			}
 		}
 		f.Websites = append(f.Websites, w)
+	}
+	text = extURLRe.ReplaceAllStringFunc(text, func(m string) string {
+		addURL(m)
 		return " "
 	})
 
@@ -177,34 +260,43 @@ func extractContacts(text string) found {
 	}
 
 	for _, a := range extAddressRe.FindAllString(text, -1) {
-		a = clean(a)
-		dup := false
-		for _, have := range f.Addresses {
-			dup = dup || have == a
+		f.Addresses = addString(f.Addresses, clean(a))
+	}
+	// "5801 Fixture Road" next to "5801 Fixture Road, Exampleville, TX 75093":
+	// keep the longer one.
+	kept := f.Addresses[:0:0]
+	for _, a := range f.Addresses {
+		covered := false
+		for _, b := range f.Addresses {
+			covered = covered || len(b) > len(a) && strings.HasPrefix(b, strings.TrimRight(a, ".,;"))
 		}
-		if !dup {
-			f.Addresses = append(f.Addresses, a)
+		if !covered {
+			kept = append(kept, a)
 		}
 	}
+	f.Addresses = kept
 	return f
 }
 
 // phoneAt validates a phone candidate text[start:end]: 10-15 digits, not glued
-// to a longer alphanumeric token. A leading year ("since 2005 555 010 0199")
-// is dropped when the rest is still a phone.
+// to a longer alphanumeric token. A leading year or 5-digit ZIP ("since 2005
+// 555 010 0199") is dropped when the rest is still a phone.
 func phoneAt(text string, start, end int) string {
 	isAlnum := func(b byte) bool { return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' }
 	if start > 0 && isAlnum(text[start-1]) || end < len(text) && isAlnum(text[end]) {
 		return ""
 	}
 	c := text[start:end]
-	if i := strings.IndexAny(c, " .-"); i == 4 && (strings.HasPrefix(c, "19") || strings.HasPrefix(c, "20")) {
+	if i := strings.IndexAny(c, " .-"); i == 5 || i == 4 && (strings.HasPrefix(c, "19") || strings.HasPrefix(c, "20")) {
 		if rest := strings.TrimLeft(c[i:], " .-"); len(digitsOf(rest)) >= 10 {
 			c = rest
 		}
 	}
 	if n := len(digitsOf(c)); n < 10 || n > 15 {
 		return ""
+	}
+	if strings.Count(c, ")") > strings.Count(c, "(") { // "(555-010-0199)": the parentheses are not part of it
+		c = strings.TrimRight(c, ")")
 	}
 	return clean(c)
 }
@@ -249,7 +341,7 @@ func splitICFPhone(v string) []string {
 		if m := icfPhoneParenRe.FindStringSubmatch(p); m != nil && len(digitsOf(m[1])) >= 7 && len(digitsOf(m[2])) >= 7 {
 			out = addPhone(out, clean(m[1]))
 			out = addPhone(out, clean(m[2]))
-		} else if c := clean(p); c != "" {
+		} else if c := clean(p); len(digitsOf(c)) >= 7 {
 			out = addPhone(out, c)
 		}
 	}

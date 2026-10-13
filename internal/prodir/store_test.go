@@ -195,7 +195,7 @@ func TestLoadMapping(t *testing.T) {
 	again := Listing{
 		Domain: "icf1.coach.coachingfederation.org", URL: icfProfileURL("IcF1"), Name: "Coach One Fixture",
 		Category: icfCategory, Niche: "coaching", Website: icfProfileURL("IcF1"), Social: map[string]string{},
-		Phone: "", Location: "Exampletown, NY UNITED STATES", Description: "A fresh description",
+		Location: "Exampletown, NY UNITED STATES", Description: "A fresh description",
 	}
 	if code := Load(context.Background(), d, "icf", []Listing{again}); code != ExitOK {
 		t.Fatalf("reload exit code %d", code)

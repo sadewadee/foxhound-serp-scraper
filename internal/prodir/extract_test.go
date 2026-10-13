@@ -111,3 +111,92 @@ func TestExtractAddresses(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractURLFalsePositives(t *testing.T) {
+	none := []string{
+		"www.FixtureFellowshipOf Fitness", "see www.fixturename .com", // www. needs a real domain
+		"it brought improvement.Health to all", "Ms.Fit said", "a dancer.Fitness coach", // sentence boundary
+		"https://www.linkedin.com", "linkedin.com/", // no profile path
+		"https://www.youtube.com/watch?v=abc123", "https://youtu.be/abc123", // videos, not channels
+	}
+	for _, in := range none {
+		if f := extractContacts(in); len(f.Websites) != 0 || len(f.Social) != 0 {
+			t.Errorf("%q: websites=%v social=%v, want nothing", in, f.Websites, f.Social)
+		}
+	}
+	found := []struct{ in, want string }{
+		{"FIXTUREMOM.COM", "http://FIXTUREMOM.COM"},
+		{"my site fixture.fitness", "http://fixture.fitness"},
+		{"www.GoodFixture.Life", "http://www.GoodFixture.Life"},
+	}
+	for _, c := range found {
+		if f := extractContacts(c.in); len(f.Websites) != 1 || f.Websites[0] != c.want {
+			t.Errorf("%q: websites=%v, want %s", c.in, f.Websites, c.want)
+		}
+	}
+	if f := extractContacts("https://www.youtube.com/@fixturechannel"); f.Social["youtube"] == "" {
+		t.Errorf("youtube channel lost: %v", f.Social)
+	}
+}
+
+func TestExtractHandleNearestPlatform(t *testing.T) {
+	cases := []struct{ in, platform string }{
+		{"Find me on Facebook, Google, or Instagram @fixture_handle", "instagram"},
+		{"Instagram & Twitter @fixture_handle", "twitter"},
+	}
+	for _, c := range cases {
+		f := extractContacts(c.in)
+		if len(f.Social) != 1 || f.Social[c.platform] == "" {
+			t.Errorf("%q: social=%v, want only %s", c.in, f.Social, c.platform)
+		}
+	}
+}
+
+func TestExtractPhonesRound2(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"Exampleville, NY 10001. (555) 010-0199.", []string{"(555) 010-0199"}},
+		{"Exampleville, NY 10001 (555) 010-0199", []string{"(555) 010-0199"}},
+		{"call (555)010-0199 now", []string{"(555)010-0199"}},
+		{"+15550100100", []string{"+15550100100"}},
+		{"+44 5550100100", []string{"+44 5550100100"}},
+		{"+971 55501001", []string{"+971 55501001"}},
+		{"+1 555", nil}, // too few digits
+		{"call (555-010-0199) now", []string{"555-010-0199"}},
+		{"2024-05-12 and 10001", nil},
+	}
+	for _, c := range cases {
+		if got := extractContacts(c.in).Phones; !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%q: phones = %v, want %v", c.in, got, c.want)
+		}
+	}
+	for _, v := range []string{"n/a", "none", "-", "+44", "0", "12345"} {
+		if got := structuredPhone(v); got != "" {
+			t.Errorf("structuredPhone(%q) = %q, want none", v, got)
+		}
+		if got := splitICFPhone(v); got != nil {
+			t.Errorf("splitICFPhone(%q) = %v, want none", v, got)
+		}
+	}
+	if got := structuredPhone(" 555 010 0199 "); got != "555 010 0199" {
+		t.Errorf("structuredPhone = %q", got)
+	}
+}
+
+func TestExtractAddressPrefix(t *testing.T) {
+	f := extractContacts("Office: 5801 Fixture Road. Mail: 5801 Fixture Road, Exampleville, TX 75093")
+	if want := []string{"5801 Fixture Road, Exampleville, TX 75093"}; !reflect.DeepEqual(f.Addresses, want) {
+		t.Errorf("addresses = %v, want %v", f.Addresses, want)
+	}
+}
+
+func TestStructuredEmailKeepsOwnDomain(t *testing.T) {
+	if got := structuredEmails("Coach@mail.coachingfederation.org/xx"); !reflect.DeepEqual(got, []string{"coach@mail.coachingfederation.org"}) {
+		t.Errorf("structuredEmails = %v", got)
+	}
+	if got := extractContacts("Coach@mail.coachingfederation.org").Emails; got != nil {
+		t.Errorf("free text must still drop the directory's own domain: %v", got)
+	}
+}

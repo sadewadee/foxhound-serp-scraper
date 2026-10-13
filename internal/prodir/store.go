@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -19,15 +20,15 @@ import (
 // Listing is one person as written to business_listings. Empty strings mean
 // "no value" (stored as NULL, and never allowed to blank an existing value).
 type Listing struct {
-	Domain, URL, Name, Category, Niche      string
-	Phone, Website, Address, Location, City string
-	Description                             string
-	RawCountry, Country, CountryCode        string // Country/CountryCode empty = unresolved
-	Social                                  map[string]string
-	Emails                                  []string // lower-cased
-	Phones                                  []string // primary first; Phone is Phones[0]
-	OwnWebsite                              bool
-	Meta                                    map[string][]string // business_meta: key -> values
+	Domain, URL, Name, Category, Niche string
+	Website, Address, Location, City   string
+	Description                        string
+	RawCountry, Country, CountryCode   string // Country/CountryCode empty = unresolved
+	Social                             map[string]string
+	Emails                             []string // lower-cased
+	Phones                             []string // primary first
+	OwnWebsite                         bool
+	Meta                               map[string][]string // business_meta: key -> values
 }
 
 // addString appends v unless it is already in list.
@@ -59,18 +60,50 @@ func sameSite(a, b string) bool {
 	return norm(a) == norm(b)
 }
 
+// mergeSocial fills the platforms of dst that are still empty from src, never
+// with the directory's own pages.
+func mergeSocial(dst, src map[string]string) {
+	for plat, u := range src {
+		if dst[plat] == "" && !aceCorporateRe.MatchString(strings.ToLower(u)) {
+			dst[plat] = u
+		}
+	}
+}
+
+var aceHTTPRe = regexp.MustCompile(`(?i)^https?://`)
+
+// aceWebsiteField reads the ACE Website value. The site prepends "http://" to
+// whatever was typed, so it can hold a handle, a profile page, two sites or no
+// site at all. A value that already is one plain URL is the own website as is;
+// anything else is scanned like free text: the first site found is the own
+// website, the rest and any social links come back in found.
+func aceWebsiteField(v string) (own string, f found) {
+	v = clean(v)
+	if v == "" {
+		return "", found{}
+	}
+	if !strings.ContainsAny(v, " \t@,;") && validHost(urlHost(v)) && socialPlatform(v) == "" {
+		return v, found{}
+	}
+	f = extractContacts(aceHTTPRe.ReplaceAllString(v, ""))
+	if len(f.Websites) > 0 {
+		own, f.Websites = f.Websites[0], f.Websites[1:]
+	}
+	return own, f
+}
+
 // setWebsites decides the website column: the structured own site if there is
 // one, else the first site found in the text. The other sites found go to the
 // other_websites meta key. With neither, Website stays the profile URL.
-func (l *Listing) setWebsites(own string, found []string) {
+func (l *Listing) setWebsites(own string, sites []string) {
 	own = clean(own)
-	if own == "" && len(found) > 0 {
-		own, found = found[0], found[1:]
+	if own == "" && len(sites) > 0 {
+		own, sites = sites[0], sites[1:]
 	}
 	if own != "" {
 		l.Website, l.OwnWebsite = withScheme(own), true
 	}
-	for _, w := range found {
+	for _, w := range sites {
 		if !sameSite(w, own) {
 			addMeta(l.Meta, "other_websites", w)
 		}
@@ -302,21 +335,17 @@ func aceListings(dir string, res *countryResolver) ([]Listing, error) {
 		fd := extractContacts(text.String())
 
 		x.Emails = fd.Emails
-		x.Phones = addPhones(nil, p.Phone)
+		x.Phones = addPhones(nil, structuredPhone(p.Phone))
 		x.Phones = addPhones(x.Phones, fd.Phones...)
-		for plat, u := range fd.Social {
-			if social[plat] == "" && !aceCorporateRe.MatchString(strings.ToLower(u)) {
-				social[plat] = u
-			}
-		}
-		// The own website field sometimes holds an email instead of a site.
-		own := p.Website
-		if len(extractContacts(own).Emails) > 0 {
-			own = ""
-		}
-		x.setWebsites(own, fd.Websites)
+		own, field := aceWebsiteField(p.Website)
+		mergeSocial(social, field.Social)
+		mergeSocial(social, fd.Social)
+		x.setWebsites(own, append(field.Websites, fd.Websites...))
+		address := strings.ToLower(clean(p.Address))
 		for _, a := range fd.Addresses {
-			addMeta(x.Meta, "street_address", a)
+			if !strings.Contains(address, strings.ToLower(a)) { // already in the contact block
+				addMeta(x.Meta, "street_address", a)
+			}
 		}
 		x.Country, x.CountryCode = res.resolve(x.RawCountry)
 		out = append(out, x)
@@ -361,16 +390,22 @@ func icfListings(dir string, res *countryResolver) ([]Listing, error) {
 		if e.fetched() {
 			x.Phones = splitICFPhone(e.prof.Phone)
 			if w := clean(e.prof.Website); socialPlatform(w) != "" {
-				x.Social[socialPlatform(w)] = withScheme(w) // a profile link typed into Web Site
+				if socialProfile(w) { // a profile link typed into Web Site
+					x.Social[socialPlatform(w)] = withScheme(w)
+				}
 			} else {
 				own = w
 			}
-			fieldText = append(fieldText, e.prof.Email)
+			// The Email field is authoritative: its address stays even at the
+			// directory's own domain.
+			x.Emails = structuredEmails(e.prof.Email)
 			for _, label := range e.prof.Fields.labels {
 				fieldText = append(fieldText, e.prof.Fields.vals[label]...)
 			}
 		}
-		x.Emails = extractContacts(strings.Join(fieldText, "\n")).Emails
+		for _, em := range extractContacts(strings.Join(fieldText, "\n")).Emails {
+			x.Emails = addString(x.Emails, em)
+		}
 
 		// The list-level description / headline are free text too.
 		fd := extractContacts(rec.Description + "\n" + rec.Headline)
@@ -378,11 +413,7 @@ func icfListings(dir string, res *countryResolver) ([]Listing, error) {
 			x.Emails = addString(x.Emails, em)
 		}
 		x.Phones = addPhones(x.Phones, fd.Phones...)
-		for plat, u := range fd.Social {
-			if x.Social[plat] == "" {
-				x.Social[plat] = u
-			}
-		}
+		mergeSocial(x.Social, fd.Social)
 		x.setWebsites(own, fd.Websites)
 		x.Country, x.CountryCode = res.resolve(matched)
 		out = append(out, x)
@@ -597,11 +628,7 @@ func upsert(ctx context.Context, db *sql.DB, l Listing) error {
 	}
 	defer tx.Rollback()
 
-	// phone is the primary number: Phones[0], else the single Phone.
-	phones := l.Phones
-	if len(phones) == 0 && l.Phone != "" {
-		phones = []string{l.Phone}
-	}
+	phones := l.Phones // primary first
 	primary := ""
 	if len(phones) > 0 {
 		primary = phones[0]

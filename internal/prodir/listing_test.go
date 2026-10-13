@@ -164,3 +164,128 @@ func TestICFListingsExtract(t *testing.T) {
 		t.Errorf("icf2 other_websites = %v", got)
 	}
 }
+
+func TestACEWebsiteField(t *testing.T) {
+	cases := []struct {
+		in     string
+		own    string
+		others []string
+		social map[string]string
+	}{
+		// not a website at all
+		{"http://Fixture Fitness Studio", "", nil, nil},
+		{"http://under construction", "", nil, nil},
+		{"http://fixturehandle", "", nil, nil},
+		{"http://5550100199", "", nil, nil},
+		{"http://", "", nil, nil},
+		{"http://@fixturehandle", "", nil, nil},
+		{"", "", nil, nil},
+		// a handle
+		{"http://Instagram @fixture.handle", "", nil, map[string]string{"instagram": "https://www.instagram.com/fixture.handle"}},
+		{"http://Instagram@fixturehandle", "", nil, map[string]string{"instagram": "https://www.instagram.com/fixturehandle"}},
+		// two sites
+		{"http://www.fixture-a.com www.fixture-b.com", "http://www.fixture-a.com", []string{"http://www.fixture-b.com"}, nil},
+		{"http://fixture-a.com, fixture-b.com", "http://fixture-a.com", []string{"http://fixture-b.com"}, nil},
+		{"http://fixture-a.com or Fixture-B.com", "http://fixture-a.com", []string{"http://Fixture-B.com"}, nil},
+		{"http://fixture-a.com under construction", "http://fixture-a.com", nil, nil},
+		// garbage around the real site
+		{"http://www,fixture-a.com", "http://fixture-a.com", nil, nil},
+		{"http://?www.fixture-a.com", "http://www.fixture-a.com", nil, nil},
+		{"http://https//www.fixture-a.com", "http://www.fixture-a.com", nil, nil},
+		{"http://Ihttp://fixture-a.wix.com/fit", "http://fixture-a.wix.com/fit", nil, nil},
+		{"http://www.fixture-a.com.", "http://www.fixture-a.com", nil, nil},
+		// a social page typed into the website field
+		{"http://http:/www.facebook.com/fixturepage", "", nil, map[string]string{"facebook": "http://www.facebook.com/fixturepage"}},
+		{"http://www.facebook.com/fixturepage", "", nil, map[string]string{"facebook": "http://www.facebook.com/fixturepage"}},
+		// a plain valid URL is kept exactly as written
+		{"http://linktr.ee/fixture", "http://linktr.ee/fixture", nil, nil},
+		{"http://www.Fixture-A.com/Path?x=1", "http://www.Fixture-A.com/Path?x=1", nil, nil},
+		{"http://fixture-a.com/a,b", "http://fixture-a.com/a,b", nil, nil},
+	}
+	for _, c := range cases {
+		own, f := aceWebsiteField(c.in)
+		if own != c.own || !reflect.DeepEqual(append([]string(nil), f.Websites...), c.others) || !reflect.DeepEqual(nilIfEmpty(f.Social), c.social) {
+			t.Errorf("%q: own=%q others=%v social=%v, want %q %v %v", c.in, own, f.Websites, f.Social, c.own, c.others, c.social)
+		}
+	}
+}
+
+func nilIfEmpty(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+func TestACEListingsRound2(t *testing.T) {
+	dir := t.TempDir()
+	row := func(id string) string {
+		return `{"EncryptedCustomerNumber":"` + id + `","ProfileURL":"/pro/` + id + `/","FullName":"Fixture ` + id + `","City":"Exampleville","StateCode":"NY","CountryName":"US","CertDisplay":"ACE Certified Personal Trainer","_page":1}`
+	}
+	writeLines(t, filepath.Join(dir, "ace_list.jsonl"), row("AcE1"), row("AcE2"), row("AcE3"))
+	head := func(contact ...string) []Token {
+		text := ""
+		for _, c := range contact {
+			text += c + "\n"
+		}
+		return []Token{{Kind: "h2", Text: "Name"}, {Kind: "text", Text: text}, {Kind: "hr"}}
+	}
+	about := func(s string) []Token { return []Token{{Kind: "h4", Text: "About"}, {Kind: "text", Text: s}} }
+	writeACEToks(t, dir, map[string][]Token{
+		// phone value too short, website field holds a handle
+		"AcE1": append(head("EXAMPLEVILLE, NY US 10001", "n/a", "http://Instagram @fixture.handle"), about("Bio.")...),
+		// the same street address in the contact block and in the text; a short and a long form in the text
+		"AcE2": append(head("5801 Fixture Road, Exampleville, TX 75093", "http://under construction"),
+			about("Visit 5801 Fixture Road, Exampleville, TX 75093. Or 900 Haddon Avenue. Or 900 Haddon Avenue, Collingswood NJ 08108.")...),
+		// short phone value, phone in text
+		"AcE3": append(head("EXAMPLEVILLE, NY US 10001", "-"), about("Exampleville, NY 10001. (555) 010-0199.")...),
+	})
+	ls, err := Listings("ace", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]Listing{}
+	for _, l := range ls {
+		by[l.Domain] = l
+	}
+	a1 := by["ace1.pro.acefitness.org"]
+	if len(a1.Phones) != 0 || a1.OwnWebsite || a1.Website != ACEBase+"/pro/AcE1/" ||
+		a1.Social["instagram"] != "https://www.instagram.com/fixture.handle" {
+		t.Errorf("ace1: phones=%v own=%v website=%q social=%v", a1.Phones, a1.OwnWebsite, a1.Website, a1.Social)
+	}
+	a2 := by["ace2.pro.acefitness.org"]
+	if a2.OwnWebsite {
+		t.Errorf("ace2 website = %q, want the profile URL", a2.Website)
+	}
+	if got := a2.Meta["street_address"]; !reflect.DeepEqual(got, []string{"900 Haddon Avenue, Collingswood NJ 08108"}) {
+		t.Errorf("ace2 street_address = %v (the contact-block address must not be repeated)", got)
+	}
+	if a3 := by["ace3.pro.acefitness.org"]; !reflect.DeepEqual(a3.Phones, []string{"(555) 010-0199"}) {
+		t.Errorf("ace3 phones = %v", a3.Phones)
+	}
+}
+
+func TestICFListingsRound2(t *testing.T) {
+	dir := t.TempDir()
+	b, _ := os.ReadFile("testdata/icf_countries.json")
+	if err := os.WriteFile(filepath.Join(dir, "icf_countries.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeLines(t, filepath.Join(dir, "icf_list.jsonl"),
+		`{"key":"IcF1","fullName":"Coach One","location":"Exampletown, NY UNITED STATES"}`,
+	)
+	writeLines(t, filepath.Join(dir, "icf_profiles.jsonl"),
+		`{"key":"IcF1","url":"u","fields":{"Coaching Themes":["Mail old@mail.coachingfederation.org"]},"email":"Own@mail.coachingfederation.org/xx","phone":"n/a","website":"https://www.linkedin.com","location":""}`,
+	)
+	ls, err := Listings("icf", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i1 := ls[0]
+	if want := []string{"own@mail.coachingfederation.org"}; !reflect.DeepEqual(i1.Emails, want) {
+		t.Errorf("icf1 emails = %v, want %v (structured Email is authoritative, free text keeps the own-domain rule)", i1.Emails, want)
+	}
+	if len(i1.Phones) != 0 || len(i1.Social) != 0 || i1.OwnWebsite {
+		t.Errorf("icf1 phones=%v social=%v own=%v, want none", i1.Phones, i1.Social, i1.OwnWebsite)
+	}
+}
