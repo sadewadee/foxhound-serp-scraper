@@ -772,6 +772,7 @@ type aceEntry struct {
 	id      string
 	list    aceListRec
 	prof    *ACEProfile // nil: no profile fetched, or fetched as missing
+	toks    []Token     // the raw profile tokens, for contact extraction at load
 	missing bool
 }
 
@@ -792,6 +793,7 @@ func loadACE(dir string) ([]aceEntry, error) {
 			e.missing = p.Missing
 			if p.Tokens != nil {
 				e.prof = parseTokens(*p.Tokens)
+				e.toks = *p.Tokens
 			}
 		}
 		entries = append(entries, e)
