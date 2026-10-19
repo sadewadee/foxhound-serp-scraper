@@ -1,0 +1,127 @@
+{
+ "$type": "p",
+ "Items": {
+  "$type": "l",
+  "$values": [
+   {
+    "$type": "x",
+    "EntityTypeName": "x",
+    "Properties": {
+     "$type": "y",
+     "$values": [
+      {
+       "$type": "z",
+       "Name": "ID",
+       "Value": "70003"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberName",
+       "Value": "Cameron Sample"
+      },
+      {
+       "$type": "z",
+       "Name": "Company",
+       "Value": "Sample Studio"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberEmail",
+       "Value": "cameron.sample@example.org"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberMobile",
+       "Value": "0455 555 103"
+      },
+      {
+       "$type": "z",
+       "Name": "Website",
+       "Value": "https://www.facebook.com/samplestudio"
+      },
+      {
+       "$type": "z",
+       "Name": "FullAddress",
+       "Value": "5 Sample Rd Sampleton VIC 3000"
+      },
+      {
+       "$type": "z",
+       "Name": "City",
+       "Value": "Sampleton"
+      },
+      {
+       "$type": "z",
+       "Name": "Zip",
+       "Value": "3000"
+      },
+      {
+       "$type": "z",
+       "Name": "Country",
+       "Value": "Australia"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberType",
+       "Value": "USTD"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberTypeDetail",
+       "Value": "PAA Practitioner - PT"
+      }
+     ]
+    }
+   },
+   {
+    "$type": "x",
+    "EntityTypeName": "x",
+    "Properties": {
+     "$type": "y",
+     "$values": [
+      {
+       "$type": "z",
+       "Name": "ID",
+       "Value": "70001"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberName",
+       "Value": "Alex Fixture"
+      }
+     ]
+    }
+   },
+   {
+    "$type": "x",
+    "EntityTypeName": "x",
+    "Properties": {
+     "$type": "y",
+     "$values": [
+      {
+       "$type": "z",
+       "Name": "ID",
+       "Value": "70004"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberName",
+       "Value": ""
+      },
+      {
+       "$type": "z",
+       "Name": "Company",
+       "Value": "No Name"
+      }
+     ]
+    }
+   }
+  ]
+ },
+ "Offset": 0,
+ "Limit": 500,
+ "Count": 3,
+ "TotalCount": 3,
+ "NextPageLink": null,
+ "HasNext": false,
+ "NextOffset": 0
+}

@@ -1,0 +1,4 @@
+{"totalCount":1500,"skip":1000,"take":1000,"data":[
+{"Id":900002,"FirstName":"Bo","LastName":"Placeholder","Email":"bo@example.org","BusinessPhone":"","Country":"United States","City":"Mockton","Province":"","IsCurrentSp":false,"Certifications":[]},
+{"Id":900004,"FirstName":"Cy","LastName":"Sample","Email":"not-an-email","BusinessPhone":"n/a","Country":"Canada","City":"Fakeham","Province":"Ontario","IsCurrentSp":false,"Certifications":["CORE™"]}
+]}

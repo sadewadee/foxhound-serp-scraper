@@ -1,0 +1,233 @@
+{
+ "$type": "p",
+ "Items": {
+  "$type": "l",
+  "$values": [
+   {
+    "$type": "x",
+    "EntityTypeName": "x",
+    "Properties": {
+     "$type": "y",
+     "$values": [
+      {
+       "$type": "z",
+       "Name": "ID",
+       "Value": "70001"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberName",
+       "Value": "Alex Fixture"
+      },
+      {
+       "$type": "z",
+       "Name": "FirstName",
+       "Value": "Alex"
+      },
+      {
+       "$type": "z",
+       "Name": "LastName",
+       "Value": "Fixture"
+      },
+      {
+       "$type": "z",
+       "Name": "Company",
+       "Value": "Example Pilates Studio"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberEmail",
+       "Value": "alex.fixture@example.org"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberMobile",
+       "Value": "0455 555 101"
+      },
+      {
+       "$type": "z",
+       "Name": "StudioPhone",
+       "Value": "02 5550 0102"
+      },
+      {
+       "$type": "z",
+       "Name": "StudioMobile",
+       "Value": null
+      },
+      {
+       "$type": "z",
+       "Name": "Website",
+       "Value": "www.example-pilates.example.com"
+      },
+      {
+       "$type": "z",
+       "Name": "FullAddress",
+       "Value": "1 Example St Exampleville NSW 2000"
+      },
+      {
+       "$type": "z",
+       "Name": "City",
+       "Value": "Exampleville"
+      },
+      {
+       "$type": "z",
+       "Name": "Zip",
+       "Value": "2000"
+      },
+      {
+       "$type": "z",
+       "Name": "Country",
+       "Value": "Australia"
+      },
+      {
+       "$type": "z",
+       "Name": "PractitionerLevel",
+       "Value": "L2"
+      },
+      {
+       "$type": "z",
+       "Name": "GroupInstructorCategory",
+       "Value": "GPMat,GPRef"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberType",
+       "Value": "USTD"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberTypeDetail",
+       "Value": "PAA Practitioner - Level 2"
+      },
+      {
+       "$type": "z",
+       "Name": "Description",
+       "Value": "PAA Practitioner"
+      },
+      {
+       "$type": "z",
+       "Name": "Latitude",
+       "Value": "-33.8"
+      },
+      {
+       "$type": "z",
+       "Name": "Longitude",
+       "Value": "151.2"
+      }
+     ]
+    }
+   },
+   {
+    "$type": "x",
+    "EntityTypeName": "x",
+    "Properties": {
+     "$type": "y",
+     "$values": [
+      {
+       "$type": "z",
+       "Name": "ID",
+       "Value": "70002"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberName",
+       "Value": null
+      },
+      {
+       "$type": "z",
+       "Name": "FirstName",
+       "Value": "Blair"
+      },
+      {
+       "$type": "z",
+       "Name": "LastName",
+       "Value": "Placeholder"
+      },
+      {
+       "$type": "z",
+       "Name": "Company",
+       "Value": ""
+      },
+      {
+       "$type": "z",
+       "Name": "MemberEmail",
+       "Value": "blair.placeholder@example.com"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberMobile",
+       "Value": null
+      },
+      {
+       "$type": "z",
+       "Name": "StudioPhone",
+       "Value": null
+      },
+      {
+       "$type": "z",
+       "Name": "StudioMobile",
+       "Value": null
+      },
+      {
+       "$type": "z",
+       "Name": "Website",
+       "Value": ""
+      },
+      {
+       "$type": "z",
+       "Name": "FullAddress",
+       "Value": ""
+      },
+      {
+       "$type": "z",
+       "Name": "City",
+       "Value": ""
+      },
+      {
+       "$type": "z",
+       "Name": "Zip",
+       "Value": ""
+      },
+      {
+       "$type": "z",
+       "Name": "Country",
+       "Value": ""
+      },
+      {
+       "$type": "z",
+       "Name": "PractitionerLevel",
+       "Value": null
+      },
+      {
+       "$type": "z",
+       "Name": "GroupInstructorCategory",
+       "Value": null
+      },
+      {
+       "$type": "z",
+       "Name": "MemberType",
+       "Value": "STDIO"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberTypeDetail",
+       "Value": "PAA Studio Instruct."
+      },
+      {
+       "$type": "z",
+       "Name": "Description",
+       "Value": "PAA Studio"
+      }
+     ]
+    }
+   }
+  ]
+ },
+ "Offset": 0,
+ "Limit": 500,
+ "Count": 2,
+ "TotalCount": 2,
+ "NextPageLink": null,
+ "HasNext": true,
+ "NextOffset": 2
+}
