@@ -225,6 +225,12 @@ var aceTopLabels = map[string]string{
 	"areas of focus": "areas_of_focus",
 }
 
+// aceStoreLabels are ACE course-store merchandising categories that leak into
+// the Areas of Focus list on some profiles; they are not training specialties.
+var aceStoreLabels = map[string]bool{
+	"on sale now": true, "expert articles quizzes": true, "new courses": true, "recorded webinar": true,
+}
+
 var (
 	aceURLRe       = regexp.MustCompile(`(?i)^(https?://|www\.)`)
 	aceCorporateRe = regexp.MustCompile(`/(acefitness|americancouncilonexercise|ace-fitness)\b|acefitness\.org`)
@@ -405,6 +411,15 @@ func parseTokens(toks []Token) *ACEProfile {
 		sep := "; "
 		if prose {
 			sep = "  "
+		}
+		if !hasSection && strings.EqualFold(label, "areas of focus") {
+			kept := lines[:0:0]
+			for _, l := range lines {
+				if !aceStoreLabels[strings.ToLower(l)] {
+					kept = append(kept, l)
+				}
+			}
+			lines = kept
 		}
 		value := normValue(strings.Join(lines, sep))
 		if hasSection {

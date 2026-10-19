@@ -233,3 +233,27 @@ func TestACENiche(t *testing.T) {
 		}
 	}
 }
+
+func TestACEAreasOfFocusDropsStoreLabels(t *testing.T) {
+	base := string(readFixture(t, "ace_profile_SYNTHETIC.html"))
+	const orig = "Active Aging<br />\nStrength Training<br />\nWeight Management<br />\n"
+	if !strings.Contains(base, orig) {
+		t.Fatal("fixture focus block not found")
+	}
+	cases := []struct{ name, block, want string }{
+		{"mixed", "Active Aging<br />\nOn Sale Now<br />\nStrength Training<br />\nexpert articles quizzes<br />\nNEW COURSES<br />\nWeight Management<br />\nRecorded Webinar<br />\n",
+			"Active Aging; Strength Training; Weight Management"},
+		{"only labels", "On Sale Now<br />\nExpert Articles Quizzes<br />\nNew Courses<br />\nRecorded Webinar<br />\n", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			toks, err := tokenizeACE([]byte(strings.Replace(base, orig, c.block, 1)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := parseTokens(toks).AreasOfFocus; got != c.want {
+				t.Errorf("AreasOfFocus = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
