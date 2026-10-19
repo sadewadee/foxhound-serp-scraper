@@ -1,0 +1,10 @@
+{"total":"2","page":0,"items_per_page":100,"next_page_url":null,"data":[
+{"id":"920001","is_event":false,"name":"Fixture Sprintcoach","address":null,"email":null,
+ "info":[{"title":"USATF Level 1, 2 or 3","value":{"type":"label","text":"Current","icon":null,"style":"success","tooltip":null,"dialog":null}},
+         {"title":"USATF Level 1, 2 or 3 Type","value":"USATF Level 2 - Sprints/Hurdles/Relays"},
+         {"title":"CEU Courses Type","value":"Basic Principles of Fixture Endurance"},
+         {"title":"Career Accomplishments Type","value":"Employment Verification"},
+         {"title":"USATF Specialty Courses Type","value":"Cross Country Specialist Course"},
+         {"title":"RRCA Certification Type","value":"RRCA Level 1"}],"actions":[],"img_url":"https://example.com/l.png"},
+{"id":"920002","is_event":false,"name":"Sample Jumpscoach","info":[],"actions":[]}
+]}

@@ -1,0 +1,11 @@
+{"total":"2","page":0,"items_per_page":100,"next_page_url":null,"data":[
+{"id":"940001","is_event":false,"name":"Fixture Sensei","subtitle":"Coach","address":null,"geolocation":null,"telephone":null,"email":null,
+ "info":[{"title":"Coach Certification","value":{"type":"label","text":"Current","icon":null,"style":"success","tooltip":null,"dialog":null}},
+         {"title":"Coach Certification Type","value":"Level 2 Coach"},
+         {"title":"Exp Date","value":"1/31/2099"},
+         {"title":"Individual Membership Type","value":"Adult Membership"},
+         {"title":"State","value":"Exampleland Judo Inc."},
+         {"title":"Valid To","value":"12/31/2099"},
+         {"title":"Club","value":"<a href=\"/c/1\">Fixture Judo Club</a>"}],"actions":[],"img_url":"https://example.com/s.png"},
+{"id":"940002","is_event":false,"name":"Sample Sensei","info":[{"title":"Coach Certification Type","value":"Level 1 Coach"}],"actions":[]}
+]}

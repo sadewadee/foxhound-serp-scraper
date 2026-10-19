@@ -1,0 +1,9 @@
+{"total":"2","page":0,"items_per_page":100,"next_page_url":null,"data":[
+{"id":"910001","is_event":false,"name":"Fixture Taekwondo Academy","subtitle":null,"address":null,"geolocation":{"lng":"-100.0","lat":"40.0"},"telephone":null,"email":"Info@Example.org",
+ "info":[{"title":"Club Membership","value":{"type":"label","text":"Current","icon":null,"style":"success","tooltip":null,"dialog":null}},
+         {"title":"Club Membership Type","value":"Silver Club Membership"},
+         {"title":"State","value":"<b>Exampleland State Federation</b>"},
+         {"title":"Website","value":"www.example.org/tkd"}],"actions":[]},
+{"id":"910002","is_event":false,"name":"Sample Dojang","address":null,"telephone":null,"email":null,
+ "info":[{"title":"Club Membership Type","value":"Bronze Club Membership"}],"actions":[]}
+]}
