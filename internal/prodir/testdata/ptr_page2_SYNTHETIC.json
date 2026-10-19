@@ -1,0 +1,32 @@
+{
+ "items": [
+  {
+   "id": 70005,
+   "externalId": "E70005",
+   "firstName": "Cameron",
+   "lastName": "Overseas",
+   "informalName": null,
+   "email": "cam@example.com",
+   "phone": "555-0102",
+   "country": "FR",
+   "state": null,
+   "city": "Paris",
+   "zip": null,
+   "status": "active",
+   "bio": null,
+   "facility": "Example Racquet Club",
+   "memberNumber": "M70005",
+   "lessonPriceHourly": "n/a",
+   "offers": {
+    "privateLessons": true,
+    "groupLessons": false,
+    "clinics": true
+   },
+   "addresses": [],
+   "certifications": []
+  }
+ ],
+ "total": 150,
+ "page": 2,
+ "pageSize": 100
+}

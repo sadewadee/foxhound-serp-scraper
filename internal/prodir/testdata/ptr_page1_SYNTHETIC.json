@@ -1,0 +1,156 @@
+{
+ "items": [
+  {
+   "id": 70001,
+   "externalId": "E70001",
+   "firstName": "Alex",
+   "lastName": "Fixture",
+   "informalName": null,
+   "email": "alex.fixture@example.com",
+   "phone": "555-0101",
+   "country": "US",
+   "state": "TX",
+   "city": "Exampleton",
+   "zip": "75000",
+   "status": "active",
+   "bio": "Synthetic coach, write me at coach@example.org.",
+   "facility": "Fixture Tennis Club",
+   "memberNumber": "M70001",
+   "lessonPriceHourly": 60,
+   "offers": {
+    "privateLessons": true,
+    "groupLessons": false,
+    "clinics": true
+   },
+   "addresses": [
+    {
+     "line1": "1 Example Rd",
+     "line2": "Suite 5",
+     "city": "Exampleton",
+     "country": "US"
+    }
+   ],
+   "certifications": [
+    {
+     "certificationName": "Professional",
+     "category": "Tennis",
+     "earnedDate": "2020-01-01",
+     "expirationDate": "2099-01-01",
+     "status": "Active",
+     "level": "Coach"
+    },
+    {
+     "certificationName": "Pickle",
+     "category": "Pickleball",
+     "earnedDate": "2020-01-01",
+     "expirationDate": "2099-01-01",
+     "status": "Active",
+     "level": "Coach"
+    }
+   ]
+  },
+  {
+   "id": 70002,
+   "externalId": "E70002",
+   "firstName": "Blair",
+   "lastName": "Placeholder",
+   "informalName": null,
+   "email": "blair@example.org",
+   "phone": null,
+   "country": "IT",
+   "state": null,
+   "city": "Sampleford",
+   "zip": null,
+   "status": "active",
+   "bio": null,
+   "facility": null,
+   "memberNumber": "M70002",
+   "lessonPriceHourly": null,
+   "offers": {
+    "privateLessons": true,
+    "groupLessons": false,
+    "clinics": true
+   },
+   "addresses": [],
+   "certifications": []
+  },
+  {
+   "id": 70003,
+   "externalId": "E70003",
+   "firstName": "Retired",
+   "lastName": "Member",
+   "informalName": null,
+   "email": "retired@example.com",
+   "phone": null,
+   "country": "US",
+   "state": "CA",
+   "city": "Nowhere",
+   "zip": "90000",
+   "status": "inactive",
+   "bio": null,
+   "facility": null,
+   "memberNumber": "M70003",
+   "lessonPriceHourly": null,
+   "offers": {
+    "privateLessons": true,
+    "groupLessons": false,
+    "clinics": true
+   },
+   "addresses": [],
+   "certifications": []
+  },
+  {
+   "id": 70001,
+   "externalId": "E70001",
+   "firstName": "Alex",
+   "lastName": "Duplicate",
+   "informalName": null,
+   "email": "dup@example.com",
+   "phone": null,
+   "country": "US",
+   "state": null,
+   "city": "X",
+   "zip": null,
+   "status": "active",
+   "bio": null,
+   "facility": null,
+   "memberNumber": "M70001",
+   "lessonPriceHourly": null,
+   "offers": {
+    "privateLessons": true,
+    "groupLessons": false,
+    "clinics": true
+   },
+   "addresses": [],
+   "certifications": []
+  },
+  {
+   "id": 70004,
+   "externalId": "E70004",
+   "firstName": " ",
+   "lastName": " ",
+   "informalName": null,
+   "email": "blank@example.com",
+   "phone": null,
+   "country": "US",
+   "state": null,
+   "city": "X",
+   "zip": null,
+   "status": "active",
+   "bio": null,
+   "facility": null,
+   "memberNumber": "M70004",
+   "lessonPriceHourly": null,
+   "offers": {
+    "privateLessons": true,
+    "groupLessons": false,
+    "clinics": true
+   },
+   "addresses": [],
+   "certifications": []
+  }
+ ],
+ "total": 150,
+ "page": 1,
+ "pageSize": 100
+}

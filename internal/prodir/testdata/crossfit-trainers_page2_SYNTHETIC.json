@@ -1,0 +1,4 @@
+[
+{"id":504,"user_id":70002,"level":"L1","first_name":"Blair","last_name":"Placeholder","certifications":[]},
+{"id":505,"user_id":70004,"level":"OL1","level_label":"","first_name":"Casey","last_name":"Overseas","country_code":"IT","certifications":[{"name":"CF-OL1","email":"casey@example.com","level":"OL1","active":true}]}
+]
