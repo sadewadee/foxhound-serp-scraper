@@ -432,3 +432,32 @@ func TestLoadEmailsPhones(t *testing.T) {
 		t.Errorf("after fix: website=%q phone=%q phones=%q", website, phone, phones)
 	}
 }
+
+// A generic source with no niche bucket yet (the sports categories) stores
+// niche_category as NULL, not ”; a niche is stored as is.
+func TestLoadGenericNullNiche(t *testing.T) {
+	d := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_prodir_"}).DB()
+	defer d.Close()
+	if err := db.Migrate(d); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	ls := []Listing{
+		recordListing(testSource("sports_tennis"), Record{ID: "t1", Name: "Tennis Fixture"}, newCountryResolver()),
+		recordListing(testSource("yoga_teacher"), Record{ID: "y1", Name: "Yoga Fixture"}, newCountryResolver()),
+	}
+	if code := Load(context.Background(), d, "gen-test", ls); code != ExitOK {
+		t.Fatalf("load exit code %d", code)
+	}
+	for domain, want := range map[string]sql.NullString{
+		"t1.gen-test.gen-test-directory.example.org": {},
+		"y1.gen-test.gen-test-directory.example.org": {String: "yoga", Valid: true},
+	} {
+		var niche sql.NullString
+		if err := d.QueryRow(`SELECT niche_category FROM business_listings WHERE domain = $1`, domain).Scan(&niche); err != nil {
+			t.Fatal(err)
+		}
+		if niche != want {
+			t.Errorf("%s niche = %+v, want %+v", domain, niche, want)
+		}
+	}
+}
