@@ -12,7 +12,12 @@ package prodir
 // Adding a source (src_<slug>.go, package prodir):
 //
 //  1. Pick Slug, Name, Host (the directory's own host), Category (a key of
-//     categoryNiche), ListingType and MinInterval.
+//     categoryNiche), ListingType and MinInterval. Host joins the own-domain
+//     filter that ACE/ICF extraction uses too: once registered, the host AND
+//     all its subdomains can never be anyone's website or social profile. So it
+//     must be the directory's own specific host, never a shared platform domain
+//     like notion.site, wixsite.com, sport80.com or zohopublic.com (use the
+//     full subdomain, e.g. mydirectory.sport80.com).
 //  2. Write List: walk the directory and call emit once per entry with a
 //     Record (ID and Name are the minimum; ID must be stable and unique).
 //  3. If the list lacks contact data, write Detail: fetch the profile page

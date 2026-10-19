@@ -76,8 +76,12 @@ func crossfitList(ctx context.Context, f Fetcher, emit func(Record) error) error
 	return nil
 }
 
-// live is an active affiliate in good standing.
-func (a crossfitAffiliate) live() bool { return a.Active == "1" && a.BadStanding == "0" }
+// live is an active affiliate not in bad standing. A missing bad_standing field
+// is good standing (only an explicit "1" is not): a record that omits a field
+// must not be dropped. show_on_map is deliberately ignored: it only hides a box
+// from the map (the few such boxes in the data have full address, website and
+// coordinates), it does not mean closed.
+func (a crossfitAffiliate) live() bool { return a.Active == "1" && a.BadStanding != "1" }
 
 func (a crossfitAffiliate) record() Record {
 	r := Record{

@@ -7,8 +7,10 @@ package prodir
 // /teachers-directory/?_paged=N (50 cards per page; the page carries
 // "total_pages" in its FWP_JSON). Profiles are /teacher/{slug}-{id}/ and add
 // the contact details (email and phone are plain text, the website a link).
-// The directory has no country field (a few teachers are outside the UK), so
-// Country stays empty rather than guessing.
+// The directory has no country field. It is the UK national association's, so
+// Country defaults to "United Kingdom"; when the location text itself ends in
+// another country the country resolver recognises ("Dublin, Ireland"), that
+// country is used instead (iyengarCountry).
 
 import (
 	"context"
@@ -17,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -44,6 +47,24 @@ func labelValue(li *goquery.Selection) string {
 // labelOf is the label of such a row, lower-cased and without the colon.
 func labelOf(li *goquery.Selection) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(clean(li.Find("span").First().Text()), ":")))
+}
+
+const iyengarDefaultCountry = "United Kingdom"
+
+var iyengarCountries = sync.OnceValue(newCountryResolver)
+
+// iyengarCountry is the country named by the last comma-separated part of the
+// first of the location texts that ends in a recognised country, else the UK.
+func iyengarCountry(locations ...string) string {
+	for _, loc := range locations {
+		parts := strings.Split(loc, ",")
+		if last := clean(parts[len(parts)-1]); len(parts) > 1 && last != "" {
+			if _, code := iyengarCountries().resolve(last); code != "" {
+				return last
+			}
+		}
+	}
+	return iyengarDefaultCountry
 }
 
 func iyengarList(ctx context.Context, f Fetcher, emit func(Record) error) error {
@@ -100,6 +121,7 @@ func iyengarCards(doc *goquery.Document, base string) []Record {
 				r.City = labelValue(li)
 			}
 		})
+		r.Country = iyengarCountry(r.City)
 		out = append(out, r)
 	})
 	return out
@@ -114,6 +136,7 @@ func iyengarDetail(ctx context.Context, f Fetcher, r Record) (Record, error) {
 		return Record{}, fmt.Errorf("no listing details on %s (layout changed?)", base)
 	}
 	d := Record{Meta: map[string][]string{}}
+	location := ""
 	bio := doc.Find(".listing-description").First().Clone()
 	bio.Find("h4").Remove()
 	d.Bio = clean(bio.Text())
@@ -132,11 +155,13 @@ func iyengarDetail(ctx context.Context, f Fetcher, r Record) (Record, error) {
 		case "website booking":
 			d.Websites = []string{firstNonEmpty(absURL(base, li.Find("a").AttrOr("href", "")), val)}
 		case "location":
+			location = val
 			// a free-form line ("Flat 4"), not the town of the list card
 			if !strings.EqualFold(val, r.City) {
 				d.Address = val
 			}
 		}
 	})
+	d.Country = iyengarCountry(location, r.City)
 	return d, nil
 }

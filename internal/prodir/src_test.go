@@ -44,9 +44,11 @@ func TestIyengarUKList(t *testing.T) {
 	got := collect(t, s, f)
 	want := []Record{
 		{ID: "alex-fixture-90001", URL: "https://iyengaryoga.org.uk/teacher/alex-fixture-90001/", Name: "Alex Fixture",
-			City: "Exampleton", Bio: "Synthetic teacher of the fixture method since 1999.", Meta: map[string][]string{"level": {"Level 2"}}},
+			City: "Exampleton", Country: "United Kingdom", Bio: "Synthetic teacher of the fixture method since 1999.", Meta: map[string][]string{"level": {"Level 2"}}},
 		{ID: "blair-placeholder-90002", URL: "https://iyengaryoga.org.uk/teacher/blair-placeholder-90002/", Name: "Blair Placeholder",
-			City: "Sampleford", Meta: map[string][]string{"level": {"Level 1"}}},
+			City: "Sampleford", Country: "United Kingdom", Meta: map[string][]string{"level": {"Level 1"}}},
+		{ID: "cameron-overseas-90003", URL: "https://iyengaryoga.org.uk/teacher/cameron-overseas-90003/", Name: "Cameron Overseas",
+			City: "Dublin, Ireland", Country: "Ireland", Meta: map[string][]string{"level": {"Level 3"}}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("records = %#v\nwant      %#v", got, want)
@@ -58,7 +60,7 @@ func TestIyengarUKList(t *testing.T) {
 	// without a pager in the page it walks until a page has no teachers
 	noPager := []byte(strings.Replace(string(page1), `"total_pages":2`, `"x":2`, 1))
 	f = &fakeFetcher{pages: map[string]Page{u("1"): {Body: noPager}, u("2"): {Body: page1}, u("3"): {Body: empty}}}
-	if got := collect(t, s, f); len(got) != 4 || len(f.calls) != 3 {
+	if got := collect(t, s, f); len(got) != 6 || len(f.calls) != 3 {
 		t.Errorf("no pager: %d records, requests %v", len(got), f.calls)
 	}
 
@@ -88,7 +90,7 @@ func TestIyengarUKDetail(t *testing.T) {
 		Emails: []string{"alex.fixture@example.org"}, Phones: []string{"01632 960123"},
 		Websites: []string{"https://alex-fixture.example.com"},
 		Address:  "Flat 4, 1 Example Road", Bio: "Synthetic teacher of the fixture method since 1999.",
-		Meta: map[string][]string{"level": {"Level 2"}},
+		Country: "United Kingdom", Meta: map[string][]string{"level": {"Level 2"}},
 	}
 	if !reflect.DeepEqual(d, want) {
 		t.Errorf("detail = %#v\nwant     %#v", d, want)
@@ -102,6 +104,34 @@ func TestIyengarUKDetail(t *testing.T) {
 	f.pages[r.URL] = Page{Body: []byte(strings.Replace(string(f.pages[r.URL].Body), "Flat 4, 1 Example Road", "exampleton", 1))}
 	if d, _ := s.Detail(context.Background(), f, r); d.Address != "" {
 		t.Errorf("address = %q, want empty", d.Address)
+	}
+
+	// a location that names another recognised country wins over the UK default,
+	// in the detail line and in the list card's town; an unknown last part does not
+	body := string(readFixture(t, "iyengaruk_profile_SYNTHETIC.html"))
+	for _, c := range []struct{ loc, city, want string }{
+		{"Flat 4, 1 Example Road, Ireland", "Exampleton", "Ireland"},
+		{"Flat 4, 1 Example Road", "Dublin, Ireland", "Ireland"},
+		{"Flat 4, 1 Example Road, Exampleshire", "Exampleton", "United Kingdom"},
+	} {
+		f.pages[r.URL] = Page{Body: []byte(strings.Replace(body, "Flat 4, 1 Example Road", c.loc, 1))}
+		d, err := s.Detail(context.Background(), f, Record{ID: r.ID, URL: r.URL, City: c.city})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Country != c.want {
+			t.Errorf("location %q city %q: country = %q, want %q", c.loc, c.city, d.Country, c.want)
+		}
+	}
+	f.pages[r.URL] = Page{Body: []byte(body)}
+
+	// the default resolves to GB, the exception to its own code
+	res := newCountryResolver()
+	if l := recordListing(s, Record{ID: "a", Country: "United Kingdom"}, res); l.CountryCode != "GB" {
+		t.Errorf("United Kingdom -> %q", l.CountryCode)
+	}
+	if l := recordListing(s, Record{ID: "b", Country: "Ireland"}, res); l.CountryCode != "IE" {
+		t.Errorf("Ireland -> %q", l.CountryCode)
 	}
 
 	// gone and layout-changed pages
@@ -185,6 +215,10 @@ func TestCrossFitAffiliatesList(t *testing.T) {
 			Meta: map[string][]string{"status": {"0"}, "kids": {"1"}, "established_date": {"2004-09-13"}}},
 		{ID: "90004", Name: "CrossFit No Site Fixture", Address: "4 Sample Way", City: "Placeholder",
 			Region: "ON", Country: "CA", Meta: map[string][]string{"status": {"2"}, "kids": {"0"}}},
+		// no bad_standing field at all, hidden from the map: still a live box
+		{ID: "90005", Name: "CrossFit No Standing Field Fixture", Address: "5 Sample Way", City: "Noflag", PostalCode: "00005",
+			Region: "Exampleland", Country: "United States",
+			Meta: map[string][]string{"status": {"0"}, "kids": {"0"}, "established_date": {"2015-05-05"}}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("records = %#v\nwant      %#v", got, want)
@@ -232,5 +266,22 @@ func TestProofSourcesListings(t *testing.T) {
 	if l.Domain != "9001.sharath.sharathyogacentre.com" || l.Niche != "yoga" || l.CountryCode != "US" ||
 		!reflect.DeepEqual(l.Meta["business_name"], []string{"Fixture Shala"}) {
 		t.Errorf("sharath listing = %+v", l)
+	}
+}
+
+func TestCrossFitLive(t *testing.T) {
+	for _, c := range []struct {
+		a    crossfitAffiliate
+		want bool
+	}{
+		{crossfitAffiliate{Active: "1", BadStanding: "0"}, true},
+		{crossfitAffiliate{Active: "1"}, true}, // no bad_standing field
+		{crossfitAffiliate{Active: "1", BadStanding: "1"}, false},
+		{crossfitAffiliate{Active: "0", BadStanding: "0"}, false},
+		{crossfitAffiliate{BadStanding: "0"}, false}, // no active field
+	} {
+		if got := c.a.live(); got != c.want {
+			t.Errorf("%+v live = %v, want %v", c.a, got, c.want)
+		}
 	}
 }
