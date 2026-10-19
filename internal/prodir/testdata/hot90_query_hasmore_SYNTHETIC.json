@@ -1,0 +1,377 @@
+{
+ "result": {
+  "type": "reducer",
+  "reducerResults": {
+   "collection_group_results": {
+    "type": "results",
+    "blockIds": [
+     "aaaaaaaa-0000-4000-8000-000000000001",
+     "aaaaaaaa-0000-4000-8000-000000000002",
+     "aaaaaaaa-0000-4000-8000-000000000003",
+     "aaaaaaaa-0000-4000-8000-000000000004",
+     "aaaaaaaa-0000-4000-8000-000000000005"
+    ],
+    "hasMore": true
+   }
+  }
+ },
+ "recordMap": {
+  "block": {
+   "aaaaaaaa-0000-4000-8000-000000000001": {
+    "value": {
+     "value": {
+      "id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "type": "page",
+      "alive": true,
+      "properties": {
+       "title": [
+        [
+         "Fixture Hot Studio"
+        ]
+       ],
+       ">XwH": [
+        [
+         "https://fixture-hot.example.com/?utm_source=ig&fbclid=ZZ",
+         [
+          [
+           "a",
+           "https://fixture-hot.example.com/?utm_source=ig&fbclid=ZZ"
+          ]
+         ]
+        ]
+       ],
+       "VzUO": [
+        [
+         "https://www.instagram.com/fixture_hot/",
+         [
+          [
+           "a",
+           "https://www.instagram.com/fixture_hot/"
+          ]
+         ]
+        ]
+       ],
+       "JRa>": [
+        [
+         "Fixtureville, California"
+        ]
+       ],
+       "cK;R": [
+        [
+         "Bay Area"
+        ]
+       ],
+       "C~Vs": [
+        [
+         "\ud83d\udd25Verified"
+        ]
+       ],
+       "]|gj": [
+        [
+         "Monday",
+         [
+          [
+           "b"
+          ]
+         ]
+        ],
+        [
+         "\n\u2022 6:00 AM"
+        ]
+       ],
+       "lhgs": [
+        [
+         "\u2023",
+         [
+          [
+           "plc",
+           {
+            "lat": 1.0,
+            "lon": 2.0,
+            "name": "Fixture Hot Studio",
+            "address": "Fixture Hot Studio, 1 Example Way, Fixtureville, CA 95000, United States"
+           }
+          ]
+         ]
+        ]
+       ]
+      }
+     },
+     "role": "reader"
+    }
+   },
+   "aaaaaaaa-0000-4000-8000-000000000002": {
+    "value": {
+     "value": {
+      "id": "aaaaaaaa-0000-4000-8000-000000000002",
+      "type": "page",
+      "alive": true,
+      "properties": {
+       "title": [
+        [
+         "Sample Heat"
+        ]
+       ],
+       ">XwH": [
+        [
+         "https://sampleheat.example.org",
+         [
+          [
+           "a",
+           "https://sampleheat.example.org"
+          ]
+         ]
+        ]
+       ],
+       "VzUO": [],
+       "JRa>": [
+        [
+         "Sampleton, California"
+        ]
+       ],
+       "cK;R": [
+        [
+         "Southern California"
+        ]
+       ],
+       "C~Vs": [
+        [
+         "\ud83d\udd25Verified"
+        ]
+       ],
+       "]|gj": [
+        [
+         "Monday",
+         [
+          [
+           "b"
+          ]
+         ]
+        ],
+        [
+         "\n\u2022 6:00 AM"
+        ]
+       ]
+      }
+     },
+     "role": "reader"
+    }
+   },
+   "aaaaaaaa-0000-4000-8000-000000000003": {
+    "value": {
+     "value": {
+      "id": "aaaaaaaa-0000-4000-8000-000000000003",
+      "type": "page",
+      "alive": true,
+      "properties": {
+       "title": [
+        [
+         ""
+        ]
+       ],
+       ">XwH": [
+        [
+         "https://noname.example.org",
+         [
+          [
+           "a",
+           "https://noname.example.org"
+          ]
+         ]
+        ]
+       ],
+       "VzUO": [],
+       "JRa>": [
+        [
+         ""
+        ]
+       ],
+       "cK;R": [
+        [
+         ""
+        ]
+       ],
+       "C~Vs": [
+        [
+         "\ud83d\udd25Verified"
+        ]
+       ],
+       "]|gj": [
+        [
+         "Monday",
+         [
+          [
+           "b"
+          ]
+         ]
+        ],
+        [
+         "\n\u2022 6:00 AM"
+        ]
+       ]
+      }
+     },
+     "role": "reader"
+    }
+   },
+   "aaaaaaaa-0000-4000-8000-000000000004": {
+    "value": {
+     "value": {
+      "id": "aaaaaaaa-0000-4000-8000-000000000004",
+      "type": "page",
+      "alive": true,
+      "properties": {
+       "title": [
+        [
+         "Closed Place"
+        ]
+       ],
+       ">XwH": [
+        [
+         "https://closed.example.org",
+         [
+          [
+           "a",
+           "https://closed.example.org"
+          ]
+         ]
+        ]
+       ],
+       "VzUO": [],
+       "JRa>": [
+        [
+         "Closedville, California"
+        ]
+       ],
+       "cK;R": [
+        [
+         "Bay Area"
+        ]
+       ],
+       "C~Vs": [
+        [
+         "Closed"
+        ]
+       ],
+       "]|gj": [
+        [
+         "Monday",
+         [
+          [
+           "b"
+          ]
+         ]
+        ],
+        [
+         "\n\u2022 6:00 AM"
+        ]
+       ]
+      }
+     },
+     "role": "reader"
+    }
+   },
+   "aaaaaaaa-0000-4000-8000-000000000005": {
+    "value": {
+     "value": {
+      "id": "aaaaaaaa-0000-4000-8000-000000000005",
+      "type": "page",
+      "alive": false,
+      "properties": {
+       "title": [
+        [
+         "Gone Studio"
+        ]
+       ],
+       ">XwH": [
+        [
+         "https://gone.example.org",
+         [
+          [
+           "a",
+           "https://gone.example.org"
+          ]
+         ]
+        ]
+       ],
+       "VzUO": [],
+       "JRa>": [
+        [
+         ""
+        ]
+       ],
+       "cK;R": [
+        [
+         ""
+        ]
+       ],
+       "C~Vs": [
+        [
+         "\ud83d\udd25Verified"
+        ]
+       ],
+       "]|gj": [
+        [
+         "Monday",
+         [
+          [
+           "b"
+          ]
+         ]
+        ],
+        [
+         "\n\u2022 6:00 AM"
+        ]
+       ]
+      }
+     },
+     "role": "reader"
+    }
+   }
+  },
+  "collection": {
+   "c1": {
+    "value": {
+     "value": {
+      "id": "c1",
+      "schema": {
+       "title": {
+        "name": "Studio Name",
+        "type": "title"
+       },
+       ">XwH": {
+        "name": "Website",
+        "type": "url"
+       },
+       "VzUO": {
+        "name": "Instagram",
+        "type": "url"
+       },
+       "JRa>": {
+        "name": "City",
+        "type": "text"
+       },
+       "cK;R": {
+        "name": "Region",
+        "type": "select"
+       },
+       "lhgs": {
+        "name": "Place",
+        "type": "place"
+       },
+       "C~Vs": {
+        "name": "Status",
+        "type": "select"
+       },
+       "]|gj": {
+        "name": "Schedule",
+        "type": "text"
+       }
+      }
+     },
+     "role": "reader"
+    }
+   }
+  }
+ }
+}

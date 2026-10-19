@@ -1,0 +1,113 @@
+{
+ "$type": "p",
+ "Items": {
+  "$type": "l",
+  "$values": [
+   {
+    "$type": "x",
+    "EntityTypeName": "x",
+    "Properties": {
+     "$type": "y",
+     "$values": [
+      {
+       "$type": "z",
+       "Name": "ID",
+       "Value": "80001"
+      },
+      {
+       "$type": "z",
+       "Name": "Company",
+       "Value": "Example Studio Collective"
+      },
+      {
+       "$type": "z",
+       "Name": "Email",
+       "Value": "studio@example.com"
+      },
+      {
+       "$type": "z",
+       "Name": "Mobile",
+       "Value": "0455 555 104"
+      },
+      {
+       "$type": "z",
+       "Name": "Phone",
+       "Value": "02 5550 0105"
+      },
+      {
+       "$type": "z",
+       "Name": "Website",
+       "Value": "https://example-collective.example.com"
+      },
+      {
+       "$type": "z",
+       "Name": "FullAddress",
+       "Value": "9 Studio Way Exampleville NSW 2000"
+      },
+      {
+       "$type": "z",
+       "Name": "City",
+       "Value": "Exampleville"
+      },
+      {
+       "$type": "z",
+       "Name": "Zip",
+       "Value": "2000"
+      },
+      {
+       "$type": "z",
+       "Name": "Country",
+       "Value": "Australia"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberType",
+       "Value": "STDIO"
+      }
+     ]
+    }
+   },
+   {
+    "$type": "x",
+    "EntityTypeName": "x",
+    "Properties": {
+     "$type": "y",
+     "$values": [
+      {
+       "$type": "z",
+       "Name": "ID",
+       "Value": "70001"
+      },
+      {
+       "$type": "z",
+       "Name": "Company",
+       "Value": "Same Id As Member"
+      },
+      {
+       "$type": "z",
+       "Name": "Email",
+       "Value": "x@example.com"
+      },
+      {
+       "$type": "z",
+       "Name": "Country",
+       "Value": "Australia"
+      },
+      {
+       "$type": "z",
+       "Name": "MemberType",
+       "Value": "STDIO"
+      }
+     ]
+    }
+   }
+  ]
+ },
+ "Offset": 0,
+ "Limit": 500,
+ "Count": 2,
+ "TotalCount": 2,
+ "NextPageLink": null,
+ "HasNext": false,
+ "NextOffset": 0
+}
