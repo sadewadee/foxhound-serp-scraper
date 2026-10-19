@@ -1,0 +1,4 @@
+{"results":[
+{"id":2001,"name":"Alex Fixture","level_marker":"Level 3 (Senior, 1000hr)","lane":"senior","cred_labels":["Registered Senior Teacher"],"specialties":["yoga-therapy"],"spec_labels":["Yoga Therapist","Prenatal Yoga"],"suburb":"Exampleton","state":"VIC","bio_excerpt":"Teaches in Exampleton. Write to alex@example.com.","profile_url":"https://yogaaustralia.org.au/teachers/alex-fixture/","distance_km":null},
+{"id":2002,"name":"Blair Placeholder","level_marker":"Level 2 (500hr)","cred_labels":[],"spec_labels":[],"suburb":"","state":"NSW","bio_excerpt":"","profile_url":"https://yogaaustralia.org.au/teachers/blair-placeholder/"}
+],"count":3,"returned":2,"offset":0,"limit":100}

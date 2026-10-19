@@ -1,0 +1,4 @@
+{"results":[
+{"id":2003,"name":"Cameron Overseas","level_marker":"Level 1 (350hr)","cred_labels":["Registered Teacher"],"spec_labels":[],"suburb":"Sampleford","state":"QLD","bio_excerpt":"","profile_url":"https://yogaaustralia.org.au/teachers/cameron-overseas/"},
+{"id":2001,"name":"Alex Fixture","level_marker":"Level 3","suburb":"Exampleton","state":"VIC"}
+],"count":3,"returned":2,"offset":2,"limit":100}

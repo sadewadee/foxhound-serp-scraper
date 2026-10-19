@@ -1,0 +1,8 @@
+{"results":[
+{"id":3001,"type":"teacher","name":"Alex Fixture","image":"","location":"Exampleton, VIC","description":"","link":"https://iyengaryoga.asn.au/blog/teacher/alex-fixture/","email":"alex@example.com","phone":"+61 400 555 010","website":"https://alex.example.com","school":"Fixture Iyengar Yoga","geo":"-37.7,145.0"},
+{"id":3002,"type":"school","name":"Fixture Iyengar Yoga","location":"Exampleton, VIC","address":"1 Example Street, Exampleton VIC 3000","link":"https://iyengaryoga.asn.au/blog/studio/fixture-iyengar-yoga/","email":"studio@example.org","phone":"03 5550 0102","website":""},
+{"id":3003,"type":"teacher","name":"Blair Placeholder","location":"Sampleford, Ireland","link":"https://iyengaryoga.asn.au/blog/teacher/blair-placeholder/","email":"","phone":"","website":""},
+{"id":3004,"type":"teacher","name":"Cameron Overseas","location":"","link":"","email":"cameron@example.com","phone":"","website":""},
+{"id":3001,"type":"teacher","name":"Alex Fixture (dup)","location":"","link":"","email":"","phone":"","website":""},
+{"id":3005,"type":"teacher","name":"  ","location":"","link":""}
+],"total":6,"location_found":false}
