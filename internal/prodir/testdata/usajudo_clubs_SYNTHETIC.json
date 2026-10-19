@@ -1,0 +1,14 @@
+{"total":"2","page":0,"items_per_page":100,"next_page_url":null,"data":[
+{"id":"930001","is_event":false,"name":"Fixture Judo Club","subtitle":"Club Membership","address":"1 Example Street, Suite 2, Exampleton, Exampleland, United States of America, 90000","geolocation":{"lng":"-100.0","lat":"40.0"},"telephone":null,"email":null,
+ "info":[{"title":"Club Membership","value":{"type":"label","text":"Current","icon":null,"style":"success","tooltip":null,"dialog":null}},
+         {"title":"Club Membership Type","value":"Club Membership"},
+         {"title":"State","value":"Exampleland Judo Inc."},
+         {"title":"Phone Number","value":"+1 555-010-0199"},
+         {"title":"Email Address","value":"Dojo@Example.org"},
+         {"title":"Organization Website","value":"www.example.org/judo"},
+         {"title":"Senior","value":"Monday,  Wednesday"},
+         {"title":"Senior - Additional Information","value":"7:00PM - 8:00PM"},
+         {"title":"Junior","value":"Tuesday"}],"actions":[]},
+{"id":"930002","is_event":false,"name":"Sample Judo School","subtitle":"Club Membership","address":"22 Placeholder Road, Sampleford, SF, United States of America, 90001-1234","telephone":null,"email":null,
+ "info":[{"title":"Phone Number","value":"n/a"},{"title":"Email Address","value":"not an email"}],"actions":[]}
+]}
