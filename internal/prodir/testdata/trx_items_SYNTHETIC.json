@@ -1,0 +1,6 @@
+{"items":[
+{"id":"00000000-0000-4000-8000-000000000001","name":"Alex Fixture","gender":"F","description":"Synthetic suspension trainer. Contact alex@example.com.","certifications":null,"website":"https://alex-fixture.example.com","postalCode":"90001","countryCode":"US","address":"1 Example St, Exampleton","locations":["Exampleton","Sampleford"],"services":["Functional Training","Suspension Training"],"languages":["English"],"socials":[{"type":"Instagram","handle":"@alex.fixture"},{"type":"Facebook","handle":"https://www.facebook.com/alex.fixture"},{"type":"Linkedin","handle":"alex-fixture"},{"type":"Whatsapp","handle":"+1 555 555 0111"}],"credentials":["TRX Suspension Training Qualified","TRX TEAM"],"rank":"Black & Yellow"},
+{"id":"00000000-0000-4000-8000-000000000002","name":"Blair Placeholder","description":null,"website":null,"postalCode":null,"countryCode":null,"address":null,"locations":[],"services":[],"languages":[],"socials":[{"type":"Tiktok","handle":"blair_p"},{"type":"Youtube","handle":"not a url"},{"type":"Whatsapp","handle":"n/a"}],"credentials":["TRX Suspension Training Qualified"],"rank":"Gray"},
+{"id":"","name":"No Id","credentials":[]},
+{"id":"00000000-0000-4000-8000-000000000003","name":"  ","credentials":[]}
+]}

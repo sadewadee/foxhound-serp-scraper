@@ -1,0 +1,5 @@
+[
+{"id":501,"user_id":70001,"is_open_to_work":true,"about":"Synthetic coach.","headline":"Fixture coach","is_contactable":true,"is_visible":true,"level":"L4","level_label":"Certified CrossFit Level 4 Coach (CF-L4)","first_name":"Alex","last_name":"Fixture","city":"Exampleton","state":"CA","zip":"90001","country":"USA","country_name":"United States","country_code":"US","certifications":[{"name":"Scaling","email":"alex@example.com","level":"SPECIALTY","active":true},{"name":"CF-L4","email":"alex@example.com","level":"L4","active":true},{"name":"Old","email":"alex2@example.org","level":"SPECIALTY","active":false}]},
+{"id":502,"user_id":70002,"is_contactable":false,"is_visible":true,"level":"L1","first_name":"Blair","last_name":"Placeholder","city":"Sampleford","country_name":"United Kingdom","country_code":"GB","certifications":[{"name":"CF-L1","email":"blair@example.com","level":"L1","active":true}]},
+{"id":503,"user_id":70003,"is_visible":false,"level":"L1","first_name":"Hidden","last_name":"Coach","certifications":[{"name":"CF-L1","email":"hidden@example.com","level":"L1","active":true}]}
+]
