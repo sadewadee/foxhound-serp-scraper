@@ -1,11 +1,20 @@
-// Command prodir crawls two curated professional directories — ACE Fitness
-// "Find an ACE Pro" (~76k certified trainers) and the ICF coach finder (~36k
-// coaches) — into append-only JSONL state files, exports them to CSV and
-// loads them into the existing database.
+// Command prodir crawls curated professional directories — ACE Fitness
+// "Find an ACE Pro" (~76k certified trainers), the ICF coach finder (~36k
+// coaches) and any number of generic sources (yoga / Pilates / fitness /
+// CrossFit / swimming / sports coach finders) — into append-only JSONL state
+// files, exports them to CSV and loads them into the existing database.
 //
-// Why: both are curated, 100%-in-niche directories (fitness / coaching) with
-// real names, locations and, for many records, a phone and an own website
-// (ICF also publishes an email). Same idea as cmd/yogaalliance.
+// Why: they are curated, 100%-in-niche directories with real names, locations
+// and, for many records, a phone, an email and an own website. Same idea as
+// cmd/yogaalliance.
+//
+// Generic sources: ace and icf are bespoke modules; every other directory is
+// one small file in internal/prodir (src_<slug>.go) that registers a Source —
+// a List func and an optional Detail func — and gets list / profiles / export /
+// load, rate limiting, retries, resumable state and the circuit breaker for
+// free. `prodir sources` prints what is registered (slug, category, niche,
+// listing_type, host, name). `prodir <slug> <list|profiles|export|load>` takes
+// the same flags as ace / icf. How to add one: internal/prodir/source.go.
 //
 // API (no auth, cookies only):
 //
@@ -15,12 +24,21 @@
 //	     POST https://icf-ccf.azurewebsites.net/api/search           (take=1000 per page)
 //	     GET  https://apps.coachingfederation.org/eweb/CCFDynamicPage.aspx?webcode=ccfcoachprofileview&coachcstkey=<key>&site=icfapp
 //
-// State dir (-state, default "data"; the file names and JSON shapes are those
-// of the original Python scrapers, so a dir written by either is readable by
-// the other):
+// State dir (-state, default "data"; the ace / icf file names and JSON shapes
+// are those of the original Python scrapers, so a dir written by either is
+// readable by the other):
 //
 //	ace_list.jsonl  ace_profiles.jsonl  ace_profiles_errors.jsonl
 //	icf_list.jsonl  icf_profiles.jsonl  icf_countries.json
+//
+// and, per generic source, one Record (internal/prodir/source.go) per line:
+//
+//	<slug>_list.jsonl             from `list`; re-running may append duplicates,
+//	                              readers dedupe by id, last wins
+//	<slug>_profiles.jsonl         from `profiles` (list record merged with the
+//	                              detail page); resumable, a 404 is stored as
+//	                              missing=true and never refetched
+//	<slug>_profiles_errors.jsonl  {"id","url","error"}
 //
 // DB mapping for `load` (EXISTING tables, plus business_meta which `load`
 // creates if missing via db.EnsureBusinessMeta):
@@ -43,6 +61,23 @@
 //     profile label under its CSV column name. Returned as data[].meta by
 //     GET /api/v2/results.
 //
+// Generic sources map the same way, with: category = the record's override or
+// the source's Category; niche_category from the one category -> niche map
+// below (an empty niche is stored as NULL); synthetic unique domain
+// "<id>.<slug>.<host>" (an id that is not a DNS label is replaced by the first
+// 16 hex chars of its sha1); website = the first structured own site, else the
+// profile URL; emails / phones / social = structured values plus whatever
+// extract.go finds in the bio; country only from the curated whitelist; meta =
+// the record's labels plus source_directory, listing_type and business_name.
+//
+//	pilates_instructor                        pilates
+//	yoga_teacher, hot_yoga_teacher            yoga
+//	fitness_trainer, crossfit_trainer,
+//	swimming_coach, sports_martial_arts       fitness
+//	sports_tennis, sports_golf, sports_pickleball, sports_running,
+//	sports_triathlon, sports_cycling,
+//	sports_equestrian                         NULL
+//
 // Proxy: there is no proxy flag; HTTPS_PROXY / NO_PROXY are honoured.
 //
 // Exit codes: 0 ok, 1 some items failed, 2 circuit breaker tripped, 130 interrupted.
@@ -55,6 +90,10 @@
 //	./prodir ace export   -state data                       # → data/ace_pros.csv
 //	./prodir icf load     -state data -dry-run              # mapping stats, no DB
 //	./prodir icf load     -state data                       # → DB (POSTGRES_DSN)
+//	./prodir sources                                        # registered generic sources
+//	./prodir iyengaruk list     -state data
+//	./prodir iyengaruk profiles -state data -workers 2 -limit 50
+//	./prodir iyengaruk load     -state data -dry-run
 package main
 
 import (
@@ -74,16 +113,33 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: prodir <ace|icf> <list|profiles|export|load> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: prodir <ace|icf|slug> <list|profiles|export|load> [flags]\n       prodir sources")
 	os.Exit(prodir.ExitErrors)
 }
 
+// printSources lists the registered generic sources.
+func printSources() {
+	fmt.Printf("%-22s %-20s %-8s %-12s %-26s %s\n", "slug", "category", "niche", "listing_type", "host", "name")
+	for _, s := range prodir.Sources() {
+		niche := prodir.Niche(s.Category)
+		if niche == "" {
+			niche = "(null)"
+		}
+		fmt.Printf("%-22s %-20s %-8s %-12s %-26s %s\n", s.Slug, s.Category, niche, s.ListingType, s.Host, s.Name)
+	}
+}
+
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "sources" {
+		printSources()
+		return
+	}
 	if len(os.Args) < 3 {
 		usage()
 	}
 	source, action := os.Args[1], os.Args[2]
-	if source != "ace" && source != "icf" {
+	generic, isGeneric := prodir.LookupSource(source)
+	if source != "ace" && source != "icf" && !isGeneric {
 		usage()
 	}
 
@@ -100,7 +156,7 @@ func main() {
 		workers = fs.Int("workers", 6, "concurrent workers")
 		limit = fs.Int("limit", 0, "max profiles to fetch (0 = all)")
 	case "export":
-		out = fs.String("out", "", "CSV path (default <state>/ace_pros.csv | <state>/icf_coaches.csv)")
+		out = fs.String("out", "", "CSV path (default <state>/ace_pros.csv | <state>/icf_coaches.csv | <state>/<slug>.csv)")
 	case "load":
 		dsn = fs.String("dsn", os.Getenv("POSTGRES_DSN"), "Postgres DSN (default $POSTGRES_DSN)")
 		limit = fs.Int("limit", 0, "max records (0 = all)")
@@ -113,7 +169,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	code, err := run(ctx, source, action, *state, workers, limit, out, dsn, dryRun)
+	code, err := run(ctx, source, generic, action, *state, workers, limit, out, dsn, dryRun)
 	if err != nil {
 		slog.Error("prodir failed", "source", source, "action", action, "error", err)
 		if code == prodir.ExitOK {
@@ -123,20 +179,31 @@ func main() {
 	os.Exit(code)
 }
 
-func run(ctx context.Context, source, action, state string, workers, limit *int, out, dsn *string, dryRun *bool) (int, error) {
+// run executes one action; generic is the registered source of a generic slug
+// (nil for ace / icf).
+func run(ctx context.Context, source string, generic *prodir.Source, action, state string, workers, limit *int, out, dsn *string, dryRun *bool) (int, error) {
 	switch action {
 	case "list":
-		if source == "ace" {
+		switch {
+		case generic != nil:
+			return prodir.SourceList(ctx, state, generic, *limit)
+		case source == "ace":
 			return prodir.ACEList(ctx, state, *workers, *limit)
 		}
 		return prodir.ICFList(ctx, state)
 	case "profiles":
-		if source == "ace" {
+		switch {
+		case generic != nil:
+			return prodir.SourceProfiles(ctx, state, generic, *workers, *limit)
+		case source == "ace":
 			return prodir.ACEProfiles(ctx, state, *workers, *limit)
 		}
 		return prodir.ICFProfiles(ctx, state, *workers, *limit)
 	case "export":
-		if source == "ace" {
+		switch {
+		case generic != nil:
+			return prodir.ExitOK, prodir.SourceExport(state, generic, *out)
+		case source == "ace":
 			return prodir.ExitOK, prodir.ACEExport(state, *out)
 		}
 		return prodir.ExitOK, prodir.ICFExport(state, *out)

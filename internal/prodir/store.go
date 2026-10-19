@@ -526,7 +526,11 @@ func PrintStats(w io.Writer, source string, ls []Listing) {
 	}
 	sort.Strings(nk)
 	for _, k := range nk {
-		fmt.Fprintf(w, "niche %-10s %d\n", k, niche[k])
+		label := k
+		if label == "" {
+			label = "(null)"
+		}
+		fmt.Fprintf(w, "niche %-10s %d\n", label, niche[k])
 	}
 
 	var sk []string
@@ -571,7 +575,8 @@ func PrintStats(w io.Writer, source string, ls []Listing) {
 	}
 }
 
-// Listings builds the listings of a source ("ace" | "icf") from a state dir.
+// Listings builds the listings of a source ("ace", "icf" or the slug of a
+// registered generic source) from a state dir.
 func Listings(source, dir string) ([]Listing, error) {
 	res := newCountryResolver()
 	switch source {
@@ -579,6 +584,9 @@ func Listings(source, dir string) ([]Listing, error) {
 		return aceListings(dir, res)
 	case "icf":
 		return icfListings(dir, res)
+	}
+	if s, ok := LookupSource(source); ok {
+		return sourceListings(dir, s, res)
 	}
 	return nil, fmt.Errorf("unknown source %q", source)
 }
@@ -603,6 +611,9 @@ var freeMail = map[string]bool{
 // and churn the worker (the 2026-06-01 YogaAlliance churn, see the comment above
 // eligibilityQuery in internal/stage/reenrich.go).
 //
+// An empty niche (the generic sports sources have no niche bucket yet) is stored
+// as NULL.
+//
 // niche_source, geo_source and completeness_score stay NULL — NULL marks the
 // value as authoritative, as for the yogaalliance rows.
 const upsertListingSQL = `
@@ -610,7 +621,7 @@ INSERT INTO business_listings
   (domain, url, business_name, contact_name, category, niche_category, off_niche,
    phone, phones, website, address, location, city, country, country_code,
    description, social_links, re_enriched_at, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, false,
+VALUES ($1, $2, $3, $4, $5, NULLIF($6::text,''), false,
    NULLIF($7::text,''), COALESCE($16::text[], '{}'::text[]),
    $8, NULLIF($9::text,''), NULLIF($10::text,''), NULLIF($11::text,''),
    NULLIF($12::text,''), NULLIF($13::text,'')::char(2),
