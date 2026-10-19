@@ -1,0 +1,4 @@
+{"total":4,"results":[
+{"id":"5001","archived":false,"properties":{"name":"Fixture Swim School","address":"1 Example St","address2":"Unit 2","city":"Exampleton","state":"NSW","zip":"2000","business_email":"info@example.com.au","phone":"02 5550 0101","website":"fixtureswim.example.com.au","swim_school_recognition_level":"Premium","type":"Swim Centre","allow_directory_search":"Yes"}},
+{"id":"5002","archived":false,"properties":{"name":"Hidden Fixture School","address":"","city":"Nowhere","state":"VIC","business_email":"hidden@example.com.au","phone":"","website":"","allow_directory_search":"No"}}
+],"paging":{"next":{"after":"2"}}}

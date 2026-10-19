@@ -1,0 +1,6 @@
+{"data":{"totalResults":3,"clubs":[
+ {"id":"g1","title":"Fixture Masters","url":"/clubs/fixture-masters","description":"A fixture team. Reach us at bio@example.com","practiceTimes":"Mon 6am","abbreviation":"FIXM","isGold":true,"trialMembership":true,"tryMasters":false,"fitnessSeries":false,"badges":[{"label":"USMS Member Club"},{"label":"USMS Certified Coach"}],"salesforceId":"sf-shared",
+  "location":[{"name":"Fixture Natatorium","address1":"1 Example Way","address2":null,"city":"Exampleville","state":"CO","zip":"80001","poolType":"Indoor"},{"name":"Second Pool","address1":"2 Sample Rd","address2":"","city":"Samplecity","state":"CO","zip":"80002","poolType":null}]},
+ {"id":"g2","title":"Second Fixture Swim","url":"/clubs/second-fixture","description":"","practiceTimes":"","abbreviation":"SFS","isGold":false,"trialMembership":false,"tryMasters":false,"fitnessSeries":false,"badges":[],"salesforceId":"sf-shared","location":[]},
+ {"id":"g3","title":"  ","url":"/clubs/untitled","description":"","practiceTimes":"","abbreviation":"","badges":[],"location":[]}
+]}}
