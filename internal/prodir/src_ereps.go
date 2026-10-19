@@ -12,8 +12,8 @@ package prodir
 // The profile adds only an optional website (the globe icon link) and the
 // free-text "About me" bio. There is no email, phone, address or social
 // profile (contact is a logged-in form), so Detail is only worth it for the
-// website. robots.txt asks for Crawl-delay 10 but allows these paths; the
-// crawl runs at 1s like the other sources.
+// website. robots.txt asks for Crawl-delay 10 and allows these paths, so
+// MinInterval is 10 s.
 
 import (
 	"context"
@@ -33,7 +33,7 @@ const erepsDefaultBio = "This member is a Registered Exercise Professional."
 func init() {
 	register(&Source{
 		Slug: "ereps", Name: "EREPS member directory", Host: "www.ereps.eu",
-		Category: "fitness_trainer", ListingType: "individual", MinInterval: time.Second,
+		Category: "fitness_trainer", ListingType: "individual", MinInterval: 10 * time.Second,
 		List: erepsList, Detail: erepsDetail,
 	})
 }
