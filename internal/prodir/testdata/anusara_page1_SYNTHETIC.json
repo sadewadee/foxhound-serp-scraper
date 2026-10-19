@@ -1,0 +1,4 @@
+{"result":{"data":[
+{"_id":"a0000001-0000-4000-8000-000000000001","info":{"name":{"first":"Alex","last":"Fixture"},"emails":[{"tag":"MAIN","email":"alex.main@example.com","primary":false},{"tag":"WORK","email":"alex@example.com","primary":true}],"phones":[{"tag":"MOBILE","phone":"5550100","formattedPhone":"+1 555-0100","primary":true}],"extendedFields":{"custom.pais":"United States Of America","custom.role":"L2-IAYT"}},"primaryInfo":{"email":"alex@example.com","phone":"5550100"},"parsedRoles":["L2-IAYT","ECATT"]},
+{"_id":"a0000002-0000-4000-8000-000000000002","info":{"name":{"first":"Blair","last":"Placeholder"},"emails":[{"tag":"MAIN","email":"blair@example.org","primary":true}],"extendedFields":{"custom.role":"CATT"}},"primaryInfo":{"email":"blair@example.org"},"parsedRoles":[]}
+],"pagination":{"page":1,"pageSize":50,"hasNext":true,"hasPrev":false}}}
