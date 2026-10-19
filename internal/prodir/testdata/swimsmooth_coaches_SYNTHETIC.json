@@ -1,0 +1,5 @@
+{"success":true,"count":3,"payload":[
+{"id":"p1","data":{"shortCode":"Fixt","displayName":"Fixture Coach","brandName":"Fixture Swim Co","brandLocation":"Exampleton, CA, USA","email":"coach@example.com","phone":"+1 555 010 0100","description":"<p>Fixture <b>bio</b> text.</p>","mainWebsite":{"url":"www.fixture-swim.example.com","display":"www.fixture-swim.example.com"},"bookingWebsite":{"url":"https://book.example.com/fixture","display":"book"},"instagram":"https://www.instagram.com/fixturecoach","facebook":"Fixture Coach Page","linkedin":"","twitter":"https://x.com/fixturecoach","tiktok":"","certified":true,"tags":["Certified Coach","Mentor"],"services":["1 to 1 Sessions (Pool)"]}},
+{"id":"p2","data":{"shortCode":"C2024-sample","displayName":"Sample Coach","brandName":"","brandLocation":"Western Australia","email":"","phone":"","description":"","mainWebsite":{},"bookingWebsite":{},"certified":false,"tags":[],"services":[]}},
+{"id":"p3","data":{"shortCode":"","displayName":"","brandName":"Nameless"}}
+]}

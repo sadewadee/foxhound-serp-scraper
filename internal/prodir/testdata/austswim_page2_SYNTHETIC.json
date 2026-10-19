@@ -1,0 +1,4 @@
+{"total":4,"results":[
+{"id":"5003","archived":false,"properties":{"name":"Overseas Fixture Aquatics","address":"3 Sample Rd","city":"Samplecity","state":"INT","zip":"","business_email":"os@example.com.au","phone":"555 0103","website":"-","swim_school_recognition_level":"Standard","type":"Swim Centre","allow_directory_search":null}},
+{"id":"5004","archived":true,"properties":{"name":"Archived Fixture","state":"QLD"}}
+]}
