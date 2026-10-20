@@ -74,6 +74,7 @@ import (
 	"github.com/lib/pq"
 
 	appdb "github.com/sadewadee/serp-scraper/internal/db"
+	"github.com/sadewadee/serp-scraper/internal/prodir"
 )
 
 const (
@@ -508,8 +509,21 @@ func parseTeacher(body []byte) *entry {
 	}
 }
 
+// addressCountry is the canonical country named by the last comma-separated
+// part of a free-text address, or "" when that part is not a recognised
+// country (invariant #6: never guessed, and a lone part is not a country).
+func addressCountry(addr string) string {
+	parts := strings.Split(addr, ",")
+	if len(parts) < 2 {
+		return ""
+	}
+	name, _ := prodir.ResolveCountry(parts[len(parts)-1])
+	return name
+}
+
 // parseSchool maps getSchoolDetails. The API gives one free-text address (no
-// city/country fields), so city/state/country stay empty rather than guessed.
+// city/state/country fields), so only the country is taken, from its trailing
+// part and only when that resolves; city/state stay empty rather than guessed.
 func parseSchool(body []byte) *entry {
 	var r schoolResp
 	if json.Unmarshal(body, &r) != nil || r.ReturnValue.Id == "" {
@@ -519,7 +533,7 @@ func parseSchool(body []byte) *entry {
 	return &entry{
 		kind: kindSchool,
 		id:   v.Id, name: clean(v.DirectoryName), email: strings.TrimSpace(v.Email), emailPublished: v.Email != "",
-		address: clean(v.Address), website: strings.TrimSpace(v.Website),
+		address: clean(v.Address), country: addressCountry(v.Address), website: strings.TrimSpace(v.Website),
 		instagram: strings.TrimSpace(v.Instagram), facebook: strings.TrimSpace(v.Facebook),
 		designation: clean(v.Designation), yogaTypes: clean(v.TypesOfYoga),
 		trainingFormats: clean(v.TrainingFormats), biography: clean(v.Biography),

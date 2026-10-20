@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/lib/pq"
 
@@ -249,6 +250,13 @@ func (r *countryResolver) resolve(raw string) (name, code string) {
 	}
 	return "", ""
 }
+
+var sharedCountries = sync.OnceValue(newCountryResolver)
+
+// ResolveCountry is the exported entry to the curated resolver for other
+// commands: (canonical name, ISO-2) of a country name/alias/code, or empty
+// strings when it is not recognised. It never guesses.
+func ResolveCountry(raw string) (name, code string) { return sharedCountries().resolve(raw) }
 
 // ---------- source -> Listing ----------
 
