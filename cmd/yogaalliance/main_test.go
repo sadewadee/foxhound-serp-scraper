@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/sadewadee/serp-scraper/internal/db"
@@ -158,5 +159,32 @@ func TestUpsertMeta(t *testing.T) {
 	var n int
 	if err := d.QueryRow(`SELECT COUNT(*) FROM business_listings WHERE category = 'yogaalliance'`).Scan(&n); err != nil || n != 2 {
 		t.Errorf("listings = %d (err %v), want 2", n, err)
+	}
+}
+
+func TestAddressCountry(t *testing.T) {
+	for _, c := range []struct{ addr, want string }{
+		{"3 School Ave, Exampleville, CA 90210, USA", "United States"},
+		{"12 Rue Exemple, Paris, France", "France"},
+		{"7 Example Rd, Ubud, Bali, Indonesia ", "Indonesia"},
+		{"5 Example St, Springfield, Narnia", ""}, // unresolvable tail stays empty
+		{"3 School Ave, Exampleville", ""},        // a trailing city is never a country
+		{"Exampleville", ""},                      // lone part: no guess
+		{"Indonesia", ""},                         // lone part, even if it is a country name
+		{"", ""},
+	} {
+		if got := addressCountry(c.addr); got != c.want {
+			t.Errorf("addressCountry(%q) = %q, want %q", c.addr, got, c.want)
+		}
+	}
+}
+
+func TestParseSchoolCountry(t *testing.T) {
+	if e := parseSchool([]byte(schoolJSON)); e == nil || e.country != "" {
+		t.Fatalf("school with city-only tail: want empty country, got %+v", e)
+	}
+	e := parseSchool([]byte(strings.Replace(schoolJSON, "3 School Ave, Exampleville", "3 School Ave, Exampleville, Indonesia", 1)))
+	if e == nil || e.country != "Indonesia" {
+		t.Fatalf("want Indonesia, got %+v", e)
 	}
 }
