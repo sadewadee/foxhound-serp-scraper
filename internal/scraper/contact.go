@@ -1274,9 +1274,9 @@ func isCleanEmail(email string) bool {
 	if dotIdx < 0 {
 		return false
 	}
-	// Accept only ICANN public suffixes (incl. multi-label ones like co.uk);
-	// glued garbage TLDs come back icann=false from the Public Suffix List.
-	if _, icann := publicsuffix.PublicSuffix(strings.ToLower(domain)); !icann {
+	// Accept any ICANN TLD; glued garbage (inivie.comview) is not one. Only the
+	// last label is checked so private-suffix domains (studio.uk.com) still pass.
+	if _, icann := publicsuffix.PublicSuffix(strings.ToLower(domain[dotIdx+1:])); !icann {
 		return false
 	}
 

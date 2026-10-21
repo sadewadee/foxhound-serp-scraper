@@ -296,8 +296,8 @@
 # v0.9.20-niche = v0.9.19 + ENRICH_TIMEOUT_MS env knob (enrich per-job fetch timeout, default 15000), image-relevant change only.
 # v0.9.21-niche = v0.9.20 + contact-page email extractor fixes, image-relevant change only:
 #   • isCleanEmail used a hand-curated TLD whitelist that dropped real addresses
-#     (.ky .rocks .fit .nyc .eu .ai .llc ...). Now validated against the ICANN
-#     Public Suffix List; glued garbage TLDs (inivie.comview) are still rejected.
+#     (.ky .rocks .fit .nyc .eu .ai .llc ...). Now the TLD is validated against the
+#     ICANN Public Suffix List; glued garbage TLDs (inivie.comview) are still rejected.
 #   • Bare email as the whole href value (<a href="a@b.ca">, no mailto:) is now extracted.
 #   No schema, trigger or data change.
 # Deploy: set IMAGE_TAG=v0.9.21-niche on the serp stack and redeploy.
