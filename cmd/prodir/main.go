@@ -91,6 +91,8 @@
 //	./prodir icf load     -state data -dry-run              # mapping stats, no DB
 //	./prodir icf load     -state data                       # → DB (POSTGRES_DSN)
 //	./prodir sources                                        # registered generic sources
+//	./prodir sites -source ace -dry-run                     # websites of loaded listings -> enrich queue (counts only)
+//	./prodir sites -source all -limit 100                   # enqueue (POSTGRES_DSN)
 //	./prodir iyengaruk list     -state data
 //	./prodir iyengaruk profiles -state data -workers 2 -limit 50
 //	./prodir iyengaruk load     -state data -dry-run
@@ -113,7 +115,7 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: prodir <ace|icf|slug> <list|profiles|export|load> [flags]\n       prodir sources")
+	fmt.Fprintln(os.Stderr, "usage: prodir <ace|icf|slug> <list|profiles|export|load> [flags]\n       prodir sources\n       prodir sites -source <ace|icf|slug|all> [-dsn DSN] [-dry-run] [-limit N]")
 	os.Exit(prodir.ExitErrors)
 }
 
@@ -129,10 +131,43 @@ func printSources() {
 	}
 }
 
+// runSites is `prodir sites`: enqueue the external websites of loaded
+// listings into the enrich pipeline (see internal/prodir/sites.go).
+func runSites(args []string) int {
+	fs := flag.NewFlagSet("sites", flag.ExitOnError)
+	source := fs.String("source", "", "ace | icf | <slug> | all")
+	dsn := fs.String("dsn", os.Getenv("POSTGRES_DSN"), "Postgres DSN (default $POSTGRES_DSN)")
+	dryRun := fs.Bool("dry-run", false, "print counts only, no writes")
+	limit := fs.Int("limit", 0, "max URLs to enqueue in total (0 = all)")
+	fs.Parse(args)
+	if *source == "" || *dsn == "" {
+		fmt.Fprintln(os.Stderr, "sites requires -source and -dsn or $POSTGRES_DSN")
+		return prodir.ExitErrors
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	db, err := sql.Open("postgres", *dsn)
+	if err == nil {
+		db.SetMaxOpenConns(2)
+		defer db.Close()
+		if err = db.PingContext(ctx); err == nil {
+			err = prodir.Sites(ctx, db, *source, *dryRun, *limit, os.Stdout)
+		}
+	}
+	if err != nil {
+		slog.Error("prodir sites failed", "source", *source, "error", err)
+		return prodir.ExitErrors
+	}
+	return prodir.ExitOK
+}
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "sources" {
 		printSources()
 		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "sites" {
+		os.Exit(runSites(os.Args[2:]))
 	}
 	if len(os.Args) < 3 {
 		usage()
