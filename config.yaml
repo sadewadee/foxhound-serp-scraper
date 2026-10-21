@@ -22,7 +22,7 @@ website:
 
 enrich:
   concurrency: 10
-  timeout_ms: 15000
+  timeout_ms: ${ENRICH_TIMEOUT_MS:-15000}
   validate_mx: false
   validate_email: false
   social_extraction: true

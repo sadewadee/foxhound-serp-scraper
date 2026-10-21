@@ -239,6 +239,9 @@ func LoadFromEnv() (*Config, error) {
 			DomainScorer:         os.Getenv("BETA_DOMAIN_SCORER") == "1",
 			SessionFatigue:       os.Getenv("BETA_SESSION_FATIGUE") == "1",
 		},
+		Enrich: EnrichConfig{
+			TimeoutMs: parseEnvInt("ENRICH_TIMEOUT_MS", 0),
+		},
 		Mordibouncer: MordibouncerConfig{
 			APIURL: os.Getenv("MORDIBOUNCER_API_URL"),
 			Secret: os.Getenv("MORDIBOUNCER_SECRET"),
