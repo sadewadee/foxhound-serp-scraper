@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -15,6 +16,9 @@ import (
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/parse"
 )
+
+// tagRe matches any HTML tag; used to separate text of adjacent elements.
+var tagRe = regexp.MustCompile(`<[^>]*>`)
 
 // Social media regex patterns.
 var (
@@ -46,6 +50,9 @@ var socialNoise = []string{
 	"share", "intent", "sharer", "login", "signup",
 	"oauth", "dialog", "widgets", "platform", "plugins",
 	"tr", "flx", "hashtag", "search",
+	// "2008" comes from the xmlns:fb="http://www.facebook.com/2008/fbml"
+	// namespace declared on every Squarespace/FBML-era page.
+	"2008",
 }
 
 // ContactData holds extracted contact and business information from a page.
@@ -102,6 +109,20 @@ func ExtractContacts(body []byte) *ContactData {
 		cd.Emails = append(cd.Emails, e)
 	}
 
+	// foxhound extracts plaintext emails from goquery's concatenated body text,
+	// which glues adjacent elements together ("CONTACT" + "a@b.com" +
+	// "instagram" -> "contacta@b.cominstagram"), and isCleanEmail then rejects
+	// the result. Re-run it with every tag replaced by a space so text from
+	// neighbouring elements stays separated.
+	spaced := &foxhound.Response{Body: tagRe.ReplaceAll(body, []byte(" "))}
+	for _, e := range parse.ExtractEmails(spaced) {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" || isExtraBlocklisted(e) || !isCleanEmail(e) || slices.Contains(cd.Emails, e) {
+			continue
+		}
+		cd.Emails = append(cd.Emails, e)
+	}
+
 	// ── Phones — foxhound handles tel: links, plaintext regex, validation ──
 	for _, p := range parse.ExtractPhones(resp) {
 		cleaned := normalizePhone(p)
@@ -118,29 +139,29 @@ func ExtractContacts(body []byte) *ContactData {
 	}
 
 	// ── Social media ──
-	if m := instagramRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(instagramRe, bodyStr); m != nil {
 		cd.Instagram = "https://instagram.com/" + m[1]
 	}
-	if m := facebookRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(facebookRe, bodyStr); m != nil {
 		cd.Facebook = "https://facebook.com/" + m[1]
 	}
-	if m := twitterRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(twitterRe, bodyStr); m != nil {
 		cd.Twitter = "https://twitter.com/" + m[1]
 	}
-	if m := linkedinRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(linkedinRe, bodyStr); m != nil {
 		cd.LinkedIn = "https://linkedin.com/company/" + m[1]
 	}
-	if m := tiktokRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(tiktokRe, bodyStr); m != nil {
 		cd.TikTok = "https://tiktok.com/@" + m[1]
 	}
-	if m := youtubeRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(youtubeRe, bodyStr); m != nil {
 		// Preserve original path form: /channel/UCxxx and /user/xxx are not
 		// valid /@handle URLs. Prepending @ to a UCid produced unreachable
 		// URLs in production data. Reconstruct the matched URL instead.
 		full := whichYouTubePath(m[0], m[1])
 		cd.YouTube = full
 	}
-	if m := telegramRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(telegramRe, bodyStr); m != nil {
 		cd.Telegram = m[1] // username only, t.me/<username> is the canonical form
 	}
 
@@ -1178,6 +1199,18 @@ func isExtraBlocklisted(email string) bool {
 	}
 	domain := lower[atIdx+1:]
 	return extraBlockedDomains[domain]
+}
+
+// firstSocialMatch returns the first submatch of re in s whose handle (group 1)
+// is not tracking/widget noise, or nil. Skipping noise instead of giving up on
+// the first hit lets a real profile later in the page win.
+func firstSocialMatch(re *regexp.Regexp, s string) []string {
+	for _, m := range re.FindAllStringSubmatch(s, -1) {
+		if len(m) > 1 && !isSocialNoise(m[1]) {
+			return m
+		}
+	}
+	return nil
 }
 
 func isSocialNoise(handle string) bool {
