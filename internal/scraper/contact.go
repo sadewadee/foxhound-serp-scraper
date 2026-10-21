@@ -100,27 +100,34 @@ func ExtractContacts(body []byte) *ContactData {
 	resp := &foxhound.Response{Body: body}
 
 	// ── Emails — foxhound handles cfemail, mailto, plaintext regex, dedup ──
+	// foxhound scans goquery body text, which glues adjacent elements together
+	// ("CONTACT" + "a@b.com" + "instagram" -> "contacta@b.cominstagram", or
+	// "Email" + "a@b.com" -> "emaila@b.com"). So also run it on a copy with every
+	// tag replaced by a space, and drop raw-pass emails that are just a spaced
+	// email with junk prefixed. Raw-only emails (mailto/cfemail) are kept.
 	// Post-filter: reject garbage that foxhound's regex picks up from raw HTML.
-	for _, e := range parse.ExtractEmails(resp) {
-		e = strings.ToLower(strings.TrimSpace(e))
-		if e == "" || isExtraBlocklisted(e) || !isCleanEmail(e) {
-			continue
+	clean := func(r *foxhound.Response) (out []string) {
+		for _, e := range parse.ExtractEmails(r) {
+			e = strings.ToLower(strings.TrimSpace(e))
+			if e != "" && !isExtraBlocklisted(e) && isCleanEmail(e) {
+				out = append(out, e)
+			}
 		}
-		cd.Emails = append(cd.Emails, e)
+		return out
 	}
-
-	// foxhound extracts plaintext emails from goquery's concatenated body text,
-	// which glues adjacent elements together ("CONTACT" + "a@b.com" +
-	// "instagram" -> "contacta@b.cominstagram"), and isCleanEmail then rejects
-	// the result. Re-run it with every tag replaced by a space so text from
-	// neighbouring elements stays separated.
-	spaced := &foxhound.Response{Body: tagRe.ReplaceAll(body, []byte(" "))}
-	for _, e := range parse.ExtractEmails(spaced) {
-		e = strings.ToLower(strings.TrimSpace(e))
-		if e == "" || isExtraBlocklisted(e) || !isCleanEmail(e) || slices.Contains(cd.Emails, e) {
-			continue
+	spaced := clean(&foxhound.Response{Body: tagRe.ReplaceAll(body, []byte(" "))})
+	for _, e := range clean(resp) {
+		glued := !slices.Contains(spaced, e) && slices.ContainsFunc(spaced, func(e2 string) bool {
+			return strings.HasSuffix(e, e2)
+		})
+		if !glued {
+			cd.Emails = append(cd.Emails, e)
 		}
-		cd.Emails = append(cd.Emails, e)
+	}
+	for _, e := range spaced {
+		if !slices.Contains(cd.Emails, e) {
+			cd.Emails = append(cd.Emails, e)
+		}
 	}
 
 	// ── Phones — foxhound handles tel: links, plaintext regex, validation ──

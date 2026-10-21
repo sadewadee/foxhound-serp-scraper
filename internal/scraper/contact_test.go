@@ -553,3 +553,24 @@ func TestExtractContacts_FacebookNamespaceNoise(t *testing.T) {
 		t.Fatalf("Facebook = %q, want https://facebook.com/studiofit", cd.Facebook)
 	}
 }
+
+func TestExtractContacts_NoGluedEmailArtifacts(t *testing.T) {
+	cases := map[string]string{
+		"heading+p":    `<h3>Email</h3><p>hello@example-studio.com</p>`,
+		"br":           `<p>Write to<br>hello@example-studio.com</p>`,
+		"strong+after": `<h3>CONTACT</h3><p><strong>hello@example-studio.com</strong></p><p>instagram</p>`,
+	}
+	for name, h := range cases {
+		cd := ExtractContacts([]byte("<html><body>" + h + "</body></html>"))
+		if len(cd.Emails) != 1 || cd.Emails[0] != "hello@example-studio.com" {
+			t.Errorf("%s: emails = %v, want [hello@example-studio.com]", name, cd.Emails)
+		}
+	}
+}
+
+func TestExtractContacts_MailtoOnlyKept(t *testing.T) {
+	cd := ExtractContacts([]byte(`<html><body><a href="mailto:info@example-studio.com">Mail us</a></body></html>`))
+	if len(cd.Emails) != 1 || cd.Emails[0] != "info@example-studio.com" {
+		t.Fatalf("emails = %v, want [info@example-studio.com]", cd.Emails)
+	}
+}
