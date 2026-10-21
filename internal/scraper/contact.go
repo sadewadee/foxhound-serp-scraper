@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -15,6 +16,9 @@ import (
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/parse"
 )
+
+// tagRe matches any HTML tag; used to separate text of adjacent elements.
+var tagRe = regexp.MustCompile(`<[^>]*>`)
 
 // Social media regex patterns.
 var (
@@ -46,6 +50,9 @@ var socialNoise = []string{
 	"share", "intent", "sharer", "login", "signup",
 	"oauth", "dialog", "widgets", "platform", "plugins",
 	"tr", "flx", "hashtag", "search",
+	// "2008" comes from the xmlns:fb="http://www.facebook.com/2008/fbml"
+	// namespace declared on every Squarespace/FBML-era page.
+	"2008",
 }
 
 // ContactData holds extracted contact and business information from a page.
@@ -93,13 +100,34 @@ func ExtractContacts(body []byte) *ContactData {
 	resp := &foxhound.Response{Body: body}
 
 	// ── Emails — foxhound handles cfemail, mailto, plaintext regex, dedup ──
+	// foxhound scans goquery body text, which glues adjacent elements together
+	// ("CONTACT" + "a@b.com" + "instagram" -> "contacta@b.cominstagram", or
+	// "Email" + "a@b.com" -> "emaila@b.com"). So also run it on a copy with every
+	// tag replaced by a space, and drop raw-pass emails that are just a spaced
+	// email with junk prefixed. Raw-only emails (mailto/cfemail) are kept.
 	// Post-filter: reject garbage that foxhound's regex picks up from raw HTML.
-	for _, e := range parse.ExtractEmails(resp) {
-		e = strings.ToLower(strings.TrimSpace(e))
-		if e == "" || isExtraBlocklisted(e) || !isCleanEmail(e) {
-			continue
+	clean := func(r *foxhound.Response) (out []string) {
+		for _, e := range parse.ExtractEmails(r) {
+			e = strings.ToLower(strings.TrimSpace(e))
+			if e != "" && !isExtraBlocklisted(e) && isCleanEmail(e) {
+				out = append(out, e)
+			}
 		}
-		cd.Emails = append(cd.Emails, e)
+		return out
+	}
+	spaced := clean(&foxhound.Response{Body: tagRe.ReplaceAll(body, []byte(" "))})
+	for _, e := range clean(resp) {
+		glued := !slices.Contains(spaced, e) && slices.ContainsFunc(spaced, func(e2 string) bool {
+			return strings.HasSuffix(e, e2)
+		})
+		if !glued {
+			cd.Emails = append(cd.Emails, e)
+		}
+	}
+	for _, e := range spaced {
+		if !slices.Contains(cd.Emails, e) {
+			cd.Emails = append(cd.Emails, e)
+		}
 	}
 
 	// ── Phones — foxhound handles tel: links, plaintext regex, validation ──
@@ -118,29 +146,29 @@ func ExtractContacts(body []byte) *ContactData {
 	}
 
 	// ── Social media ──
-	if m := instagramRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(instagramRe, bodyStr); m != nil {
 		cd.Instagram = "https://instagram.com/" + m[1]
 	}
-	if m := facebookRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(facebookRe, bodyStr); m != nil {
 		cd.Facebook = "https://facebook.com/" + m[1]
 	}
-	if m := twitterRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(twitterRe, bodyStr); m != nil {
 		cd.Twitter = "https://twitter.com/" + m[1]
 	}
-	if m := linkedinRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(linkedinRe, bodyStr); m != nil {
 		cd.LinkedIn = "https://linkedin.com/company/" + m[1]
 	}
-	if m := tiktokRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(tiktokRe, bodyStr); m != nil {
 		cd.TikTok = "https://tiktok.com/@" + m[1]
 	}
-	if m := youtubeRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(youtubeRe, bodyStr); m != nil {
 		// Preserve original path form: /channel/UCxxx and /user/xxx are not
 		// valid /@handle URLs. Prepending @ to a UCid produced unreachable
 		// URLs in production data. Reconstruct the matched URL instead.
 		full := whichYouTubePath(m[0], m[1])
 		cd.YouTube = full
 	}
-	if m := telegramRe.FindStringSubmatch(bodyStr); len(m) > 1 && !isSocialNoise(m[1]) {
+	if m := firstSocialMatch(telegramRe, bodyStr); m != nil {
 		cd.Telegram = m[1] // username only, t.me/<username> is the canonical form
 	}
 
@@ -1178,6 +1206,18 @@ func isExtraBlocklisted(email string) bool {
 	}
 	domain := lower[atIdx+1:]
 	return extraBlockedDomains[domain]
+}
+
+// firstSocialMatch returns the first submatch of re in s whose handle (group 1)
+// is not tracking/widget noise, or nil. Skipping noise instead of giving up on
+// the first hit lets a real profile later in the page win.
+func firstSocialMatch(re *regexp.Regexp, s string) []string {
+	for _, m := range re.FindAllStringSubmatch(s, -1) {
+		if len(m) > 1 && !isSocialNoise(m[1]) {
+			return m
+		}
+	}
+	return nil
 }
 
 func isSocialNoise(handle string) bool {

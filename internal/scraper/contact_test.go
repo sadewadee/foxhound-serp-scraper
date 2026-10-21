@@ -4,6 +4,7 @@ package scraper
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -523,4 +524,53 @@ func TestApplyTLDCountryFallback_EnvGated(t *testing.T) {
 			t.Errorf("malformed URL: want Country='', got %q", cd.Country)
 		}
 	})
+}
+
+// Regression: foxhound extracts plaintext emails from goquery's concatenated
+// body text, so "CONTACT" + email + "instagram" in adjacent elements became
+// "contacthello@example-studio.cominstagram" and was rejected by isCleanEmail.
+func TestExtractContacts_EmailBetweenAdjacentElements(t *testing.T) {
+	filler := strings.Repeat("<div class=\"blk\"><p>lorem ipsum dolor sit amet</p></div>\n", 2000)
+	html := "<html><body>" + filler +
+		"<h3><strong><em>CONTACT</em></strong></h3>" +
+		"<p><strong>hello@example-studio.com</strong></p>" +
+		"<p><strong>instagram: @studio</strong></p></body></html>"
+	cd := ExtractContacts([]byte(html))
+	if len(cd.Emails) != 1 || cd.Emails[0] != "hello@example-studio.com" {
+		t.Fatalf("emails = %v, want [hello@example-studio.com]", cd.Emails)
+	}
+}
+
+func TestExtractContacts_FacebookNamespaceNoise(t *testing.T) {
+	ns := `<html xmlns:fb="http://www.facebook.com/2008/fbml"><body>`
+	cd := ExtractContacts([]byte(ns + `<p>hi</p></body></html>`))
+	if cd.Facebook != "" {
+		t.Fatalf("namespace-only page: Facebook = %q, want empty", cd.Facebook)
+	}
+	cd = ExtractContacts([]byte(ns + `<a href="https://www.facebook.com/sharer/sharer.php?u=x">s</a>` +
+		`<a href="https://www.facebook.com/studiofit/">fb</a></body></html>`))
+	if cd.Facebook != "https://facebook.com/studiofit" {
+		t.Fatalf("Facebook = %q, want https://facebook.com/studiofit", cd.Facebook)
+	}
+}
+
+func TestExtractContacts_NoGluedEmailArtifacts(t *testing.T) {
+	cases := map[string]string{
+		"heading+p":    `<h3>Email</h3><p>hello@example-studio.com</p>`,
+		"br":           `<p>Write to<br>hello@example-studio.com</p>`,
+		"strong+after": `<h3>CONTACT</h3><p><strong>hello@example-studio.com</strong></p><p>instagram</p>`,
+	}
+	for name, h := range cases {
+		cd := ExtractContacts([]byte("<html><body>" + h + "</body></html>"))
+		if len(cd.Emails) != 1 || cd.Emails[0] != "hello@example-studio.com" {
+			t.Errorf("%s: emails = %v, want [hello@example-studio.com]", name, cd.Emails)
+		}
+	}
+}
+
+func TestExtractContacts_MailtoOnlyKept(t *testing.T) {
+	cd := ExtractContacts([]byte(`<html><body><a href="mailto:info@example-studio.com">Mail us</a></body></html>`))
+	if len(cd.Emails) != 1 || cd.Emails[0] != "info@example-studio.com" {
+		t.Fatalf("emails = %v, want [info@example-studio.com]", cd.Emails)
+	}
 }
