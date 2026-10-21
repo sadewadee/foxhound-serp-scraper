@@ -14,9 +14,9 @@ type GeoLocale struct {
 // CountryLocale maps country names (matching wellness.go Cities keys) to locale params.
 var CountryLocale = map[string]*GeoLocale{
 	// --- Southeast Asia ---
-	"Indonesia":   {GoogleGL: "id", GoogleHL: "id", BingCC: "id", BingLang: "id", DDGKL: "id-id"},
-	"Thailand":    {GoogleGL: "th", GoogleHL: "th", BingCC: "th", BingLang: "th", DDGKL: "th-th"},
-	"Vietnam":     {GoogleGL: "vn", GoogleHL: "vi", BingCC: "vn", BingLang: "vi", DDGKL: "vn-vi"},
+	"Indonesia": {GoogleGL: "id", GoogleHL: "id", BingCC: "id", BingLang: "id", DDGKL: "id-id"},
+	"Thailand":  {GoogleGL: "th", GoogleHL: "th", BingCC: "th", BingLang: "th", DDGKL: "th-th"},
+	"Vietnam":   {GoogleGL: "vn", GoogleHL: "vi", BingCC: "vn", BingLang: "vi", DDGKL: "vn-vi"},
 	"Philippines": {GoogleGL: "ph", GoogleHL: "tl", BingCC: "ph", BingLang: "en", DDGKL: "ph-en"},
 	"Malaysia":    {GoogleGL: "my", GoogleHL: "ms", BingCC: "my", BingLang: "ms", DDGKL: "my-ms"},
 	"Singapore":   {GoogleGL: "sg", GoogleHL: "en", BingCC: "sg", BingLang: "en", DDGKL: "sg-en"},
