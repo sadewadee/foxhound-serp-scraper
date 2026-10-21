@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/publicsuffix"
 
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/parse"
@@ -19,6 +20,12 @@ import (
 
 // tagRe matches any HTML tag; used to separate text of adjacent elements.
 var tagRe = regexp.MustCompile(`<[^>]*>`)
+
+// hrefValueRe captures a whole href attribute value; hrefEmailRe checks it is a bare email.
+var (
+	hrefValueRe = regexp.MustCompile(`(?i)\bhref\s*=\s*["']\s*([^"'<>\s]+)\s*["']`)
+	hrefEmailRe = regexp.MustCompile(`(?i)^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)
+)
 
 // Social media regex patterns.
 var (
@@ -126,6 +133,19 @@ func ExtractContacts(body []byte) *ContactData {
 	}
 	for _, e := range spaced {
 		if !slices.Contains(cd.Emails, e) {
+			cd.Emails = append(cd.Emails, e)
+		}
+	}
+
+	// Bare email as the whole href value (<a href="a@b.ca">, no mailto:) is
+	// invisible to foxhound's text/mailto passes and to the tag-stripped pass.
+	for _, m := range hrefValueRe.FindAllSubmatch(body, -1) {
+		v, err := url.QueryUnescape(string(m[1]))
+		if err != nil {
+			continue
+		}
+		e := strings.ToLower(v)
+		if hrefEmailRe.MatchString(e) && !isExtraBlocklisted(e) && isCleanEmail(e) && !slices.Contains(cd.Emails, e) {
 			cd.Emails = append(cd.Emails, e)
 		}
 	}
@@ -1254,8 +1274,9 @@ func isCleanEmail(email string) bool {
 	if dotIdx < 0 {
 		return false
 	}
-	tld := domain[dotIdx+1:]
-	if !isValidTLD(tld) {
+	// Accept any ICANN TLD; glued garbage (inivie.comview) is not one. Only the
+	// last label is checked so private-suffix domains (studio.uk.com) still pass.
+	if _, icann := publicsuffix.PublicSuffix(strings.ToLower(domain[dotIdx+1:])); !icann {
 		return false
 	}
 
@@ -1271,68 +1292,6 @@ func isCleanEmail(email string) bool {
 	}
 
 	return true
-}
-
-// validTLDs is a set of common real TLDs. This is not exhaustive but catches
-// the most common fake TLDs from social media content.
-var validTLDs = map[string]bool{
-	// Generic
-	"com": true, "net": true, "org": true, "info": true, "biz": true,
-	"io": true, "co": true, "me": true, "tv": true, "cc": true,
-	"xyz": true, "app": true, "dev": true, "tech": true, "site": true,
-	"online": true, "store": true, "shop": true, "club": true, "pro": true,
-	"studio": true, "agency": true, "design": true, "media": true,
-	"digital": true, "global": true, "world": true, "life": true,
-	"fitness": true, "health": true, "travel": true, "hotel": true, "yoga": true,
-	"gym": true, "beauty": true, "salon": true, "restaurant": true, "cafe": true,
-	"space": true, "today": true, "email": true, "link": true,
-	"work": true, "asia": true, "rent": true, "page": true,
-	// Wellness/business gTLDs
-	"services": true, "center": true, "coach": true, "training": true,
-	"consulting": true, "solutions": true, "academy": true, "education": true,
-	"care": true, "clinic": true, "dental": true, "vet": true,
-	"events": true, "marketing": true, "photography": true, "wedding": true,
-	"group": true, "team": true, "zone": true, "network": true, "systems": true,
-	"expert": true, "guru": true, "tips": true, "bio": true, "eco": true,
-	"foundation": true, "institute": true, "international": true,
-	"partners": true, "ventures": true, "holdings": true, "limited": true,
-	"enterprises": true, "management": true, "properties": true,
-	"fun": true, "live": true, "news": true, "social": true, "run": true,
-	"one": true, "top": true, "icu": true, "vip": true, "mobi": true,
-	"name": true, "ly": true, "gg": true, "to": true, "is": true,
-
-	// Country codes
-	"id": true, "uk": true, "au": true, "de": true, "fr": true,
-	"jp": true, "kr": true, "sg": true, "my": true, "th": true,
-	"ph": true, "vn": true, "in": true, "cn": true, "tw": true,
-	"hk": true, "nz": true, "ca": true, "us": true, "br": true,
-	"mx": true, "es": true, "it": true, "nl": true, "be": true,
-	"ch": true, "at": true, "pl": true, "se": true, "no": true,
-	"dk": true, "fi": true, "pt": true, "ru": true, "ua": true,
-	"za": true, "ae": true, "sa": true, "il": true, "tr": true,
-	"ie": true, "cz": true, "ro": true, "hu": true, "gr": true,
-	// Africa & Middle East
-	"ke": true, "tz": true, "ug": true, "ng": true, "gh": true,
-	"eg": true, "ma": true, "et": true, "qa": true, "kw": true,
-	"om": true, "bh": true, "jo": true, "lb": true,
-	// Americas
-	"ar": true, "cl": true, "pe": true, "ec": true,
-	"ve": true, "cr": true, "pa": true, "do": true, "gt": true,
-	"pr": true, "tt": true, "jm": true,
-	// Europe (additional)
-	"sk": true, "bg": true, "lt": true, "lv": true, "ee": true,
-	"si": true, "hr": true, "rs": true, "lu": true, "mt": true,
-	"cy": true,
-	// South/SE Asia (additional)
-	"pk": true, "bd": true, "lk": true, "np": true, "mm": true,
-	"kh": true, "la": true,
-
-	// Education & gov
-	"edu": true, "gov": true, "mil": true, "ac": true,
-}
-
-func isValidTLD(tld string) bool {
-	return validTLDs[strings.ToLower(tld)]
 }
 
 func truncate(s string, maxLen int) string {
