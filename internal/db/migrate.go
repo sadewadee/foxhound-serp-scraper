@@ -835,18 +835,18 @@ func runMigrations(db *sql.DB) error {
 	db.Exec(`ALTER TABLE IF EXISTS websites RENAME TO websites_backup`)
 
 	// Add picked_at column to serp_jobs if missing (from redesign).
-	if _, err := db.Exec(`ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`); err != nil {
+	if err := execDDL(db, `ALTER TABLE serp_jobs ADD COLUMN IF NOT EXISTS picked_at TIMESTAMPTZ`); err != nil {
 		return fmt.Errorf("db: add picked_at column: %w", err)
 	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_feed ON serp_jobs(created_at) WHERE status = 'new' AND picked_at IS NULL`); err != nil {
+	if err := execDDL(db, `CREATE INDEX IF NOT EXISTS idx_serp_feed ON serp_jobs(created_at) WHERE status = 'new' AND picked_at IS NULL`); err != nil {
 		return fmt.Errorf("db: create idx_serp_feed: %w", err)
 	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_stale ON serp_jobs(picked_at) WHERE status = 'new' AND picked_at IS NOT NULL`); err != nil {
+	if err := execDDL(db, `CREATE INDEX IF NOT EXISTS idx_serp_stale ON serp_jobs(picked_at) WHERE status = 'new' AND picked_at IS NOT NULL`); err != nil {
 		return fmt.Errorf("db: create idx_serp_stale: %w", err)
 	}
 
 	// Index for reconciler: retire exhausted failed jobs to 'dead' and resurrect viable ones.
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_serp_failed_retry ON serp_jobs(updated_at) WHERE status = 'failed'`); err != nil {
+	if err := execDDL(db, `CREATE INDEX IF NOT EXISTS idx_serp_failed_retry ON serp_jobs(updated_at) WHERE status = 'failed'`); err != nil {
 		return fmt.Errorf("db: create idx_serp_failed_retry: %w", err)
 	}
 
@@ -862,7 +862,7 @@ func runMigrations(db *sql.DB) error {
 		// business_listings.phone: used by V2 stats with_phone count.
 		`CREATE INDEX IF NOT EXISTS idx_bl_phone ON business_listings(phone) WHERE phone IS NOT NULL AND phone != ''`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if err := execDDL(db, stmt); err != nil {
 			// pg_trgm might not be available on some setups; log and continue.
 			slog.Warn("db: optional index creation", "error", err)
 		}
@@ -881,7 +881,7 @@ func runMigrations(db *sql.DB) error {
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS emails_delta INT DEFAULT 0`,
 		`ALTER TABLE workers ADD COLUMN IF NOT EXISTS delta_at TIMESTAMPTZ`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if err := execDDL(db, stmt); err != nil {
 			return fmt.Errorf("db: worker delta columns: %w", err)
 		}
 	}
@@ -969,7 +969,7 @@ func runMigrations(db *sql.DB) error {
 		// doesn't block concurrent writes. Cannot live inside this batch since
 		// CONCURRENTLY is illegal inside a transaction block.
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if err := execDDL(db, stmt); err != nil {
 			return fmt.Errorf("db: schema fix 2026-04-27: %w (stmt: %s)", err, stmt)
 		}
 	}
@@ -1342,7 +1342,7 @@ func runMigrations(db *sql.DB) error {
 		}
 		migOK := true
 		for _, s := range stmts {
-			if _, err := db.Exec(s); err != nil {
+			if err := execDDL(db, s); err != nil {
 				slog.Warn("db: reenrich col migration failed", "error", err)
 				migOK = false
 				break
@@ -1386,7 +1386,7 @@ func runMigrations(db *sql.DB) error {
 		}
 		migOK := true
 		for _, s := range stmts {
-			if _, err := db.Exec(s); err != nil {
+			if err := execDDL(db, s); err != nil {
 				slog.Warn("db: reenrich lock migration failed", "error", err)
 				migOK = false
 				break
@@ -2235,6 +2235,130 @@ func runMigrations(db *sql.DB) error {
 	return nil
 }
 
+// DDL lock-safety. On an already-migrated DB, IF NOT EXISTS DDL is not free:
+// ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE and CREATE
+// INDEX IF NOT EXISTS takes ShareLock before noticing the object exists. Under
+// heavy enrich write load these requests queue behind in-flight writers and
+// every new writer queues behind them (2026-10-21: one ALTER waited ~49s,
+// enrich throughput 260/min -> 3/min, then a 40P01 deadlock crash-looped the
+// manager). So existence is checked via catalog reads (no table locks) and the
+// DDL only runs when the object is really missing — fail-fast, never queued.
+const (
+	ddlLockTimeout  = "5s"
+	ddlRetryMax     = 10
+	ddlRetryBackoff = 2 * time.Second
+)
+
+var (
+	// schemaRelationRe extracts every table / index / matview the schema block creates.
+	schemaRelationRe = regexp.MustCompile(`(?i)CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|MATERIALIZED\s+VIEW)\s+IF\s+NOT\s+EXISTS\s+(\w+)`)
+	addColumnRe      = regexp.MustCompile(`(?is)^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)\b`)
+	// Plain CREATE INDEX only: CONCURRENTLY is deliberately not matched (it has
+	// its own path, ensureIndexConcurrently, and cannot run in a transaction).
+	createIndexRe = regexp.MustCompile(`(?is)^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+ON\b`)
+
+	schemaRelations = extractSchemaRelations(schema)
+)
+
+func extractSchemaRelations(sqlText string) []string {
+	var names []string
+	for _, m := range schemaRelationRe.FindAllStringSubmatch(sqlText, -1) {
+		names = append(names, m[1])
+	}
+	return names
+}
+
+// parseDDLTarget recognises `ALTER TABLE t ADD COLUMN IF NOT EXISTS c ...`
+// (returns table, column) and `CREATE [UNIQUE] INDEX IF NOT EXISTS i ON ...`
+// (returns "", index). ok=false means the statement is not a known pattern and
+// must simply be executed.
+func parseDDLTarget(stmt string) (table, name string, ok bool) {
+	if m := addColumnRe.FindStringSubmatch(stmt); m != nil {
+		return m[1], m[2], true
+	}
+	if m := createIndexRe.FindStringSubmatch(stmt); m != nil {
+		return "", m[1], true
+	}
+	return "", "", false
+}
+
+// allRelationsExist reports whether every named relation exists. to_regclass
+// reads the catalog without locking the relation. Any query error -> false, so
+// the caller falls back to running the DDL.
+func allRelationsExist(db *sql.DB, names []string) bool {
+	var missing int
+	err := db.QueryRow(
+		`SELECT count(*) FROM unnest($1::text[]) AS n WHERE to_regclass(n) IS NULL`, pq.Array(names),
+	).Scan(&missing)
+	return err == nil && missing == 0
+}
+
+// ddlAlreadyApplied is true when stmt is a recognised idempotent ADD COLUMN /
+// CREATE INDEX whose target already exists (catalog-only check, no table lock).
+func ddlAlreadyApplied(db *sql.DB, stmt string) bool {
+	table, name, ok := parseDDLTarget(stmt)
+	if !ok {
+		return false
+	}
+	if table == "" {
+		return allRelationsExist(db, []string{name})
+	}
+	var exists bool
+	err := db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM pg_attribute
+		   WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped)`,
+		table, name,
+	).Scan(&exists)
+	return err == nil && exists
+}
+
+// execDDL runs an idempotent ADD COLUMN / CREATE INDEX statement only when its
+// target is missing, under a lock timeout with retry (see execInDDLTx).
+func execDDL(db *sql.DB, stmt string) error {
+	if ddlAlreadyApplied(db, stmt) {
+		return nil
+	}
+	return execInDDLTx(db, stmt)
+}
+
+// execInDDLTx runs stmt in a transaction with SET LOCAL lock_timeout so it
+// fails fast instead of queueing behind writers, retrying on lock_not_available
+// (55P03) and deadlock_detected (40P01).
+func execInDDLTx(db *sql.DB, stmt string) error {
+	var err error
+	for attempt := 1; attempt <= ddlRetryMax; attempt++ {
+		if err = execOnceInTx(db, stmt); err == nil || !isRetryableDDLErr(err) {
+			return err
+		}
+		slog.Warn("db: DDL lock contention, retrying",
+			"attempt", attempt, "max", ddlRetryMax, "error", err)
+		if attempt < ddlRetryMax {
+			time.Sleep(ddlRetryBackoff)
+		}
+	}
+	return err
+}
+
+func execOnceInTx(db *sql.DB, stmt string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SET LOCAL lock_timeout = '` + ddlLockTimeout + `'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(stmt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func isRetryableDDLErr(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && (pqErr.Code == "55P03" || pqErr.Code == "40P01")
+}
+
 // migrateAdvisoryLockKey serializes Migrate() across all booting containers.
 // Every container (serp×N, enrich×N, reenrich×N, manager) runs Migrate() on
 // boot via cmd/run.go. Without serialization their concurrent DROP/CREATE
@@ -2281,7 +2405,12 @@ func Migrate(db *sql.DB) error {
 	db.Exec(`SET statement_timeout = '300s'`)
 	defer db.Exec(`SET statement_timeout = '60s'`)
 
-	if _, err := db.Exec(schema); err != nil {
+	// Skip the schema block when every relation it creates already exists: even
+	// as IF NOT EXISTS no-ops, its CREATE INDEX statements take a ShareLock on
+	// the table first and hold it until the whole implicit tx commits.
+	if allRelationsExist(db, schemaRelations) {
+		slog.Debug("db: schema block skipped, all relations present")
+	} else if err := execInDDLTx(db, schema); err != nil {
 		return fmt.Errorf("db: migration failed: %w", err)
 	}
 	if err := EnsureBusinessMeta(ctx, db); err != nil {
