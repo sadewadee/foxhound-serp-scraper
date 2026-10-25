@@ -26,6 +26,7 @@ enrich:
   validate_mx: false
   validate_email: false
   social_extraction: true
+  discover_links: false  # ENRICH_DISCOVER_LINKS=1 overrides
 
 proxy:
   url: "${PROXY_URL}"

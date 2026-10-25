@@ -402,6 +402,9 @@ func (c *EnrichStage) reconciler(ctx context.Context) {
 				  AND error_msg NOT LIKE '%x509%'
 				  AND error_msg NOT LIKE '%no such host%'
 				  AND error_msg NOT LIKE '%server misbehaving%'
+				  AND error_msg NOT LIKE '%name resolution%'
+				  AND error_msg NOT LIKE '%NXDOMAIN%'
+				  AND error_msg NOT LIKE '%ERR_NAME_NOT_RESOLVED%'
 				  AND error_msg NOT LIKE 'permanently dead%'
 				LIMIT 1000 FOR UPDATE SKIP LOCKED
 			)
@@ -770,6 +773,12 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			WHERE url_hash = $2`, "completion-update-failed: "+updErr.Error(), urlHash)
 		}
 
+		// Mirror the trigger's email-less-homepage condition, but follow the
+		// site's real contact/about links instead of blind-guessed paths.
+		if updErr == nil && c.cfg.Enrich.DiscoverLinks && job.Source == "serp_result" && len(emails) == 0 {
+			c.queueDiscoveredLinks(pageURL, domain, job.ParentQueryID, []byte(body))
+		}
+
 		redisClient.Del(ctx, "enrich:lock:"+urlHash)
 		c.emailsFound.Add(int64(len(emails)))
 		c.phonesFound.Add(int64(len(phones)))
@@ -788,6 +797,24 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 				"first_email", firstEmail,
 				"business", cd.BusinessName,
 				"worker", workerID)
+		}
+	}
+}
+
+// queueDiscoveredLinks inserts up to 3 contact/about links found in a
+// homepage body as pending contact_page jobs; normal workers pick them up.
+// url_hash is a plain sha256 of the URL, exactly like the enrichment trigger,
+// so ON CONFLICT dedupes against trigger-created rows.
+func (c *EnrichStage) queueDiscoveredLinks(pageURL, domain string, parentQueryID int64, body []byte) {
+	var parent any
+	if parentQueryID != 0 {
+		parent = parentQueryID
+	}
+	for _, link := range internalScraper.DiscoverContactLinks(pageURL, body, 3) {
+		if _, err := c.db.Exec(`INSERT INTO enrichment_jobs (url, url_hash, domain, parent_query_id, source, status)
+			VALUES ($1, $2, $3, $4, 'contact_page', 'pending') ON CONFLICT (url_hash) DO NOTHING`,
+			link, dedup.SHA256(link), domain, parent); err != nil {
+			slog.Warn("enrich: queue discovered link failed", "url", link, "error", err)
 		}
 	}
 }
@@ -850,7 +877,11 @@ func fetchStealthOnly(ctx context.Context, stealth *fetch.StealthFetcher, pageUR
 }
 
 func isPermanentError(errMsg string) bool {
-	permanent := []string{"HTTP 404", "HTTP 410", "HTTP 451", "certificate", "x509", "no such host", "server misbehaving"}
+	// DNS failures ("no such host", "server misbehaving", resolver/browser
+	// variants) are included; keep in sync with the reconciler's resurrection
+	// exclusion list above.
+	permanent := []string{"HTTP 404", "HTTP 410", "HTTP 451", "certificate", "x509", "no such host", "server misbehaving",
+		"name resolution", "nxdomain", "err_name_not_resolved"}
 	lower := strings.ToLower(errMsg)
 	for _, p := range permanent {
 		if strings.Contains(lower, strings.ToLower(p)) {

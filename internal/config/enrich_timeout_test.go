@@ -47,3 +47,31 @@ func TestEnrichTimeoutYAMLExpansion(t *testing.T) {
 		t.Errorf("override = %d, want 60000", cfg.Enrich.TimeoutMs)
 	}
 }
+
+// ENRICH_DISCOVER_LINKS ships off and is enabled only by "1", on both the
+// env-only and the YAML paths.
+func TestEnrichDiscoverLinks(t *testing.T) {
+	const y = "enrich:\n  discover_links: false\n"
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{{"", false}, {"0", false}, {"1", true}} {
+		t.Run("env="+tc.env, func(t *testing.T) {
+			t.Setenv("ENRICH_DISCOVER_LINKS", tc.env)
+			cfg, err := LoadFromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Enrich.DiscoverLinks != tc.want {
+				t.Errorf("LoadFromEnv = %v, want %v", cfg.Enrich.DiscoverLinks, tc.want)
+			}
+			cfg, err = LoadFromString(y)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Enrich.DiscoverLinks != tc.want {
+				t.Errorf("LoadFromString = %v, want %v", cfg.Enrich.DiscoverLinks, tc.want)
+			}
+		})
+	}
+}
