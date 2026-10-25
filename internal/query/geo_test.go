@@ -121,3 +121,17 @@ func TestCountryAliasesValid(t *testing.T) {
 		}
 	}
 }
+
+// An alias must never shadow another country's canonical name, otherwise the
+// resolver (alias loaded last) would silently re-route that country.
+func TestCountryAliasesDoNotShadowCanonicalNames(t *testing.T) {
+	canon := map[string]string{}
+	for _, r := range CountryRows() {
+		canon[strings.ToLower(r.Name)] = r.Code
+	}
+	for alias, code := range CountryAliases() {
+		if c, ok := canon[alias]; ok && c != code {
+			t.Errorf("alias %q → %q shadows canonical name of %q", alias, code, c)
+		}
+	}
+}
