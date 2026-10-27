@@ -113,6 +113,9 @@ type EnrichConfig struct {
 	SocialExtraction bool `yaml:"social_extraction"`
 	ValidateEmail    bool `yaml:"validate_email"`
 	ContactPages     bool `yaml:"contact_pages"`
+	// DiscoverLinks queues up to 3 contact/about links found on an email-less
+	// homepage as contact_page jobs. Off by default (ENRICH_DISCOVER_LINKS=1).
+	DiscoverLinks bool `yaml:"discover_links"`
 }
 
 type MordibouncerConfig struct {
@@ -289,6 +292,11 @@ func LoadFromString(s string) (*Config, error) {
 }
 
 func setDefaults(cfg *Config) {
+	// Env-driven flag applied here so the YAML and env-only paths agree
+	// ("1" is not a valid YAML bool, so it cannot go through ${VAR:-default}).
+	if os.Getenv("ENRICH_DISCOVER_LINKS") == "1" {
+		cfg.Enrich.DiscoverLinks = true
+	}
 	if cfg.Redis.Addr == "" {
 		cfg.Redis.Addr = "localhost:6379"
 	}
