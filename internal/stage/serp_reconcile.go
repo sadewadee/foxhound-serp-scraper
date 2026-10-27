@@ -32,7 +32,13 @@ func ParseRetiredEngines(csv string) []string {
 	return out
 }
 
-// ReconcileProcessingQueries resolves a batch of up to 500 'processing' queries:
+// reconcileBatch bounds one pass. The per-query job-stats scan (serp_jobs by
+// parent_job_id, random heap reads on a ~27M-row table) is the only statement
+// that scales with the batch; 200 keeps it far from the 5s statement timeout
+// even when the disks are busy.
+const reconcileBatch = 200
+
+// ReconcileProcessingQueries resolves a batch of up to reconcileBatch 'processing' queries:
 //   - Marks jobs for globally retired engines as 'dead'. A host's SERP_ENGINES
 //     only says what that host can process, so engines that are merely absent
 //     from this host's set (served by another host against the same tables)
@@ -55,7 +61,7 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, retiredEngines 
 
 	// 5-second statement timeout per Operational Invariant #2
 	if _, err := tx.ExecContext(ctx, `SET LOCAL statement_timeout = '5000'`); err != nil {
-		_ = err
+		return ReconcileResult{}, fmt.Errorf("serp: set statement timeout: %w", err)
 	}
 
 	// 1. Select bounded batch of processing queries ordered by updated_at ASC.
@@ -68,7 +74,7 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, retiredEngines 
 	// trailing UPDATEs, which showed up in prod as
 	// `serp: advance active queries: canceling statement due to statement
 	// timeout (57014)`. With the lock held until COMMIT, a concurrent caller
-	// skips the locked rows and picks the next 500 instead, so the two hosts
+	// skips the locked rows and picks the next batch instead, so the two hosts
 	// work on disjoint batches and still both make progress.
 	//
 	// A transaction-scoped advisory lock was the alternative, but it serializes
@@ -79,20 +85,27 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, retiredEngines 
 		SELECT id FROM queries
 		WHERE status = 'processing'
 		ORDER BY updated_at ASC
-		LIMIT 500
+		LIMIT $1
 		FOR UPDATE SKIP LOCKED
-	`)
+	`, reconcileBatch)
 	if err != nil {
 		return ReconcileResult{}, fmt.Errorf("serp: query processing batch: %w", err)
 	}
 	defer rows.Close()
 
+	// Every error below must surface: a swallowed statement error leaves the tx
+	// aborted (25P02) and, worse, yields empty stats that make every query look
+	// like a zombie.
 	var queryIDs []int64
 	for rows.Next() {
 		var qid int64
-		if err := rows.Scan(&qid); err == nil {
-			queryIDs = append(queryIDs, qid)
+		if err := rows.Scan(&qid); err != nil {
+			return ReconcileResult{}, fmt.Errorf("serp: scan processing batch: %w", err)
 		}
+		queryIDs = append(queryIDs, qid)
+	}
+	if err := rows.Err(); err != nil {
+		return ReconcileResult{}, fmt.Errorf("serp: read processing batch: %w", err)
 	}
 	rows.Close()
 
@@ -106,15 +119,25 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, retiredEngines 
 	// 2. Retire only globally-retired engines. Jobs of engines that simply run
 	// on another host (bing on kurawa, searxng on hachibi) must never be
 	// touched by a host that cannot itself run them.
-	if deadRes, err := tx.ExecContext(ctx, `
+	//
+	// Best-effort and isolated in a SAVEPOINT: stats (step 3) already ignore
+	// retired engines, so a failed or timed-out retire must not abort the tx.
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT retire_engines`); err != nil {
+		return ReconcileResult{}, fmt.Errorf("serp: savepoint retire: %w", err)
+	}
+	deadRes, err := tx.ExecContext(ctx, `
 		UPDATE serp_jobs SET status = 'dead', error_msg = 'engine retired globally (SERP_RETIRED_ENGINES)', updated_at = NOW()
 		WHERE parent_job_id = ANY($1)
 		  AND engine = ANY($2)
 		  AND status IN ('new', 'processing')
-	`, pqQueryIDs, pqRetired); err == nil {
-		if n, _ := deadRes.RowsAffected(); n > 0 {
-			slog.Info("serp: reconciler retired retired-engine jobs to dead", "count", n)
+	`, pqQueryIDs, pqRetired)
+	if err != nil {
+		slog.Warn("serp: reconciler retire-engine jobs failed, skipping this pass", "error", err)
+		if _, rbErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT retire_engines`); rbErr != nil {
+			return ReconcileResult{}, fmt.Errorf("serp: rollback retire savepoint: %w", rbErr)
 		}
+	} else if n, _ := deadRes.RowsAffected(); n > 0 {
+		slog.Info("serp: reconciler retired retired-engine jobs to dead", "count", n)
 	}
 
 	// 3. Summarize serp_jobs for this batch of queries.
@@ -143,13 +166,17 @@ func ReconcileProcessingQueries(ctx context.Context, db *sql.DB, retiredEngines 
 	for jobRows.Next() {
 		var parentID int64
 		var total, active, results int
-		if err := jobRows.Scan(&parentID, &total, &active, &results); err == nil {
-			stats[parentID] = &jobStats{
-				totalJobs:    total,
-				activeJobs:   active,
-				totalResults: results,
-			}
+		if err := jobRows.Scan(&parentID, &total, &active, &results); err != nil {
+			return ReconcileResult{}, fmt.Errorf("serp: scan job stats: %w", err)
 		}
+		stats[parentID] = &jobStats{
+			totalJobs:    total,
+			activeJobs:   active,
+			totalResults: results,
+		}
+	}
+	if err := jobRows.Err(); err != nil {
+		return ReconcileResult{}, fmt.Errorf("serp: read job stats: %w", err)
 	}
 	jobRows.Close()
 

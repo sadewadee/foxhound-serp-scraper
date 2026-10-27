@@ -2,6 +2,7 @@ package stage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -28,7 +29,10 @@ func TestReconcileSQLShape(t *testing.T) {
 
 	for _, want := range []string{
 		"SET LOCAL statement_timeout = '5000'",
-		"LIMIT 500",
+		"LIMIT $1",
+		"reconcileBatch",
+		"SAVEPOINT retire_engines",
+		"rows.Err()",
 		"ORDER BY updated_at ASC",
 		"FOR UPDATE SKIP LOCKED",
 		"engine retired globally (SERP_RETIRED_ENGINES)",
@@ -314,7 +318,7 @@ func TestReconcileProcessingQueries_Integration(t *testing.T) {
 // TestReconcileProcessingQueries_ConcurrentCallers is the regression test for
 // the prod contention seen after #54 shipped: ReconcileProcessingQueries runs
 // in every serp container on both hosts, and without FOR UPDATE SKIP LOCKED
-// both callers took the identical "500 oldest processing" batch and then
+// both callers took the identical "oldest processing" batch and then
 // blocked on each other's row locks until the 5s statement_timeout fired
 // (`serp: advance active queries: canceling statement due to statement
 // timeout (57014)`, ~9x/3h). With SKIP LOCKED the second caller skips the
@@ -326,11 +330,11 @@ func TestReconcileProcessingQueries_ConcurrentCallers(t *testing.T) {
 		t.Fatalf("schema: %v", err)
 	}
 
-	// 600 processing queries whose only job is completed, so every one of them
-	// is eligible for completion. A serial pass would finish all 600; two
-	// contending passes without SKIP LOCKED would each try to take 500 of the
-	// same rows.
-	const total = 600
+	// Two batches' worth of processing queries whose only job is completed, so
+	// every one of them is eligible for completion. A serial pass pair would
+	// finish all of them; two contending passes without SKIP LOCKED would each
+	// try to take the same rows.
+	const total = 2 * reconcileBatch
 	for i := 0; i < total; i++ {
 		var id int64
 		if err := db.QueryRow(
@@ -386,6 +390,91 @@ func TestReconcileProcessingQueries_ConcurrentCallers(t *testing.T) {
 	if stillProcessing != 0 {
 		t.Errorf("%d queries still processing after two concurrent passes, want 0", stillProcessing)
 	}
+}
+
+// TestReconcileProcessingQueries_RetireStepFailure is the regression test for
+// the prod incident of 2026-10-24: the retire-engine UPDATE (step 2) failed or
+// hit statement_timeout, its error was ignored, and the aborted tx made the next
+// statement fail with 25P02 on every pass. A trigger forces step 2 to fail
+// (error / statement timeout); the pass must still complete cleanly, leave the
+// retired job untouched and finish the query from the job stats.
+func TestReconcileProcessingQueries_RetireStepFailure(t *testing.T) {
+	db := testpg.Start(t, testpg.StartOpts{Prefix: "xxchk_reconcile_"}).DB()
+	if _, err := db.Exec(reconcileTestSchema); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	// Only fires when step 2 flips a job to 'dead'; the mode decides how it fails.
+	if _, err := db.Exec(`
+		CREATE FUNCTION fail_dead() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.status = 'dead' THEN
+				IF current_setting('test.mode', true) = 'timeout' THEN
+					PERFORM pg_sleep(8);
+				END IF;
+				RAISE EXCEPTION 'forced retire failure';
+			END IF;
+			RETURN NEW;
+		END $$ LANGUAGE plpgsql;
+		CREATE TRIGGER fail_dead BEFORE UPDATE ON serp_jobs
+			FOR EACH ROW EXECUTE FUNCTION fail_dead();
+	`); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+
+	for _, mode := range []string{"error", "timeout"} {
+		t.Run(mode, func(t *testing.T) {
+			// A trigger cannot read a session GUC set on another pooled
+			// connection, so pin the mode in the database for this subtest.
+			if _, err := db.Exec(fmt.Sprintf(`ALTER DATABASE %s SET test.mode = '%s'`, currentDB(t, db), mode)); err != nil {
+				t.Fatalf("set mode: %v", err)
+			}
+			db.SetMaxIdleConns(0) // force fresh connections that pick up the new default
+
+			var qid int64
+			if err := db.QueryRow(
+				`INSERT INTO queries (text, text_hash, status) VALUES ($1, $1, 'processing') RETURNING id`,
+				"retire-fail-"+mode).Scan(&qid); err != nil {
+				t.Fatalf("seed query: %v", err)
+			}
+			for suffix, j := range map[string]struct {
+				engine, status string
+				results        int
+			}{"g": {"google", "new", 0}, "b": {"bing", "completed", 3}} {
+				if _, err := db.Exec(
+					`INSERT INTO serp_jobs (id, parent_job_id, search_url, page_num, engine, status, result_count)
+					 VALUES ($1, $2, 'http://example/', 0, $3, $4, $5)`,
+					mode+"-"+suffix, qid, j.engine, j.status, j.results); err != nil {
+					t.Fatalf("seed job: %v", err)
+				}
+			}
+
+			res, err := ReconcileProcessingQueries(context.Background(), db, []string{"google"})
+			if err != nil {
+				t.Fatalf("reconcile returned %v, want success despite failed retire step", err)
+			}
+			if res.Completed != 1 {
+				t.Errorf("result = %+v, want the query completed from job stats", res)
+			}
+			var qStatus, gStatus string
+			db.QueryRow(`SELECT status FROM queries WHERE id = $1`, qid).Scan(&qStatus)
+			db.QueryRow(`SELECT status FROM serp_jobs WHERE id = $1`, mode+"-g").Scan(&gStatus)
+			if qStatus != "completed" {
+				t.Errorf("query status = %q, want completed", qStatus)
+			}
+			if gStatus != "new" {
+				t.Errorf("retired job status = %q, want new (retire rolled back)", gStatus)
+			}
+		})
+	}
+}
+
+func currentDB(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var name string
+	if err := db.QueryRow(`SELECT quote_ident(current_database())`).Scan(&name); err != nil {
+		t.Fatalf("current_database: %v", err)
+	}
+	return name
 }
 
 const reconcileTestSchema = `

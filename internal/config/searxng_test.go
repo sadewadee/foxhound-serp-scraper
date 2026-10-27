@@ -133,3 +133,20 @@ serp:
 		}
 	})
 }
+
+func TestQueueRefillDefaultsAndEnv(t *testing.T) {
+	cfg, err := LoadFromString("serp:\n  engines: all\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SERP.QueueLowWater != 500 || cfg.SERP.QueueRefillBatch != 1000 {
+		t.Errorf("defaults = %d/%d, want 500/1000", cfg.SERP.QueueLowWater, cfg.SERP.QueueRefillBatch)
+	}
+	cfg2, err := LoadFromString("serp:\n  queue_low_water: 50\n  queue_refill_batch: 200\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.SERP.QueueLowWater != 50 || cfg2.SERP.QueueRefillBatch != 200 {
+		t.Errorf("yaml = %d/%d, want 50/200", cfg2.SERP.QueueLowWater, cfg2.SERP.QueueRefillBatch)
+	}
+}

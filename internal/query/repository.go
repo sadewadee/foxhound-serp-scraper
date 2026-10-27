@@ -103,14 +103,90 @@ func (r *Repository) InsertBatch(queries []string) (int, error) {
 	return len(newQueries), nil
 }
 
-// pushQueryToQueue enqueues a query onto the Redis sorted-set queue.
-func (r *Repository) pushQueryToQueue(ctx context.Context, queryID int64, text string) {
+// queueMember is the sorted-set member for a query. Every producer must use it
+// so the same query always serializes to the same member and ZADD dedups.
+func queueMember(queryID int64, text string) string {
 	data, _ := json.Marshal(map[string]any{
 		"id":   queryID,
 		"text": text,
 	})
+	return string(data)
+}
+
+// pushQueryToQueue enqueues a query onto the Redis sorted-set queue.
+func (r *Repository) pushQueryToQueue(ctx context.Context, queryID int64, text string) {
 	score := float64(time.Now().UnixMicro())
-	r.redis.ZAdd(ctx, QueueKey, redis.Z{Score: score, Member: string(data)})
+	r.redis.ZAdd(ctx, QueueKey, redis.Z{Score: score, Member: queueMember(queryID, text)})
+}
+
+// RefillLockKey guards RefillQueue so containers on several hosts that share
+// one Redis do not push the same batch at the same moment.
+const RefillLockKey = "serp:queue:refill-lock"
+
+// refillLockTTL is deliberately left to expire (no unlock): it also keeps a
+// second container from re-checking right after the first one pushed.
+const refillLockTTL = 30 * time.Second
+
+// RefillQueue tops the Redis query queue up from Postgres. Queries only reach
+// Redis on insert/retry/startup, so once the startup batch drains the queue
+// stays empty while millions of 'pending' rows wait in the DB.
+//
+// If ZCARD is below lowWater it pushes the next batch of pending queries
+// (lowest id first). Scores are UnixMicro of now plus a 1µs stagger — the same
+// unit as pushQueryToQueue, so refilled items land BEHIND everything already
+// queued (Invariant #3) and keep id order. ZADD NX leaves already-queued
+// members untouched. Returns the number of members actually added.
+func (r *Repository) RefillQueue(ctx context.Context, lowWater, batch int) (int, error) {
+	if r.redis == nil || batch <= 0 {
+		return 0, nil
+	}
+	size, err := r.redis.ZCard(ctx, QueueKey).Result()
+	if err != nil {
+		return 0, fmt.Errorf("query: refill zcard: %w", err)
+	}
+	if size >= int64(lowWater) {
+		return 0, nil
+	}
+	locked, err := r.redis.SetNX(ctx, RefillLockKey, "1", refillLockTTL).Result()
+	if err != nil {
+		return 0, fmt.Errorf("query: refill lock: %w", err)
+	}
+	if !locked {
+		return 0, nil
+	}
+
+	// Served by idx_queries_pending_id (partial, status = 'pending'); bounded by LIMIT.
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, text FROM queries WHERE status = 'pending' ORDER BY id ASC LIMIT $1`, batch)
+	if err != nil {
+		return 0, fmt.Errorf("query: refill select pending: %w", err)
+	}
+	defer rows.Close()
+
+	base := time.Now().UnixMicro()
+	var members []redis.Z
+	for rows.Next() {
+		var id int64
+		var text string
+		if err := rows.Scan(&id, &text); err != nil {
+			return 0, fmt.Errorf("query: refill scan: %w", err)
+		}
+		members = append(members, redis.Z{
+			Score:  float64(base + int64(len(members))),
+			Member: queueMember(id, text),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("query: refill rows: %w", err)
+	}
+	if len(members) == 0 {
+		return 0, nil
+	}
+	added, err := r.redis.ZAddNX(ctx, QueueKey, members...).Result()
+	if err != nil {
+		return 0, fmt.Errorf("query: refill zadd: %w", err)
+	}
+	return int(added), nil
 }
 
 // InsertBatchWithCountry bulk-inserts queries with a specific country, skipping duplicates by text_hash.

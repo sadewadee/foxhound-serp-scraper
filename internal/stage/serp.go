@@ -175,6 +175,7 @@ func (s *SERPStage) Run(ctx context.Context) error {
 	go s.heartbeat(ctx)
 	go s.reconciler(ctx)
 	go s.queryFeeder(ctx)
+	go s.queueRefiller(ctx)
 
 	// Start the DB-to-Redis buffer feeder.
 	engineNames := make([]string, len(s.engines))
@@ -231,6 +232,32 @@ func (s *SERPStage) heartbeat(ctx context.Context) {
 				delta_at = NOW(), last_heartbeat = NOW(),
 				status = 'working'
 			WHERE worker_id = $3`, pages, emails, workerID)
+		}
+	}
+}
+
+// queueRefiller keeps serp:queue:queries stocked from the DB. Queries reach
+// Redis only on insert/retry/startup, so without this the queue drains for good
+// after the startup batch while the pending backlog sits in Postgres. Safe on
+// every container: RefillQueue takes a short Redis lock and dedups by member.
+func (s *SERPStage) queueRefiller(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		n, err := s.queryRepo.RefillQueue(ctx, s.cfg.SERP.QueueLowWater, s.cfg.SERP.QueueRefillBatch)
+		if err != nil {
+			slog.Warn("serp: queue refill failed", "error", err)
+			continue
+		}
+		if n > 0 {
+			slog.Info("serp: refilled query queue from pending", "count", n)
 		}
 	}
 }
