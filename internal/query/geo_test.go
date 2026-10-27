@@ -135,3 +135,24 @@ func TestCountryAliasesDoNotShadowCanonicalNames(t *testing.T) {
 		}
 	}
 }
+
+// The listing backfill joins on LOWER(country) = key over (names ∪ aliases ∪
+// lowercased ISO codes); a key mapping to two codes would make UPDATE … FROM pick
+// one arbitrarily.
+func TestCountryResolverKeysUnambiguous(t *testing.T) {
+	keys := map[string]string{}
+	put := func(k, code string) {
+		k = strings.ToLower(k)
+		if prev, ok := keys[k]; ok && prev != code {
+			t.Errorf("resolver key %q maps to both %s and %s", k, prev, code)
+		}
+		keys[k] = code
+	}
+	for _, r := range CountryRows() {
+		put(r.Name, r.Code)
+		put(r.Code, r.Code)
+	}
+	for a, c := range CountryAliases() {
+		put(a, c)
+	}
+}
