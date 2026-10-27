@@ -93,6 +93,8 @@
 //	./prodir sources                                        # registered generic sources
 //	./prodir sites -source ace -dry-run                     # websites of loaded listings -> enrich queue (counts only)
 //	./prodir sites -source all -limit 100                   # enqueue (POSTGRES_DSN)
+//	./prodir websites all -dry-run                          # link-back, counts only
+//	./prodir websites ace                                   # POSTGRES_DSN; re-run as enrich completes
 //	./prodir iyengaruk list     -state data
 //	./prodir iyengaruk profiles -state data -workers 2 -limit 50
 //	./prodir iyengaruk load     -state data -dry-run
@@ -107,6 +109,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	_ "github.com/lib/pq"
@@ -115,7 +118,7 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: prodir <ace|icf|slug> <list|profiles|export|load> [flags]\n       prodir sources\n       prodir sites -source <ace|icf|slug|all> [-dsn DSN] [-dry-run] [-limit N]")
+	fmt.Fprintln(os.Stderr, "usage: prodir <ace|icf|slug> <list|profiles|export|load> [flags]\n       prodir sources\n       prodir sites -source <ace|icf|slug|all> [-dsn DSN] [-dry-run] [-limit N]\n       prodir websites [ace|icf|yogaalliance|slug|all] [-dsn DSN] [-dry-run]")
 	os.Exit(prodir.ExitErrors)
 }
 
@@ -161,6 +164,38 @@ func runSites(args []string) int {
 	return prodir.ExitOK
 }
 
+// runWebsites is `prodir websites [slug|all]`: link the contact data enrich scraped
+// from directory rows' own websites back onto the rows (internal/prodir/websites.go).
+func runWebsites(args []string) int {
+	sel := "all"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sel, args = args[0], args[1:]
+	}
+	fs := flag.NewFlagSet("websites", flag.ExitOnError)
+	dsn := fs.String("dsn", os.Getenv("POSTGRES_DSN"), "Postgres DSN (default $POSTGRES_DSN)")
+	dryRun := fs.Bool("dry-run", false, "print counts only, no writes")
+	fs.Parse(args)
+	if *dsn == "" {
+		fmt.Fprintln(os.Stderr, "websites requires -dsn or $POSTGRES_DSN")
+		return prodir.ExitErrors
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	db, err := sql.Open("postgres", *dsn)
+	if err == nil {
+		db.SetMaxOpenConns(2)
+		defer db.Close()
+		if err = db.PingContext(ctx); err == nil {
+			err = prodir.Websites(ctx, db, sel, *dryRun, os.Stdout)
+		}
+	}
+	if err != nil {
+		slog.Error("prodir websites failed", "source", sel, "error", err)
+		return prodir.ExitErrors
+	}
+	return prodir.ExitOK
+}
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "sources" {
 		printSources()
@@ -168,6 +203,9 @@ func main() {
 	}
 	if len(os.Args) >= 2 && os.Args[1] == "sites" {
 		os.Exit(runSites(os.Args[2:]))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "websites" {
+		os.Exit(runWebsites(os.Args[2:]))
 	}
 	if len(os.Args) < 3 {
 		usage()
