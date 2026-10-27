@@ -453,7 +453,9 @@ func BackfillListingCountryCode(ctx context.Context, db *sql.DB) {
 // enriching the lookup (query.CountryRows full ISO names + extras), this pass
 // re-walks those rows, now also resolving caller-supplied aliases. New version
 // string → runs once on deploy; the old version row is left untouched.
-const listingCountryCodeAliasVersion = "2026_06_10_listing_country_code_aliases"
+// v2 (2026-10-27) re-runs it for the extended countries/aliases and also accepts
+// a bare ISO-2 value and an empty-string code.
+const listingCountryCodeAliasVersion = "2026_10_27_listing_country_code_aliases_v2"
 
 // BackfillListingCountryCodeAliases maps page-extracted full-name countries to
 // ISO-2 country_code via the (now-enriched) countries lookup UNIONed with a
@@ -478,7 +480,9 @@ func BackfillListingCountryCodeAliases(ctx context.Context, db *sql.DB, aliases 
 	// (lowercased-country-string, ISO-2 code). Alias literals are pq-quoted; the
 	// values are a small curated Go map, but quoting keeps the build injection-safe
 	// and matches the geo backfills' string-interpolation pattern.
-	resolver := `SELECT LOWER(name) AS k, code FROM countries`
+	// A country value that is itself an ISO-2 code in the table ("us") resolves too:
+	// the code still comes from the countries whitelist (invariant #6).
+	resolver := `SELECT LOWER(name) AS k, code FROM countries UNION SELECT LOWER(code), code FROM countries`
 	if len(aliases) > 0 {
 		pairs := make([]string, 0, len(aliases))
 		for name, code := range aliases {
@@ -510,7 +514,7 @@ func BackfillListingCountryCodeAliases(ctx context.Context, db *sql.DB, aliases 
 		SET country_code = r.code
 		FROM (%s) r
 		WHERE bl.id > $1 AND bl.id <= $2
-		  AND bl.country_code IS NULL
+		  AND COALESCE(bl.country_code, '') = ''
 		  AND COALESCE(bl.country, '') <> ''
 		  AND LOWER(bl.country) = r.k
 	`, resolver)

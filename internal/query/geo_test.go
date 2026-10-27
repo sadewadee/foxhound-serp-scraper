@@ -121,3 +121,38 @@ func TestCountryAliasesValid(t *testing.T) {
 		}
 	}
 }
+
+// An alias must never shadow another country's canonical name, otherwise the
+// resolver (alias loaded last) would silently re-route that country.
+func TestCountryAliasesDoNotShadowCanonicalNames(t *testing.T) {
+	canon := map[string]string{}
+	for _, r := range CountryRows() {
+		canon[strings.ToLower(r.Name)] = r.Code
+	}
+	for alias, code := range CountryAliases() {
+		if c, ok := canon[alias]; ok && c != code {
+			t.Errorf("alias %q → %q shadows canonical name of %q", alias, code, c)
+		}
+	}
+}
+
+// The listing backfill joins on LOWER(country) = key over (names ∪ aliases ∪
+// lowercased ISO codes); a key mapping to two codes would make UPDATE … FROM pick
+// one arbitrarily.
+func TestCountryResolverKeysUnambiguous(t *testing.T) {
+	keys := map[string]string{}
+	put := func(k, code string) {
+		k = strings.ToLower(k)
+		if prev, ok := keys[k]; ok && prev != code {
+			t.Errorf("resolver key %q maps to both %s and %s", k, prev, code)
+		}
+		keys[k] = code
+	}
+	for _, r := range CountryRows() {
+		put(r.Name, r.Code)
+		put(r.Code, r.Code)
+	}
+	for a, c := range CountryAliases() {
+		put(a, c)
+	}
+}
