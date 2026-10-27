@@ -193,6 +193,8 @@ Query: `page`, `per_page≤200`, `status`, `search`
   "enrichment_jobs_total": 900000,
   "emails_total": 828000,
   "business_listings_total": 500000,
+  "totals_estimated": true,
+  "unknown_figures": [],
   "queues": {
     "serp:queue:queries": 42,
     "serp:buffer": 180,
@@ -200,6 +202,14 @@ Query: `page`, `per_page≤200`, `status`, `search`
   }
 }
 ```
+
+**Semantik angka (stats)** — berlaku untuk `/api/pipeline/stats`, `/api/dashboard`, `/api/v2/stats`:
+
+- Total tabel besar (`serp.total`, `enrich.total`, `results.total_emails`, `*_total` di pipeline stats) adalah **estimasi** dari `pg_class.reltuples` (akurat < 1% selama autovacuum jalan), bukan `COUNT(*)`. Nama figure-nya tercantum di `estimated_figures`.
+- `serp.completed`, `serp.urls_found`, `enrich.completed`, `results.unique_domains` (v1: `contacts.*`), dan `providers` dihitung manager di background tiap ~5 menit dan dibaca dari Redis; waktu snapshot ada di `snapshot_at` (RFC3339, `null` bila belum ada).
+- Figure yang gagal dihitung (timeout/error/snapshot belum ada) bernilai **`null`** dan namanya masuk `unknown_figures` (mis. `"serp.completed"`). Tidak pernah diganti 0. Client harus menangani `null` per figure.
+- Bila **tidak ada satu pun** figure yang bisa dihitung, endpoint balas 500 dan respons tidak di-cache.
+- `unknown_figures` / `estimated_figures` selalu array (kosong = `[]`).
 
 ### `GET /api/dashboard`
 
@@ -218,7 +228,10 @@ Query: `page`, `per_page≤200`, `status`, `search`
     "total_emails":828000,"unique_emails":828000,"emails_today":34000,
     "emails_per_hour":1200,"providers":{"gmail.com":420000},"unique_domains":87000
   },
-  "queues": {"serp:queue:queries":42,"serp:buffer":180,"enrich:buffer":75}
+  "queues": {"serp:queue:queries":42,"serp:buffer":180,"enrich:buffer":75},
+  "unknown_figures": [],
+  "estimated_figures": ["serp.total","enrich.total","contacts.total_emails"],
+  "snapshot_at": "2026-10-27T10:00:00Z"
 }
 ```
 
@@ -429,10 +442,15 @@ mengembalikannya per listing.
       "total_emails":828000,"emails_today":34000,"emails_per_hour":1200,
       "unique_domains":87000,"providers":{"gmail.com":420000}
     },
-    "queues": {"serp:queue:queries":42,"serp:buffer":180,"enrich:buffer":75}
+    "queues": {"serp:queue:queries":42,"serp:buffer":180,"enrich:buffer":75},
+    "unknown_figures": [],
+    "estimated_figures": ["serp.total","enrich.total","results.total_emails"],
+    "snapshot_at": "2026-10-27T10:00:00Z"
   }
 }
 ```
+
+Semantik angka sama dengan v1 (lihat bagian 5): total = estimasi, figure yang tak bisa dihitung = `null` + masuk `unknown_figures`.
 
 ---
 
