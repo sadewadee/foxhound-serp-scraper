@@ -98,6 +98,7 @@ type SERPConfig struct {
 	SearXNGDelayMs        int     `yaml:"searxng_delay_ms"`   // per-request delay for this engine, default 1000
 	RelevanceMin          float64 `yaml:"relevance_min"`      // default 0.3
 	RelevanceGuard        bool    `yaml:"relevance_guard"`    // default true ("1", "0" disables)
+	DDGNoReferer          bool    `yaml:"ddg_no_referer"`     // default false: drop the Referer on DDG stealth requests ("1" enables)
 }
 
 type WebsiteConfig struct {
@@ -226,6 +227,7 @@ func LoadFromEnv() (*Config, error) {
 			SearXNGDelayMs:   parseEnvInt("SEARXNG_DELAY_MS", 0),
 			RelevanceMin:     parseEnvFloat("SERP_RELEVANCE_MIN", 0.3),
 			RelevanceGuard:   os.Getenv("SERP_RELEVANCE_GUARD") != "0",
+			DDGNoReferer:     os.Getenv("SERP_DDG_NO_REFERER") == "1",
 		},
 		Fetch: FetchConfig{
 			Headless:             true,
@@ -352,6 +354,9 @@ func setDefaults(cfg *Config) {
 		cfg.SERP.RelevanceGuard = false
 	} else if !cfg.SERP.RelevanceGuard && os.Getenv("SERP_RELEVANCE_GUARD") != "0" {
 		cfg.SERP.RelevanceGuard = true
+	}
+	if os.Getenv("SERP_DDG_NO_REFERER") == "1" {
+		cfg.SERP.DDGNoReferer = true
 	}
 	if cfg.Directory.Solver == "" {
 		cfg.Directory.Solver = "none"

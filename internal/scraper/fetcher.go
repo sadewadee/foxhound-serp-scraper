@@ -314,14 +314,24 @@ func FetchSERPWithEngine(ctx context.Context, browser *fetch.CamoufoxFetcher, se
 	return resp.Body, nil
 }
 
+// serpStealthHeaders returns the extra headers for a stealth SERP request.
+// DuckDuckGo answers a GET carrying a self-referencing Referer with its
+// anomaly (captcha) page, so noReferer drops it.
+func serpStealthHeaders(serpURL string, noReferer bool) http.Header {
+	if noReferer {
+		return nil
+	}
+	return engineHomepageReferer(serpURL)
+}
+
 // FetchSERPStealth fetches a SERP page via stealth HTTP (no browser).
 // Used by engines that do not require a full browser (e.g. DuckDuckGo).
-func FetchSERPStealth(ctx context.Context, stealth *fetch.StealthFetcher, serpURL, jobID string) ([]byte, error) {
+func FetchSERPStealth(ctx context.Context, stealth *fetch.StealthFetcher, serpURL, jobID string, noReferer bool) ([]byte, error) {
 	resp, err := stealth.Fetch(ctx, &foxhound.Job{
 		ID:      jobID,
 		URL:     serpURL,
 		Method:  "GET",
-		Headers: engineHomepageReferer(serpURL),
+		Headers: serpStealthHeaders(serpURL, noReferer),
 	})
 	if err != nil {
 		return nil, err

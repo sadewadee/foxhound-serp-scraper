@@ -160,6 +160,7 @@ services:
       SEARXNG_DELAY_MS: "${SEARXNG_DELAY_MS:-1000}"
       SERP_RELEVANCE_MIN: "${SERP_RELEVANCE_MIN:-0.3}"
       SERP_RELEVANCE_GUARD: "${SERP_RELEVANCE_GUARD:-1}"
+      SERP_DDG_NO_REFERER: "${SERP_DDG_NO_REFERER:-0}"
       # ── Beta features DISABLED for SERP — circuit breaker skips proxy too aggressively ──
       BETA_FEATURES: "0"
       # ── Persister (batch flush Redis→DB) ──
