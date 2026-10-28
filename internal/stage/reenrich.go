@@ -451,52 +451,7 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 	// The DB trigger (trg_enrich_complete_upsert) handles the upsert into
 	// business_listings — we do NOT duplicate that logic here.
 	urlHash := dedup.HashURL(row.URL)
-	_, insertErr := r.db.ExecContext(ctx, `
-		INSERT INTO enrichment_jobs (
-			url, url_hash, domain, status,
-			raw_emails, raw_phones, raw_social,
-			raw_business_name, raw_category, raw_address,
-			raw_page_title, raw_description, raw_location, raw_country,
-			raw_city, raw_contact_name, raw_opening_hours, raw_rating,
-			raw_tiktok, raw_youtube, raw_telegram,
-			completed_at, updated_at
-		) VALUES (
-			$1, $2, $3, 'completed',
-			$4, $5, $6,
-			$7, $8, $9,
-			$10, $11, $12, $13,
-			$14, $15, $16, $17,
-			$18, $19, $20,
-			NOW(), NOW()
-		)
-		ON CONFLICT (url_hash) DO UPDATE SET
-			status        = 'completed',
-			raw_emails    = EXCLUDED.raw_emails,
-			raw_phones    = EXCLUDED.raw_phones,
-			raw_social    = EXCLUDED.raw_social,
-			raw_business_name  = COALESCE(EXCLUDED.raw_business_name,  enrichment_jobs.raw_business_name),
-			raw_category       = COALESCE(EXCLUDED.raw_category,       enrichment_jobs.raw_category),
-			raw_address        = COALESCE(EXCLUDED.raw_address,        enrichment_jobs.raw_address),
-			raw_page_title     = COALESCE(EXCLUDED.raw_page_title,     enrichment_jobs.raw_page_title),
-			raw_description    = COALESCE(EXCLUDED.raw_description,    enrichment_jobs.raw_description),
-			raw_location       = COALESCE(EXCLUDED.raw_location,       enrichment_jobs.raw_location),
-			raw_country        = COALESCE(EXCLUDED.raw_country,        enrichment_jobs.raw_country),
-			raw_city           = COALESCE(EXCLUDED.raw_city,           enrichment_jobs.raw_city),
-			raw_contact_name   = COALESCE(EXCLUDED.raw_contact_name,   enrichment_jobs.raw_contact_name),
-			raw_opening_hours  = COALESCE(EXCLUDED.raw_opening_hours,  enrichment_jobs.raw_opening_hours),
-			raw_rating         = COALESCE(EXCLUDED.raw_rating,         enrichment_jobs.raw_rating),
-			raw_tiktok         = COALESCE(EXCLUDED.raw_tiktok,         enrichment_jobs.raw_tiktok),
-			raw_youtube        = COALESCE(EXCLUDED.raw_youtube,        enrichment_jobs.raw_youtube),
-			raw_telegram       = COALESCE(EXCLUDED.raw_telegram,       enrichment_jobs.raw_telegram),
-			completed_at = NOW(), updated_at = NOW()
-	`,
-		row.URL, urlHash, row.Domain,
-		pq.Array(emails), pq.Array(phones), socialJSON,
-		nullIfEmpty(sanitizeUTF8(cd.BusinessName)), nullIfEmpty(sanitizeUTF8(cd.BusinessCategory)), nullIfEmpty(sanitizeUTF8(cd.Address)),
-		nullIfEmpty(sanitizeUTF8(cd.PageTitle)), nullIfEmpty(sanitizeUTF8(cd.Description)), nullIfEmpty(sanitizeUTF8(cd.Location)), nullIfEmpty(sanitizeUTF8(cd.Country)),
-		nullIfEmpty(sanitizeUTF8(cd.City)), nullIfEmpty(sanitizeUTF8(cd.ContactName)), nullIfEmpty(sanitizeUTF8(cd.OpeningHours)), nullIfEmpty(sanitizeUTF8(cd.Rating)),
-		nullIfEmpty(sanitizeUTF8(cd.TikTok)), nullIfEmpty(sanitizeUTF8(cd.YouTube)), nullIfEmpty(sanitizeUTF8(cd.Telegram)),
-	)
+	insertErr := completeEnrichmentJob(ctx, r.db, row.URL, urlHash, row.Domain, emails, phones, socialJSON, cd)
 	if insertErr != nil {
 		// DB-side failure (transient). Release the claim so another worker
 		// can retry without waiting for the 15-min stale-claim window.
@@ -527,6 +482,64 @@ func (r *ReenrichStage) processRow(ctx context.Context, stealth *fetch.StealthFe
 			"phones", len(phones),
 			"worker", workerID)
 	}
+}
+
+// completeEnrichmentJob writes a re-enrichment result to enrichment_jobs so
+// trg_enrichment_normalize folds it into business_listings + business_emails.
+// That trigger is AFTER UPDATE ... WHEN (NEW.status='completed' AND OLD.status
+// IS DISTINCT FROM 'completed'), so it never fires for a plain upsert: an
+// INSERT is not an UPDATE, and ON CONFLICT DO UPDATE on an already-completed
+// row has OLD.status='completed'. Re-enriched emails were silently dropped
+// (862 SERP yoga/pilates/fitness listings had raw_emails but no
+// business_emails row). Park the row as 'processing' first, in the same
+// transaction, so the completing UPDATE is a real status transition.
+func completeEnrichmentJob(ctx context.Context, db *sql.DB, url, urlHash, domain string,
+	emails, phones []string, socialJSON []byte, cd *internalScraper.ContactData) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO enrichment_jobs (url, url_hash, domain, status)
+		VALUES ($1, $2, $3, 'processing')
+		ON CONFLICT (url_hash) DO UPDATE SET status = 'processing'`,
+		url, urlHash, domain); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE enrichment_jobs SET
+			status        = 'completed',
+			raw_emails    = $2,
+			raw_phones    = $3,
+			raw_social    = $4,
+			raw_business_name  = COALESCE($5,  raw_business_name),
+			raw_category       = COALESCE($6,  raw_category),
+			raw_address        = COALESCE($7,  raw_address),
+			raw_page_title     = COALESCE($8,  raw_page_title),
+			raw_description    = COALESCE($9,  raw_description),
+			raw_location       = COALESCE($10, raw_location),
+			raw_country        = COALESCE($11, raw_country),
+			raw_city           = COALESCE($12, raw_city),
+			raw_contact_name   = COALESCE($13, raw_contact_name),
+			raw_opening_hours  = COALESCE($14, raw_opening_hours),
+			raw_rating         = COALESCE($15, raw_rating),
+			raw_tiktok         = COALESCE($16, raw_tiktok),
+			raw_youtube        = COALESCE($17, raw_youtube),
+			raw_telegram       = COALESCE($18, raw_telegram),
+			completed_at = NOW(), updated_at = NOW()
+		WHERE url_hash = $1`,
+		urlHash,
+		pq.Array(emails), pq.Array(phones), socialJSON,
+		nullIfEmpty(sanitizeUTF8(cd.BusinessName)), nullIfEmpty(sanitizeUTF8(cd.BusinessCategory)), nullIfEmpty(sanitizeUTF8(cd.Address)),
+		nullIfEmpty(sanitizeUTF8(cd.PageTitle)), nullIfEmpty(sanitizeUTF8(cd.Description)), nullIfEmpty(sanitizeUTF8(cd.Location)), nullIfEmpty(sanitizeUTF8(cd.Country)),
+		nullIfEmpty(sanitizeUTF8(cd.City)), nullIfEmpty(sanitizeUTF8(cd.ContactName)), nullIfEmpty(sanitizeUTF8(cd.OpeningHours)), nullIfEmpty(sanitizeUTF8(cd.Rating)),
+		nullIfEmpty(sanitizeUTF8(cd.TikTok)), nullIfEmpty(sanitizeUTF8(cd.YouTube)), nullIfEmpty(sanitizeUTF8(cd.Telegram)),
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // applyOfflineParse derives country/city from row.Address via the tail-parse
