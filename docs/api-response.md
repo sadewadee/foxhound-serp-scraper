@@ -206,7 +206,7 @@ Query: `page`, `per_page≤200`, `status`, `search`
 **Semantik angka (stats)** — berlaku untuk `/api/pipeline/stats`, `/api/dashboard`, `/api/v2/stats`:
 
 - Total tabel besar (`serp.total`, `enrich.total`, `results.total_emails`, `*_total` di pipeline stats) adalah **estimasi** dari `pg_class.reltuples` (akurat < 1% selama autovacuum jalan), bukan `COUNT(*)`. Nama figure-nya tercantum di `estimated_figures`.
-- `serp.completed`, `serp.urls_found`, `enrich.completed`, `results.unique_domains` (v1: `contacts.*`), dan `providers` dihitung manager di background tiap ~5 menit dan dibaca dari Redis; waktu snapshot ada di `snapshot_at` (RFC3339, `null` bila belum ada).
+- `serp.completed`, `serp.urls_found`, `enrich.completed`, `results.unique_domains` (v1: `contacts.*`), dan `providers` dihitung manager di background tiap ~15 menit dan dibaca dari Redis; waktu snapshot ada di `snapshot_at` (RFC3339, `null` bila belum ada).
 - Figure yang gagal dihitung (timeout/error/snapshot belum ada) bernilai **`null`** dan namanya masuk `unknown_figures` (mis. `"serp.completed"`). Tidak pernah diganti 0. Client harus menangani `null` per figure.
 - Bila **tidak ada satu pun** figure yang bisa dihitung, endpoint balas 500 dan respons tidak di-cache.
 - `unknown_figures` / `estimated_figures` selalu array (kosong = `[]`).

@@ -31,7 +31,7 @@ import (
 const (
 	statsFastTimeout   = 2 * time.Second
 	statsSlowTimeout   = 120 * time.Second
-	statsSlowInterval  = 5 * time.Minute
+	statsSlowInterval  = 15 * time.Minute
 	statsSlowKey       = "stats:slow:v1"
 	statsSlowKeyTTL    = time.Hour // outlives several missed refreshes, then figures go unknown
 	statsSnapshotField = "computed_at"
@@ -55,6 +55,8 @@ var fastFigures = []struct{ key, sql string }{
 	{"results.emails_today", `SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'`},
 }
 
+// slowFigures are full scans: the single sanctioned exception to Invariant #2 —
+// manager-only, own 120s timeout, 15 min cadence, never on the request path.
 // slowFigures are computed by RunSlowStatsLoop. Values are stored as strings;
 // "results.providers" holds a JSON object.
 var slowFigures = []struct{ key, sql string }{
