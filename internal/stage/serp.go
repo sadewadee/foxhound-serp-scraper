@@ -389,7 +389,8 @@ func (s *SERPStage) queryFeeder(ctx context.Context) {
 // An engine currently inside a suspension backoff is left out, so tabs keep
 // draining the host's other engines instead of idling behind SearXNG's
 // suspension. allBackedOff is true when that filtering left nothing to read.
-func (s *SERPStage) bufferKeys() (keys []string, allBackedOff bool) {
+// turn rotates the engine order so every engine gets a fair share of pops.
+func (s *SERPStage) bufferKeys(turn int) (keys []string, allBackedOff bool) {
 	engineKeys := make([]string, 0, len(s.engines))
 	for _, e := range s.engines {
 		if e != nil && e.Name() != "" {
@@ -399,7 +400,7 @@ func (s *SERPStage) bufferKeys() (keys []string, allBackedOff bool) {
 	// Always drain the legacy shared list last: a deploy landing on top of a
 	// non-empty old `serp:buffer` would otherwise strand its items. Foreign
 	// items popped from there hit the release-on-miss path, which is safe.
-	keys, allBackedOff = SelectBufferKeys(engineKeys, feeder.SERPBufferKey, func(k string) bool {
+	keys, allBackedOff = SelectBufferKeys(engineKeys, feeder.SERPBufferKey, turn, func(k string) bool {
 		return k == feeder.BufferKeyForEngine("searxng") && s.searxngBackoff.BackedOff(time.Now())
 	})
 	return keys, allBackedOff
@@ -421,6 +422,8 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 	plainClient := scraper.NewPlainHTTPFetcher(time.Duration(s.cfg.SERP.SearXNGTimeoutMs) * time.Millisecond)
 	defer stealth.Close()
 
+	// Rotates the engine key order per BLPOP so no engine starves another.
+	turn := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -432,7 +435,7 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 		// host's engines (the feeder claims per engine from the same sets).
 		// An engine inside a suspension backoff is left out, so the other
 		// engines keep draining instead of every tab parking behind SearXNG.
-		keys, allBackedOff := s.bufferKeys()
+		keys, allBackedOff := s.bufferKeys(turn)
 		if allBackedOff {
 			wait := WaitForAnyBackoff([]time.Duration{s.searxngBackoff.Remaining(time.Now())}, MaxAllEnginesWait)
 			if wait <= 0 {
@@ -447,6 +450,7 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			continue
 		}
 		result, err := s.redis.BLPop(ctx, 5*time.Second, keys...).Result()
+		turn++
 		if err != nil {
 			if ctx.Err() != nil {
 				return
