@@ -52,3 +52,17 @@ func TestDuckDuckGoEngine_ParseResults(t *testing.T) {
 		t.Errorf("FilterRelevant kept %d, ratio %f; want 2, >=0.6", len(kept), ratio)
 	}
 }
+
+// DDG serves its anomaly page to a GET with a self-referencing Referer
+// (probe: 2/50 pages ok with it, 46/50 without). With the flag on the
+// request must carry no Referer; with it off the legacy header stays.
+func TestSerpStealthHeadersDDGReferer(t *testing.T) {
+	u := "https://html.duckduckgo.com/html/?q=yoga&kl=us-en-"
+
+	if got := serpStealthHeaders(u, false).Get("Referer"); got != "https://html.duckduckgo.com/" {
+		t.Errorf("flag off: Referer = %q, want engine homepage", got)
+	}
+	if got := serpStealthHeaders(u, true).Get("Referer"); got != "" {
+		t.Errorf("flag on: Referer = %q, want none", got)
+	}
+}

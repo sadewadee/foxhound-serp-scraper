@@ -626,7 +626,8 @@ func (s *SERPStage) tabWorker(ctx context.Context, tabID int) {
 			}
 			// Per-fetch timeout for stealth too.
 			stealthCtx, stealthCancel := context.WithTimeout(ctx, 30*time.Second)
-			body, fetchErr = scraper.FetchSERPStealth(stealthCtx, stealth, job.URL, job.ID)
+			noReferer := s.cfg.SERP.DDGNoReferer && job.Engine == "duckduckgo"
+			body, fetchErr = scraper.FetchSERPStealth(stealthCtx, stealth, job.URL, job.ID, noReferer)
 			stealthCancel()
 		}
 
