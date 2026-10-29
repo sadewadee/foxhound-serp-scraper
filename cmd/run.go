@@ -126,6 +126,11 @@ func RunPipeline(cfg *config.Config, stageName string, workers int) error {
 		// a ticker).
 		go db.RefreshCategoryStatsLoop(ctx, database)
 
+		// Dashboard stats: full-scan figures (serp/enrich completed, urls_found,
+		// unique_domains, email providers) are computed here off the request path
+		// and served from Redis by /api/v2/stats, /api/dashboard. Manager-only.
+		go api.RunSlowStatsLoop(ctx, database, dd.Client())
+
 		// Geo lineage (v4 schema direction): seed the countries + geo_cities
 		// reference tables, then run the one-time geo backfills IN ORDER —
 		// queries first (city token in text → ISO-2 country + city), then

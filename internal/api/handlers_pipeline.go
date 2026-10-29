@@ -12,201 +12,69 @@ import (
 )
 
 func (s *Server) handlePipelineStats(w http.ResponseWriter, r *http.Request) {
-	// 10s budget — must exceed the 8s statement_timeout below so PG cancels
-	// the query first and we observe a clean error rather than a context-cancel.
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	stats := map[string]any{}
-
-	// Wrap big-table COUNT(*) in a single tx with statement_timeout so a slow
-	// query can't hold the manager's 2-conn pool open indefinitely (the cascade
-	// that was causing v2 endpoints to balas 500 with context deadline exceeded).
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		slog.Error("v1: pipeline-stats tx error", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
-		return
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '8000'"); err != nil {
-		slog.Error("v1: pipeline-stats set timeout error", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
-		return
-	}
-
-	// Table counts. tables is compile-time only — no user input flows into the
-	// SQL string here, so fmt.Sprintf is safe.
+	// Table totals are pg_class.reltuples estimates (Invariant #2: no COUNT(*)
+	// over serp_jobs / enrichment_jobs). A table without an estimate is null and
+	// listed in unknown_figures — never a fake 0.
 	tables := map[string]string{
 		"queries": "queries", "serp_jobs": "serp_jobs",
 		"enrichment_jobs": "enrichment_jobs", "emails": "emails",
 		"business_listings": "business_listings",
 	}
-	for key, table := range tables {
-		var total int
-		if err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&total); err != nil {
-			slog.Warn("v1: pipeline-stats count failed", "table", table, "error", err)
-		}
-		stats[key+"_total"] = total
+	est, err := s.tableEstimates(ctx, "queries", "serp_jobs", "enrichment_jobs", "emails", "business_listings")
+	if err != nil {
+		slog.Warn("v1: pipeline-stats estimates failed", "error", err)
 	}
-	tx.Commit()
-
-	// Queue depths from Redis (buffers are LISTs, queries queue is sorted set).
-	queueStats := map[string]int64{}
-	qDepth, _ := s.redis.ZCard(ctx, "serp:queue:queries").Result()
-	queueStats["serp:queue:queries"] = qDepth
-	serpBuf, _ := s.redis.LLen(ctx, "serp:buffer").Result()
-	queueStats["serp:buffer"] = serpBuf
-	enrichBuf, _ := s.redis.LLen(ctx, "enrich:buffer").Result()
-	queueStats["enrich:buffer"] = enrichBuf
-	stats["queues"] = queueStats
+	stats := map[string]any{}
+	unknown := []string{}
+	for key, table := range tables {
+		if n, ok := est[table]; ok {
+			stats[key+"_total"] = n
+		} else {
+			stats[key+"_total"] = nil
+			unknown = append(unknown, key+"_total")
+		}
+	}
+	if len(unknown) == len(tables) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+	stats["totals_estimated"] = true
+	stats["unknown_figures"] = unknown
+	stats["queues"] = s.queueDepths(ctx)
 
 	writeJSON(w, http.StatusOK, stats)
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// 18s — same budget as v2_response.v2RequestContext so the V1 dashboard
-	// won't outlive V2 requests. Statement timeout below is 15s; PG cancels first.
+	// won't outlive V2 requests.
 	ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
 	defer cancel()
 
-	// -- Queries (small table — runs outside the big tx since CSV-style status
-	// rollup is cheap and we want it to complete even if the tx hits timeout.) --
-	queries := map[string]int{}
-	qRows, _ := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM queries GROUP BY status`)
-	if qRows != nil {
-		for qRows.Next() {
-			var status string
-			var cnt int
-			qRows.Scan(&status, &cnt)
-			queries[status] = cnt
-		}
-		qRows.Close()
-	}
-	qTotal := 0
-	for _, c := range queries {
-		qTotal += c
-	}
-	queries["total"] = qTotal
-
-	// Big-table aggregates wrapped in a tx + statement_timeout to bound the
-	// time these can hold the manager's 2-conn pool. Without this V2 endpoints
-	// see 500 with context deadline exceeded when this handler runs slow.
-	tx, err := s.db.BeginTx(ctx, nil)
+	st, err := s.computeDashboardStats(ctx)
 	if err != nil {
-		slog.Error("v1: dashboard tx error", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
-		return
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '15000'"); err != nil {
-		slog.Error("v1: dashboard set timeout error", "error", err)
+		slog.Error("v1: dashboard stats error", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 		return
 	}
 
-	// -- SERP Jobs --
-	serp := map[string]any{}
-	var serpTotal, serpNew, serpProcessing, serpCompleted, serpFailed int
-	var serpURLsFound, serpPerHour, serpToday int
-	tx.QueryRowContext(ctx, `
-		SELECT
-			COUNT(*),
-			COUNT(*) FILTER (WHERE status = 'new'),
-			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COALESCE(SUM(result_count) FILTER (WHERE status = 'completed'), 0),
-			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND updated_at > NOW() - INTERVAL '24 hours')
-		FROM serp_jobs
-	`).Scan(&serpTotal, &serpNew, &serpProcessing, &serpCompleted, &serpFailed, &serpURLsFound, &serpPerHour, &serpToday)
-	serp["total"] = serpTotal
-	serp["pending"] = serpNew
-	serp["processing"] = serpProcessing
-	serp["completed"] = serpCompleted
-	serp["failed"] = serpFailed
-	serp["urls_found"] = serpURLsFound
-	serp["rate_per_hour"] = serpPerHour
-	serp["today"] = serpToday
-
-	// -- Enrich Jobs --
-	enrich := map[string]any{}
-	var enrichTotal, enrichPending, enrichProcessing, enrichCompleted, enrichFailed, enrichDead int
-	var enrichPerHour, enrichToday int
-	tx.QueryRowContext(ctx, `
-		SELECT
-			COUNT(*),
-			COUNT(*) FILTER (WHERE status = 'pending'),
-			COUNT(*) FILTER (WHERE status = 'processing'),
-			COUNT(*) FILTER (WHERE status = 'completed'),
-			COUNT(*) FILTER (WHERE status = 'failed'),
-			COUNT(*) FILTER (WHERE status = 'dead'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '1 hour'),
-			COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours')
-		FROM enrichment_jobs
-	`).Scan(&enrichTotal, &enrichPending, &enrichProcessing, &enrichCompleted, &enrichFailed, &enrichDead, &enrichPerHour, &enrichToday)
-	enrich["total"] = enrichTotal
-	enrich["pending"] = enrichPending
-	enrich["processing"] = enrichProcessing
-	enrich["completed"] = enrichCompleted
-	enrich["failed"] = enrichFailed
-	enrich["dead"] = enrichDead
-	enrich["rate_per_hour"] = enrichPerHour
-	enrich["today"] = enrichToday
-
-	// -- Contacts (from normalized tables) --
-	contacts := map[string]any{}
-	var totalEmails, uniqueEmails, emailsToday, emailsLastHour, uniqueDomains int
-	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails`).Scan(&totalEmails)
-	uniqueEmails = totalEmails // emails table has UNIQUE constraint, so total == unique
-	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '24 hours'`).Scan(&emailsToday)
-	tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM emails WHERE created_at > NOW() - INTERVAL '1 hour'`).Scan(&emailsLastHour)
-	tx.QueryRowContext(ctx, `SELECT COUNT(DISTINCT domain) FROM business_listings`).Scan(&uniqueDomains)
-
-	contacts["total_emails"] = totalEmails
-	contacts["unique_emails"] = uniqueEmails
-	contacts["emails_today"] = emailsToday
-	contacts["emails_per_hour"] = emailsLastHour
-
-	// Top email providers.
-	providerRows, _ := tx.QueryContext(ctx, `
-		SELECT domain, COUNT(*) AS cnt
-		FROM emails
-		GROUP BY domain ORDER BY cnt DESC LIMIT 10
-	`)
-	providers := map[string]int{}
-	if providerRows != nil {
-		for providerRows.Next() {
-			var p string
-			var c int
-			providerRows.Scan(&p, &c)
-			providers[p] = c
-		}
-		providerRows.Close()
-	}
-	contacts["providers"] = providers
-	contacts["unique_domains"] = uniqueDomains
-
-	tx.Commit()
-
-	// -- Queues (Redis) --
-	queueMap := map[string]int64{}
-	qd, _ := s.redis.ZCard(ctx, "serp:queue:queries").Result()
-	queueMap["serp:queue:queries"] = qd
-	sb, _ := s.redis.LLen(ctx, "serp:buffer").Result()
-	queueMap["serp:buffer"] = sb
-	eb, _ := s.redis.LLen(ctx, "enrich:buffer").Result()
-	queueMap["enrich:buffer"] = eb
+	// v1 calls the results block "contacts" and adds unique_emails (the emails
+	// table has a UNIQUE constraint, so total == unique).
+	contacts := st.Results
+	contacts["unique_emails"] = contacts["total_emails"]
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"queries":  queries,
-		"serp":     serp,
-		"enrich":   enrich,
-		"contacts": contacts,
-		"queues":   queueMap,
+		"queries":           st.Queries,
+		"serp":              st.Serp,
+		"enrich":            st.Enrich,
+		"contacts":          contacts,
+		"queues":            st.Queues,
+		"unknown_figures":   renamePrefix(nonNil(st.Unknown), "results", "contacts"),
+		"estimated_figures": renamePrefix(nonNil(st.Estimated), "results", "contacts"),
+		"snapshot_at":       st.SnapshotAt,
 	})
 }
 
