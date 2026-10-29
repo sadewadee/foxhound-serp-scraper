@@ -268,7 +268,7 @@ const linkEmailsSQL = `
 INSERT INTO business_emails (business_id, email_id, source)
 SELECT t.id, e.id, '` + websiteMatchLink + `'
 FROM unnest($1::bigint[], $2::text[]) AS t(id, email)
-JOIN emails e ON lower(e.email) = t.email
+JOIN emails e ON e.email = t.email
 WHERE NOT EXISTS (SELECT 1 FROM business_emails x WHERE x.business_id = t.id)
 ON CONFLICT (business_id, email_id) DO NOTHING`
 
