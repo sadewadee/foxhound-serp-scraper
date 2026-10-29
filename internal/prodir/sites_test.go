@@ -86,6 +86,14 @@ func TestSiteSources(t *testing.T) {
 	if s, err := siteSources("all"); err != nil || len(s) < 2 {
 		t.Errorf("all: %v %v", s, err)
 	}
+	all, _ := siteSources("all")
+	found := false
+	for _, x := range all {
+		found = found || (x.name == "yogaalliance" && x.domainLike == "%.yogaalliance.org" && x.categories[0] == "yogaalliance")
+	}
+	if !found {
+		t.Error("all must include the yogaalliance rows")
+	}
 	if _, err := siteSources("nope"); err == nil {
 		t.Error("unknown source should fail")
 	}

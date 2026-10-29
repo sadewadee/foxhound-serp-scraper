@@ -12,6 +12,7 @@ package prodir
 // A source's rows are the business_listings with the source's category and a
 // domain ending in the synthetic domain suffix `load` writes:
 //
+//	yogaalliance  category yogaalliance  domain *.ryt|rys.yogaalliance.org
 //	ace  category acefitness   domain *.pro.acefitness.org
 //	icf  category icfcoaching  domain *.coach.coachingfederation.org
 //	slug category in categoryNiche (a record can override the source's own
@@ -43,6 +44,8 @@ var siteBlockedHosts = []string{
 	"maps.app.goo.gl", "yelp.com", "wa.me", "whatsapp.com", "t.me", "calendly.com",
 	"mindbodyonline.com", "classpass.com", "eventbrite.com", "meetup.com",
 	"amazon.com", "apple.com", "spotify.com",
+	"paperbell.com", "bio.site", "lnk.bio", "stan.store", "fb.me", "m.me",
+	"acuityscheduling.com", "as.me", "setmore.com", "vagaro.com", "booksy.com", "fresha.com",
 }
 
 const (
@@ -187,9 +190,13 @@ type siteSource struct {
 func siteSources(sel string) ([]siteSource, error) {
 	ace := siteSource{"ace", "acefitness.org", "%.pro.acefitness.org", []string{aceCategory}}
 	icf := siteSource{"icf", "coachingfederation.org", "%.coach.coachingfederation.org", []string{icfCategory}}
+	// cmd/yogaalliance rows: teachers <id>.ryt.…, schools <id>.rys.…
+	ya := siteSource{"yogaalliance", "yogaalliance.org", "%.yogaalliance.org", []string{"yogaalliance"}}
 	switch sel {
 	case "ace":
 		return []siteSource{ace}, nil
+	case "yogaalliance":
+		return []siteSource{ya}, nil
 	case "icf":
 		return []siteSource{icf}, nil
 	}
@@ -202,7 +209,7 @@ func siteSources(sel string) ([]siteSource, error) {
 		return siteSource{s.Slug, s.Host, "%." + s.Slug + "." + s.Host, cats}
 	}
 	if sel == "all" {
-		out := []siteSource{ace, icf}
+		out := []siteSource{ace, icf, ya}
 		for _, s := range Sources() {
 			out = append(out, gen(s))
 		}
@@ -211,7 +218,7 @@ func siteSources(sel string) ([]siteSource, error) {
 	if s, ok := LookupSource(sel); ok {
 		return []siteSource{gen(s)}, nil
 	}
-	return nil, fmt.Errorf("unknown source %q (ace, icf, a registered slug or all)", sel)
+	return nil, fmt.Errorf("unknown source %q (ace, icf, yogaalliance, a registered slug or all)", sel)
 }
 
 const sitesSelectSQL = `
