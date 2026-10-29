@@ -1023,6 +1023,13 @@ func runMigrations(db *sql.DB) error {
 		slog.Warn("db: idx_queries_processing_updated CONCURRENTLY failed — planner will use idx_queries_status fallback", "error", err)
 	}
 
+	// Serves the periodic serp queue refill (status = 'pending' ORDER BY id LIMIT n).
+	// Without it the planner walks queries_pkey and filters, which degrades as the
+	// pending set shrinks. CONCURRENTLY + log-and-continue, same as above.
+	if _, err := db.Exec(`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_queries_pending_id ON queries (id) WHERE status = 'pending'`); err != nil {
+		slog.Warn("db: idx_queries_pending_id CONCURRENTLY failed — refill will fall back to queries_pkey scan", "error", err)
+	}
+
 	// Feeds the serp claim query (engine = $1 AND status = 'new' ORDER BY
 	// priority DESC, created_at). idx_serp_engine only covers (engine, status),
 	// so the planner bitmap-scans then sorts the whole per-engine backlog

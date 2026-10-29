@@ -99,6 +99,8 @@ type SERPConfig struct {
 	RelevanceMin          float64 `yaml:"relevance_min"`      // default 0.3
 	RelevanceGuard        bool    `yaml:"relevance_guard"`    // default true ("1", "0" disables)
 	DDGNoReferer          bool    `yaml:"ddg_no_referer"`     // default false: drop the Referer on DDG stealth requests ("1" enables)
+	QueueLowWater         int     `yaml:"queue_low_water"`    // refill serp:queue:queries when ZCARD is below this, default 500
+	QueueRefillBatch      int     `yaml:"queue_refill_batch"` // pending queries pushed per refill, default 1000
 }
 
 type WebsiteConfig struct {
@@ -228,6 +230,8 @@ func LoadFromEnv() (*Config, error) {
 			RelevanceMin:     parseEnvFloat("SERP_RELEVANCE_MIN", 0.3),
 			RelevanceGuard:   os.Getenv("SERP_RELEVANCE_GUARD") != "0",
 			DDGNoReferer:     os.Getenv("SERP_DDG_NO_REFERER") == "1",
+			QueueLowWater:    parseEnvInt("SERP_QUEUE_LOW_WATER", 0),
+			QueueRefillBatch: parseEnvInt("SERP_QUEUE_REFILL_BATCH", 0),
 		},
 		Fetch: FetchConfig{
 			Headless:             true,
@@ -349,6 +353,12 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.SERP.RelevanceMin == 0 {
 		cfg.SERP.RelevanceMin = 0.3
+	}
+	if cfg.SERP.QueueLowWater <= 0 {
+		cfg.SERP.QueueLowWater = 500
+	}
+	if cfg.SERP.QueueRefillBatch <= 0 {
+		cfg.SERP.QueueRefillBatch = 1000
 	}
 	if os.Getenv("SERP_RELEVANCE_GUARD") == "0" {
 		cfg.SERP.RelevanceGuard = false
