@@ -3,14 +3,23 @@ package prodir
 // `prodir websites`: link-back of own-website results onto directory rows.
 // `prodir sites` enqueues the own website of every directory row into the enrich
 // pipeline; the results land on organic business_listings rows (domain = the
-// website host), never on the directory row. This step copies them back: an
-// organic row with domain = host or www.host gives its emails to the directory
-// row (business_emails, source 'website_match') and its phone when the
-// directory row has none. Existing directory values are never overwritten and
-// the organic row is never touched. It also counts, per source, how the
-// enrichment_jobs of the websites ended (completed / pending / dead / none).
-// Row selection and host skip rules are shared with sites.go. Dry-run executes
-// the same statements and rolls them back, so its counts are exact.
+// website host, or www.host), never on the directory row. This step copies them
+// back, following the directory-email rules:
+//
+//   - a row that has an email from its directory page (any business_emails row
+//     whose source is not 'website_match') is never given a website email;
+//   - otherwise it gets at most ONE email, the person's own, chosen exactly like
+//     the CRM loader does (webemail.go: chooseWebEmail + prep.py's junk filters),
+//     stored with source 'website_match' so the loader can tell it from a page
+//     email; no pick = nothing linked; a row that already has one is not re-picked;
+//   - the organic row's phone fills the directory row's phone only when empty;
+//   - hosts listed by more than 3 directory rows (employer / platform) are skipped;
+//   - nothing existing is overwritten and the organic row is never touched.
+//
+// It also counts, per source, how the enrichment_jobs of the websites ended
+// (completed / pending / dead / none). Row selection and host skip rules are
+// shared with sites.go. Dry-run executes the same statements and rolls them
+// back, so its counts are exact.
 
 import (
 	"context"
@@ -18,6 +27,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
+	"strings"
 
 	"github.com/lib/pq"
 )
@@ -29,19 +40,21 @@ const (
 
 // WebsiteStats are the per-source counters printed by `prodir websites`.
 type WebsiteStats struct {
-	Selected, Skipped, Hosts                       int
+	Selected, Skipped, Hosts, SharedSkipped        int
+	PageEmailRows, WebEmailRows, NoPick            int
 	LinkedRows, EmailsLinked, PhonesFilled         int
 	JobsCompleted, JobsPending, JobsDead, JobsNone int // hosts by enrichment_jobs outcome
 }
 
 type dirRow struct {
-	id  int64
-	url string
-	key string // host without www.
+	id   int64
+	name string
+	url  string
+	key  string // host without www.
 }
 
 const websiteRowsSQL = `
-SELECT id, website FROM business_listings
+SELECT id, COALESCE(business_name, ''), website FROM business_listings
 WHERE category = ANY($1) AND domain LIKE $2 AND website IS NOT NULL AND website <> ''
 ORDER BY id`
 
@@ -64,8 +77,8 @@ func selectWebsiteRows(ctx context.Context, db *sql.DB, src siteSource, st *Webs
 	var out []dirRow
 	for rs.Next() {
 		var id int64
-		var website string
-		if err := rs.Scan(&id, &website); err != nil {
+		var name, website string
+		if err := rs.Scan(&id, &name, &website); err != nil {
 			return nil, err
 		}
 		st.Selected++
@@ -74,7 +87,7 @@ func selectWebsiteRows(ctx context.Context, db *sql.DB, src siteSource, st *Webs
 			st.Skipped++
 			continue
 		}
-		out = append(out, dirRow{id, u, hostKey(host)})
+		out = append(out, dirRow{id, name, u, hostKey(host)})
 	}
 	return out, rs.Err()
 }
@@ -90,13 +103,6 @@ org AS (
 
 const (
 	linkCountSQL = linkOrgCTE + ` SELECT COUNT(DISTINCT dir_id) FROM org WHERE org_id <> dir_id`
-
-	linkEmailsSQL = linkOrgCTE + `
-INSERT INTO business_emails (business_id, email_id, source)
-SELECT org.dir_id, be.email_id, '` + websiteMatchLink + `'
-FROM org JOIN business_emails be ON be.business_id = org.org_id
-WHERE org.org_id <> org.dir_id
-ON CONFLICT (business_id, email_id) DO NOTHING`
 
 	linkPhonesSQL = linkOrgCTE + `,
 pick AS (
@@ -134,8 +140,8 @@ func beginWrite(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
 	return tx, nil
 }
 
-// linkRows is step 1: contact data of organic rows onto the directory rows.
-func linkRows(ctx context.Context, db *sql.DB, rows []dirRow, dryRun bool, st *WebsiteStats) error {
+// linkPhones fills the empty phones of the directory rows from their organic rows.
+func linkPhones(ctx context.Context, db *sql.DB, rows []dirRow, dryRun bool, st *WebsiteStats) error {
 	for i := 0; i < len(rows); i += websitesLinkChunk {
 		chunk := rows[i:min(i+websitesLinkChunk, len(rows))]
 		ids := make([]int64, len(chunk))
@@ -152,13 +158,7 @@ func linkRows(ctx context.Context, db *sql.DB, rows []dirRow, dryRun bool, st *W
 			tx.Rollback()
 			return err
 		}
-		res, err := tx.ExecContext(ctx, linkEmailsSQL, pq.Array(ids), pq.Array(keys))
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		emails, _ := res.RowsAffected()
-		res, err = tx.ExecContext(ctx, linkPhonesSQL, pq.Array(ids), pq.Array(keys))
+		res, err := tx.ExecContext(ctx, linkPhonesSQL, pq.Array(ids), pq.Array(keys))
 		if err != nil {
 			tx.Rollback()
 			return err
@@ -168,10 +168,159 @@ func linkRows(ctx context.Context, db *sql.DB, rows []dirRow, dryRun bool, st *W
 			return err
 		}
 		st.LinkedRows += linked
-		st.EmailsLinked += int(emails)
 		st.PhonesFilled += int(phones)
 	}
 	return nil
+}
+
+// readTx runs fn in a read-only transaction with a statement timeout.
+func readTx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = '"+sitesReadTimeout+"'"); err != nil {
+		return err
+	}
+	return fn(tx)
+}
+
+// hostEmails reads the emails of the organic rows of the hosts (domain = key or
+// www.key), lower-cased, per host key.
+func hostEmails(ctx context.Context, db *sql.DB, keys []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	err := readTx(ctx, db, func(tx *sql.Tx) error {
+		for i := 0; i < len(keys); i += sitesHostChunk {
+			var doms []string
+			for _, k := range keys[i:min(i+sitesHostChunk, len(keys))] {
+				doms = append(doms, k, "www."+k)
+			}
+			rs, err := tx.QueryContext(ctx, `
+SELECT o.domain, e.email FROM business_listings o
+JOIN business_emails be ON be.business_id = o.id JOIN emails e ON e.id = be.email_id
+WHERE o.domain = ANY($1)`, pq.Array(doms))
+			if err != nil {
+				return err
+			}
+			for rs.Next() {
+				var d, e string
+				if err := rs.Scan(&d, &e); err != nil {
+					rs.Close()
+					return err
+				}
+				k := hostKey(d)
+				out[k] = addString(out[k], strings.ToLower(strings.TrimSpace(e)))
+			}
+			if err := rs.Err(); err != nil {
+				rs.Close()
+				return err
+			}
+			rs.Close()
+		}
+		return nil
+	})
+	return out, err
+}
+
+// emailState reads, per directory row, whether it holds a page email (a
+// business_emails row not from this command) and whether it holds a website one.
+func emailState(ctx context.Context, db *sql.DB, rows []dirRow) (page, web map[int64]bool, err error) {
+	page, web = map[int64]bool{}, map[int64]bool{}
+	err = readTx(ctx, db, func(tx *sql.Tx) error {
+		for i := 0; i < len(rows); i += sitesHostChunk {
+			ids := make([]int64, 0, sitesHostChunk)
+			for _, r := range rows[i:min(i+sitesHostChunk, len(rows))] {
+				ids = append(ids, r.id)
+			}
+			rs, err := tx.QueryContext(ctx, `
+SELECT business_id, source IS DISTINCT FROM '`+websiteMatchLink+`' FROM business_emails WHERE business_id = ANY($1)`, pq.Array(ids))
+			if err != nil {
+				return err
+			}
+			for rs.Next() {
+				var id int64
+				var isPage bool
+				if err := rs.Scan(&id, &isPage); err != nil {
+					rs.Close()
+					return err
+				}
+				if isPage {
+					page[id] = true
+				} else {
+					web[id] = true
+				}
+			}
+			if err := rs.Err(); err != nil {
+				rs.Close()
+				return err
+			}
+			rs.Close()
+		}
+		return nil
+	})
+	return page, web, err
+}
+
+// linkEmailsSQL links one picked email per directory row. The NOT EXISTS keeps
+// a row that gained any email since it was read untouched.
+const linkEmailsSQL = `
+INSERT INTO business_emails (business_id, email_id, source)
+SELECT t.id, e.id, '` + websiteMatchLink + `'
+FROM unnest($1::bigint[], $2::text[]) AS t(id, email)
+JOIN emails e ON lower(e.email) = t.email
+WHERE NOT EXISTS (SELECT 1 FROM business_emails x WHERE x.business_id = t.id)
+ON CONFLICT (business_id, email_id) DO NOTHING`
+
+func linkEmails(ctx context.Context, db *sql.DB, ids []int64, emails []string, dryRun bool) (int, error) {
+	total := 0
+	for i := 0; i < len(ids); i += websitesLinkChunk {
+		end := min(i+websitesLinkChunk, len(ids))
+		tx, err := beginWrite(ctx, db)
+		if err != nil {
+			return total, err
+		}
+		res, err := tx.ExecContext(ctx, linkEmailsSQL, pq.Array(ids[i:end]), pq.Array(emails[i:end]))
+		if err != nil {
+			tx.Rollback()
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		if err := finish(tx, dryRun); err != nil {
+			return total, err
+		}
+		total += int(n)
+	}
+	return total, nil
+}
+
+// pickEmails chooses the website email of every row that has no email yet.
+func pickEmails(rows []dirRow, page, web map[int64]bool, emails map[string][]string, st *WebsiteStats) (ids []int64, picked []string) {
+	for _, r := range rows {
+		switch {
+		case page[r.id]:
+			st.PageEmailRows++
+			continue
+		case web[r.id]:
+			st.WebEmailRows++
+			continue
+		}
+		var cands []webCand
+		for _, e := range emails[r.key] {
+			cands = append(cands, webCand{e, r.key})
+		}
+		if len(cands) == 0 {
+			continue
+		}
+		// the CRM loader names the person after the part of business_name before the first comma
+		first, _, _ := strings.Cut(r.name, ",")
+		if c, ok := chooseWebEmail(cands, first, ""); ok {
+			ids, picked = append(ids, r.id), append(picked, c.email)
+		} else {
+			st.NoPick++
+		}
+	}
+	return ids, picked
 }
 
 // jobCoverage counts the hosts by the best outcome of their enrichment_jobs
@@ -242,29 +391,72 @@ func jobCoverage(ctx context.Context, db *sql.DB, rows []dirRow, st *WebsiteStat
 
 // Websites links the enriched results of the selected source's websites back
 // onto its directory rows (ace, icf, yogaalliance, a generic slug or "all").
-// dryRun writes nothing. Per-source counts go to w.
+// dryRun writes nothing. Per-source counts go to w. The "listed by more than 3
+// rows" rule counts the rows of the selected sources, so use `all` for the
+// exact figure.
 func Websites(ctx context.Context, db *sql.DB, sel string, dryRun bool, w io.Writer) error {
 	srcs, err := siteSources(sel)
 	if err != nil {
 		return err
 	}
+	type loaded struct {
+		src  siteSource
+		rows []dirRow
+		st   *WebsiteStats
+	}
+	var all []loaded
+	share := map[string]int{}
 	for _, src := range srcs {
 		st := &WebsiteStats{}
 		rows, err := selectWebsiteRows(ctx, db, src, st)
 		if err != nil {
 			return fmt.Errorf("%s: read: %w", src.name, err)
 		}
-		if err := linkRows(ctx, db, rows, dryRun, st); err != nil {
-			return fmt.Errorf("%s: link: %w", src.name, err)
+		for _, r := range rows {
+			share[r.key]++
 		}
-		if err := jobCoverage(ctx, db, rows, st); err != nil {
-			return fmt.Errorf("%s: job coverage: %w", src.name, err)
+		all = append(all, loaded{src, rows, st})
+	}
+	keys := make([]string, 0, len(share))
+	for k := range share {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	raw, err := hostEmails(ctx, db, keys)
+	if err != nil {
+		return fmt.Errorf("host emails: %w", err)
+	}
+	emails := siteEmailSet(raw, share)
+
+	for _, l := range all {
+		st := l.st
+		var own []dirRow
+		for _, r := range l.rows {
+			if share[r.key] > maxHostShare {
+				st.SharedSkipped++
+				continue
+			}
+			own = append(own, r)
 		}
-		slog.Info("prodir websites", "source", src.name, "dry_run", dryRun, "selected", st.Selected,
-			"linked_rows", st.LinkedRows, "emails_linked", st.EmailsLinked, "phones_filled", st.PhonesFilled)
-		fmt.Fprintf(w, "%s: selected=%d platform_skipped=%d hosts=%d linked_rows=%d emails_linked=%d phones_filled=%d jobs_completed=%d jobs_pending=%d jobs_dead=%d jobs_none=%d dry_run=%v\n",
-			src.name, st.Selected, st.Skipped, st.Hosts, st.LinkedRows, st.EmailsLinked, st.PhonesFilled,
-			st.JobsCompleted, st.JobsPending, st.JobsDead, st.JobsNone, dryRun)
+		if err := linkPhones(ctx, db, own, dryRun, st); err != nil {
+			return fmt.Errorf("%s: link phones: %w", l.src.name, err)
+		}
+		page, web, err := emailState(ctx, db, own)
+		if err != nil {
+			return fmt.Errorf("%s: email state: %w", l.src.name, err)
+		}
+		ids, picked := pickEmails(own, page, web, emails, st)
+		if st.EmailsLinked, err = linkEmails(ctx, db, ids, picked, dryRun); err != nil {
+			return fmt.Errorf("%s: link emails: %w", l.src.name, err)
+		}
+		if err := jobCoverage(ctx, db, l.rows, st); err != nil {
+			return fmt.Errorf("%s: job coverage: %w", l.src.name, err)
+		}
+		slog.Info("prodir websites", "source", l.src.name, "dry_run", dryRun, "selected", st.Selected,
+			"emails_linked", st.EmailsLinked, "phones_filled", st.PhonesFilled)
+		fmt.Fprintf(w, "%s: selected=%d platform_skipped=%d hosts=%d shared_host_rows=%d page_email_rows=%d web_email_rows=%d no_pick=%d organic_matched_rows=%d emails_linked=%d phones_filled=%d jobs_completed=%d jobs_pending=%d jobs_dead=%d jobs_none=%d dry_run=%v\n",
+			l.src.name, st.Selected, st.Skipped, st.Hosts, st.SharedSkipped, st.PageEmailRows, st.WebEmailRows, st.NoPick,
+			st.LinkedRows, st.EmailsLinked, st.PhonesFilled, st.JobsCompleted, st.JobsPending, st.JobsDead, st.JobsNone, dryRun)
 	}
 	return nil
 }
