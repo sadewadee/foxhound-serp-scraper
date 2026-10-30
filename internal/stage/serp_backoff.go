@@ -89,10 +89,16 @@ func (b *EngineBackoff) BackedOff(now time.Time) bool {
 // key that is not currently backed off, plus legacyKey appended last so a
 // deploy landing on top of a non-empty shared buffer still drains it.
 //
+// BLPOP pops from the first non-empty key, so key order is a strict priority.
+// The readable engine keys are therefore rotated by turn (a per-tab counter):
+// each engine is first in turn, and BLPOP still falls through to the next key
+// when a list is empty. Without it an engine whose buffer is always non-empty
+// starved every engine after it (prod: 0 duckduckgo pops in 30 min).
+//
 // backedOff reports whether a given key is parked right now. allBackedOff is
 // true when every engine key was filtered out, which is the only case where a
 // worker has nothing to read and should wait.
-func SelectBufferKeys(engineKeys []string, legacyKey string, backedOff func(string) bool) (keys []string, allBackedOff bool) {
+func SelectBufferKeys(engineKeys []string, legacyKey string, turn int, backedOff func(string) bool) (keys []string, allBackedOff bool) {
 	keys = make([]string, 0, len(engineKeys)+1)
 	allBackedOff = len(engineKeys) > 0
 	for _, k := range engineKeys {
@@ -101,6 +107,13 @@ func SelectBufferKeys(engineKeys []string, legacyKey string, backedOff func(stri
 		}
 		keys = append(keys, k)
 		allBackedOff = false
+	}
+	if n := len(keys); n > 1 {
+		r := turn % n
+		if r < 0 {
+			r += n
+		}
+		keys = append(keys[r:], keys[:r]...)
 	}
 	// The legacy list is always readable: items for a parked engine are
 	// released on arrival rather than fetched, so draining it is always safe.

@@ -1,6 +1,7 @@
 package stage
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,7 +73,7 @@ func TestSelectBufferKeys_ExcludesParkedEngines(t *testing.T) {
 	parked := map[string]bool{"serp:buffer:searxng": true}
 	keys, allParked := SelectBufferKeys(
 		[]string{"serp:buffer:searxng", "serp:buffer:duckduckgo"},
-		"serp:buffer",
+		"serp:buffer", 0,
 		func(k string) bool { return parked[k] },
 	)
 	if allParked {
@@ -89,7 +90,7 @@ func TestSelectBufferKeys_ExcludesParkedEngines(t *testing.T) {
 func TestSelectBufferKeys_AllParked(t *testing.T) {
 	keys, allParked := SelectBufferKeys(
 		[]string{"serp:buffer:searxng", "serp:buffer:duckduckgo"},
-		"serp:buffer",
+		"serp:buffer", 0,
 		func(string) bool { return true },
 	)
 	if !allParked {
@@ -106,7 +107,7 @@ func TestSelectBufferKeys_AllParked(t *testing.T) {
 func TestSelectBufferKeys_NoneParked(t *testing.T) {
 	keys, allParked := SelectBufferKeys(
 		[]string{"serp:buffer:searxng", "serp:buffer:duckduckgo"},
-		"serp:buffer",
+		"serp:buffer", 0,
 		func(string) bool { return false },
 	)
 	if allParked {
@@ -114,6 +115,62 @@ func TestSelectBufferKeys_NoneParked(t *testing.T) {
 	}
 	if len(keys) != 3 || keys[2] != "serp:buffer" {
 		t.Fatalf("keys = %v, want both engines plus the legacy key last", keys)
+	}
+}
+
+func TestSelectBufferKeys_RoundRobin(t *testing.T) {
+	none := func(string) bool { return false }
+	join := func(k []string) string { return strings.Join(k, " ") }
+
+	for turn, want := range map[int]string{0: "a b L", 1: "b a L", 2: "a b L"} {
+		keys, _ := SelectBufferKeys([]string{"a", "b"}, "L", turn, none)
+		if got := join(keys); got != want {
+			t.Errorf("2 engines turn %d = %q, want %q", turn, got, want)
+		}
+	}
+
+	first := map[string]int{}
+	for turn := 0; turn < 3; turn++ {
+		keys, _ := SelectBufferKeys([]string{"a", "b", "c"}, "L", turn, none)
+		first[keys[0]]++
+		if keys[len(keys)-1] != "L" {
+			t.Errorf("turn %d keys = %v, legacy key must stay last", turn, keys)
+		}
+	}
+	if first["a"] != 1 || first["b"] != 1 || first["c"] != 1 {
+		t.Errorf("first-position counts = %v, want each engine first once", first)
+	}
+
+	// Turn beyond the key count wraps: 7 % 2 = 1.
+	keys, _ := SelectBufferKeys([]string{"a", "b"}, "L", 7, none)
+	if got := join(keys); got != "b a L" {
+		t.Errorf("turn 7 = %q, want %q", got, "b a L")
+	}
+}
+
+func TestSelectBufferKeys_RoundRobinParkedAndEmpty(t *testing.T) {
+	for turn := 0; turn < 6; turn++ {
+		keys, all := SelectBufferKeys([]string{"a", "b", "c"}, "L", turn, func(k string) bool { return k == "b" })
+		if all {
+			t.Errorf("turn %d: allBackedOff must be false", turn)
+		}
+		for _, k := range keys {
+			if k == "b" {
+				t.Errorf("turn %d: parked engine returned in %v", turn, keys)
+			}
+		}
+		if len(keys) != 3 || keys[2] != "L" {
+			t.Errorf("turn %d keys = %v, want two engines + L last", turn, keys)
+		}
+		keys, all = SelectBufferKeys([]string{"a", "b"}, "L", turn, func(string) bool { return true })
+		if !all || len(keys) != 1 || keys[0] != "L" {
+			t.Errorf("turn %d all parked = %v %v, want [L] and allBackedOff", turn, keys, all)
+		}
+	}
+
+	keys, all := SelectBufferKeys(nil, "L", 5, nil)
+	if all || len(keys) != 1 || keys[0] != "L" {
+		t.Errorf("no engines = %v %v, want [L] and allBackedOff=false", keys, all)
 	}
 }
 

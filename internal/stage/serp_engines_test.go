@@ -38,7 +38,7 @@ func TestBufferKeysAreEngineScoped(t *testing.T) {
 	}
 	s.engines = resolveEngines(cfg)
 
-	keys, allBackedOff := s.bufferKeys()
+	keys, allBackedOff := s.bufferKeys(0)
 	if allBackedOff {
 		t.Error("no engine is backed off yet — allBackedOff must be false")
 	}
@@ -58,7 +58,7 @@ func TestBufferKeysAreEngineScoped(t *testing.T) {
 	// A live suspension window removes only the searxng key: duckduckgo must
 	// keep flowing, and the legacy list is always readable.
 	s.searxngBackoff.RecordSuspension(time.Now())
-	keys, allBackedOff = s.bufferKeys()
+	keys, allBackedOff = s.bufferKeys(0)
 	if allBackedOff {
 		t.Fatal("duckduckgo is still healthy — allBackedOff must be false")
 	}
