@@ -1,6 +1,9 @@
 package emailfix
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRepair(t *testing.T) {
 	cases := []struct {
@@ -15,9 +18,10 @@ func TestRepair(t *testing.T) {
 		{"9346082info@x.com", "info@x.com", true, true},
 		{"812-3868-7387marcom@x.com", "marcom@x.com", true, true},
 		{"(212) 555-7575hello@studio.com", "hello@studio.com", true, true},
-		{"9346082info@gmail.com", "info@gmail.com", true, true},        // role word beats free-mail
-		{"+6281234567890john@gmail.com", "john@gmail.com", true, true}, // '+' marks a phone
-		{"9346082john@studio.com", "john@studio.com", true, true},      // non-free domain
+		{"9346082info@yahoo.com", "info@yahoo.com", true, true},                  // role word beats free-mail
+		{"9346082info@gmail.com", "9346082info@gmail.com", false, true},          // Gmail cannot issue a 4-char local part
+		{"+6281234567890johnsmith@gmail.com", "johnsmith@gmail.com", true, true}, // '+' marks a phone
+		{"9346082john@studio.com", "john@studio.com", true, true},                // non-free domain
 		// R2: website text glued after the TLD.
 		{"info@inivie.comview", "info@inivie.com", true, true},
 		{"hi@balifitness.asiaphone", "hi@balifitness.asia", true, true},
@@ -48,5 +52,76 @@ func TestRepair(t *testing.T) {
 		if got != c.want || changed != c.changed || ok != c.ok {
 			t.Errorf("Repair(%q) = (%q, %v, %v), want (%q, %v, %v)", c.in, got, changed, ok, c.want, c.changed, c.ok)
 		}
+	}
+}
+
+func set(addrs ...string) func(string) bool {
+	return func(e string) bool {
+		for _, a := range addrs {
+			if a == e {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func TestRepairCtx(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		ctx   Context
+		want  string
+		rules string
+	}{
+		// Case 1: literal label glue.
+		{"label keeps the s", "emails.anwar369@gmail.com", Context{ExistsLinked: set("s.anwar369@gmail.com")}, "s.anwar369@gmail.com", "label"},
+		{"label needs a linked free-mail twin", "emails.anwar369@gmail.com", Context{Exists: set("s.anwar369@gmail.com")}, "emails.anwar369@gmail.com", ""},
+		{"label before role word", "emailinfo@studio.com", Context{}, "info@studio.com", "label"},
+		{"e-mail label", "e-mailinfo@studio.com", Context{}, "info@studio.com", "label"},
+		{"label non-role needs existing", "emailjohn@studio.com", Context{}, "emailjohn@studio.com", ""},
+		{"label non-role existing", "emailjohn@studio.com", Context{Exists: set("john@studio.com")}, "john@studio.com", "label"},
+		{"bare mail local untouched", "mail@studio.com", Context{}, "mail@studio.com", ""},
+		// Case 2: place/word glued before a role word.
+		{"rostock", "rostockinfo@uni-rostock.de", Context{Exists: set("info@uni-rostock.de")}, "info@uni-rostock.de", "prefix"},
+		{"hannover own domain", "hannoverinfo@hannover-yoga.de", Context{ListingDomains: []string{"www.hannover-yoga.de"}}, "info@hannover-yoga.de", "prefix"},
+		{"muenster", "nsterinfo@uni.de", Context{Exists: set("info@uni.de")}, "info@uni.de", "prefix"},
+		{"palaiseau contact", "palaiseaucontact@mairie.fr", Context{Exists: set("contact@mairie.fr")}, "contact@mairie.fr", "prefix"},
+		{"republic", "republicinfo@republic.com", Context{ListingDomains: []string{"republic.com"}}, "info@republic.com", "prefix"},
+		{"unvouched place glue stays", "rostockinfo@uni-rostock.de", Context{}, "rostockinfo@uni-rostock.de", ""},
+		{"boxoffice protected", "boxoffice@theatre.com", Context{Exists: set("office@theatre.com"), ListingDomains: []string{"theatre.com"}}, "boxoffice@theatre.com", ""},
+		{"apoeppel", "apoeppel@uni.de", Context{Exists: set("poeppel@uni.de")}, "apoeppel@uni.de", ""},
+		{"customerservice", "customerservice@x.com", Context{Exists: set("service@x.com")}, "customerservice@x.com", ""},
+		{"studierendenservice", "studierendenservice@uni.de", Context{Exists: set("service@uni.de")}, "studierendenservice@uni.de", ""},
+		{"studierendenoffice protected", "studierendenoffice@uni.de", Context{Exists: set("office@uni.de")}, "studierendenoffice@uni.de", ""},
+		{"role lead protected", "contactinfo@x.com", Context{Exists: set("info@x.com")}, "contactinfo@x.com", ""},
+		// Case 3: text between two domains.
+		{"gmail mid glue", "someone01@gmail.comfacebookfacebook.com", Context{}, "someone01@gmail.com", "middomain"},
+		{"own domain mid glue", "sales@plyconvanlines.complycongroup.com", Context{ListingDomains: []string{"plyconvanlines.com"}}, "sales@plyconvanlines.com", "middomain"},
+		{"existing mid glue", "a1@vendor.comother.com", Context{Exists: set("a1@vendor.com")}, "a1@vendor.com", "middomain"},
+		{"mid glue unvouched", "a1@vendor.comother.com", Context{}, "a1@vendor.comother.com", ""},
+		{"trailing glue yahoo.com.ph", "drstmh@yahoo.com.phcontact", Context{}, "drstmh@yahoo.com.ph", "tld"},
+		{"trailing glue naver", "zebramats@naver.comhome", Context{}, "zebramats@naver.com", "tld"},
+		{"trailing glue .de", "safir@bella-und-dent.dedetails", Context{}, "safir@bella-und-dent.de", "tld"},
+		{"trailing glue .it", "postmaster@lezionidistoria.itcontatti", Context{}, "postmaster@lezionidistoria.it", "tld"},
+		{"multi-label suffix kept", "info@studio.com.au", Context{ListingDomains: []string{"studio.com.au"}}, "info@studio.com.au", ""},
+		{"co.uk kept", "info@studio.co.uk", Context{}, "info@studio.co.uk", ""},
+		{"suffix-like label kept", "info@mail.company.com", Context{ListingDomains: []string{"company.com"}}, "info@mail.company.com", ""},
+		// Case 4: free-mail false positives stay blocked.
+		{"services@gmail", "customerservices@gmail.com", Context{Exists: set("services@gmail.com"), ExistsLinked: set("services@gmail.com")}, "customerservices@gmail.com", ""},
+		{"pilates@gmail", "clubpilates@gmail.com", Context{Exists: set("pilates@gmail.com"), ExistsLinked: set("pilates@gmail.com")}, "clubpilates@gmail.com", ""},
+		{"srodriguez@gmail", "msrodriguez@gmail.com", Context{Exists: set("srodriguez@gmail.com"), ExistsLinked: set("srodriguez@gmail.com")}, "msrodriguez@gmail.com", ""},
+		{"tudios@gmail", "studios@gmail.com", Context{Exists: set("tudios@gmail.com"), ExistsLinked: set("tudios@gmail.com")}, "studios@gmail.com", ""},
+		{"gmail result too short", "rostockinfo@gmail.com", Context{ExistsLinked: set("info@gmail.com")}, "rostockinfo@gmail.com", ""},
+		{"free-mail needs linked", "rostockinfos@yahoo.com", Context{Exists: set("info@yahoo.com")}, "rostockinfos@yahoo.com", ""},
+		{"free-mail linked ok", "rostockinfo@yahoo.com", Context{ExistsLinked: set("info@yahoo.com")}, "info@yahoo.com", "prefix"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, rules, ok := RepairCtx(c.in, c.ctx)
+			if got != c.want || strings.Join(rules, "+") != c.rules || !ok {
+				t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, %q, true)", c.in, got, rules, ok, c.want, c.rules)
+			}
+		})
 	}
 }

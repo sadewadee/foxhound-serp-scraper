@@ -4,15 +4,18 @@
 //
 // Modes:
 //
-//	-mode scan   (default) read-only; writes id,old_email,new_email,action,target_id to -out
+//	-mode scan   (default) read-only; writes id,old_email,new_email,action,target_id,rules
+//	             to -out and logs per-rule counts plus 20 random samples per rule
 //	-mode apply  scan + repair in place, one transaction per 50k-id window
 //	-mode map    -in <file> -out <file>: old_email,new_email,action for a list of
-//	             emails, no database (used to build the CRM correction list)
+//	             emails, no database (used to build the CRM correction list); only the
+//	             context-free rules (phone, tld) apply here
 //
 // Actions: update (fixed address is new, row is rewritten and re-queued for
 // validation), merge (fixed address already exists, links move to that row and
 // the broken row is marked malformed), reject (not recoverable, row is marked
-// malformed). Rows are never deleted. Affected rows and their business_emails
+// malformed). Rules: phone, tld (context-free); label, prefix, middomain only fire
+// when the fixed address exists on its own or the domain is the listing's own. Rows are never deleted. Affected rows and their business_emails
 // links are copied to emails_backup_YYYYMMDD / business_emails_backup_YYYYMMDD
 // first. Safe to re-run; resume a stopped run with -from-id.
 //
@@ -31,7 +34,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -54,7 +59,13 @@ type fix struct {
 	id       int64
 	old, new string
 	action   string
+	rules    []string
 	target   int64 // merge only
+}
+
+type emailRow struct {
+	id    int64
+	email string
 }
 
 // classify returns the repaired address and action for an email, or "" when the
@@ -62,17 +73,18 @@ type fix struct {
 // are left alone unless their TLD is invalid (glue with no valid TLD prefix);
 // otherwise odd-but-real addresses such as a single-char local part would be
 // marked malformed.
-func classify(email string) (fixed, action string) {
-	fixed, changed, ok := emailfix.Repair(email)
+func classify(email string, c emailfix.Context) (fixed, action string, rules []string) {
+	fixed, rules, ok := emailfix.RepairCtx(email, c)
+	changed := len(rules) > 0
 	switch {
 	case ok && !changed:
-		return "", ""
+		return "", "", nil
 	case ok:
-		return fixed, actUpdate
+		return fixed, actUpdate, rules
 	case changed || !validTLD(fixed):
-		return fixed, actReject
+		return fixed, actReject, rules
 	}
-	return "", ""
+	return "", "", nil
 }
 
 func validTLD(email string) bool {
@@ -149,7 +161,7 @@ func runMap(in, out string) error {
 		if e == "" || (first && !strings.Contains(e, "@")) { // blank line or header
 			continue
 		}
-		if fixed, action := classify(e); action != "" {
+		if fixed, action, _ := classify(e, emailfix.Context{}); action != "" {
 			counts[action]++
 			if err := w.Write([]string{e, fixed, action}); err != nil {
 				return err
@@ -180,7 +192,7 @@ func runDB(apply bool, out string, fromID int64) error {
 	var w *csv.Writer
 	if out != "" {
 		var f *os.File
-		if w, f, err = openCSV(out, []string{"id", "old_email", "new_email", "action", "target_id"}); err != nil {
+		if w, f, err = openCSV(out, []string{"id", "old_email", "new_email", "action", "target_id", "rules"}); err != nil {
 			return err
 		}
 		defer f.Close()
@@ -200,6 +212,7 @@ func runDB(apply bool, out string, fromID int64) error {
 	slog.Info("starting", "mode", map[bool]string{true: "apply", false: "scan"}[apply], "from_id", fromID, "max_id", maxID)
 
 	counts := map[string]int{}
+	rc := newRuleStats()
 	for lo := fromID; lo <= maxID; lo += windowSize {
 		fixes, err := processWindow(ctx, db, lo, lo+windowSize, apply, suffix)
 		if err != nil {
@@ -207,6 +220,7 @@ func runDB(apply bool, out string, fromID int64) error {
 		}
 		for _, x := range fixes {
 			counts[x.action]++
+			rc.add(x)
 			if w == nil {
 				continue
 			}
@@ -214,7 +228,7 @@ func runDB(apply bool, out string, fromID int64) error {
 			if x.action == actMerge {
 				target = strconv.FormatInt(x.target, 10)
 			}
-			if err := w.Write([]string{strconv.FormatInt(x.id, 10), x.old, x.new, x.action, target}); err != nil {
+			if err := w.Write([]string{strconv.FormatInt(x.id, 10), x.old, x.new, x.action, target, strings.Join(x.rules, "+")}); err != nil {
 				return err
 			}
 		}
@@ -223,6 +237,7 @@ func runDB(apply bool, out string, fromID int64) error {
 		}
 		slog.Info("window done", "from_id", lo, "found", len(fixes))
 	}
+	rc.log()
 	slog.Info("done", "apply", apply, "update", counts[actUpdate], "merge", counts[actMerge], "reject", counts[actReject])
 	if w != nil {
 		return w.Error()
@@ -245,7 +260,7 @@ func createBackups(ctx context.Context, db *sql.DB, suffix string) error {
 // processWindow scans emails with lo <= id < hi inside one transaction and, in
 // apply mode, repairs what it found before committing.
 func processWindow(ctx context.Context, db *sql.DB, lo, hi int64, apply bool, suffix string) ([]fix, error) {
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: !apply})
 	if err != nil {
 		return nil, err
 	}
@@ -263,21 +278,23 @@ func processWindow(ctx context.Context, db *sql.DB, lo, hi int64, apply bool, su
 	if err != nil {
 		return nil, err
 	}
-	var fixes []fix
+	var batch []emailRow
 	for rows.Next() {
-		var x fix
-		if err := rows.Scan(&x.id, &x.old); err != nil {
+		var r emailRow
+		if err := rows.Scan(&r.id, &r.email); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		if x.new, x.action = classify(x.old); x.action != "" {
-			fixes = append(fixes, x)
-		}
+		batch = append(batch, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	rows.Close()
+	fixes, err := classifyRows(ctx, tx, batch)
+	if err != nil {
+		return nil, err
+	}
 	if len(fixes) == 0 {
 		return nil, nil
 	}
@@ -329,6 +346,148 @@ func processWindow(ctx context.Context, db *sql.DB, lo, hi int64, apply bool, su
 		return nil, err
 	}
 	return fixes, tx.Commit()
+}
+
+// classifyRows runs the repair rules over a window. Pass 1 uses an empty context
+// that records every address a rule would look up; only rows that reached such a
+// lookup get a pass 2 with real database answers (existing addresses, and the
+// listings each row is linked to).
+func classifyRows(ctx context.Context, tx *sql.Tx, batch []emailRow) ([]fix, error) {
+	wanted := map[string]bool{}
+	var pending []emailRow
+	var fixes []fix
+	for _, r := range batch {
+		touched := false
+		look := func(e string) bool { touched, wanted[e] = true, true; return false }
+		fixed, action, rules := classify(r.email, emailfix.Context{Exists: look, ExistsLinked: look})
+		if touched {
+			pending = append(pending, r)
+		} else if action != "" {
+			fixes = append(fixes, fix{id: r.id, old: r.email, new: fixed, action: action, rules: rules})
+		}
+	}
+	if len(pending) == 0 {
+		return fixes, nil
+	}
+
+	ids := make([]int64, len(pending))
+	for i, r := range pending {
+		ids[i] = r.id
+	}
+	bizOf := map[int64]map[int64]bool{} // email id -> linked business ids
+	domainsOf := map[int64][]string{}   // email id -> linked listing domains
+	rs, err := tx.QueryContext(ctx, `
+		SELECT be.email_id, be.business_id, COALESCE(bl.domain, '')
+		FROM business_emails be JOIN business_listings bl ON bl.id = be.business_id
+		WHERE be.email_id = ANY($1)`, pq.Array(ids))
+	if err != nil {
+		return nil, err
+	}
+	for rs.Next() {
+		var eid, bid int64
+		var dom string
+		if err := rs.Scan(&eid, &bid, &dom); err != nil {
+			rs.Close()
+			return nil, err
+		}
+		if bizOf[eid] == nil {
+			bizOf[eid] = map[int64]bool{}
+		}
+		bizOf[eid][bid] = true
+		domainsOf[eid] = append(domainsOf[eid], dom)
+	}
+	if err := rs.Err(); err != nil {
+		return nil, err
+	}
+	rs.Close()
+
+	cands := make([]string, 0, len(wanted))
+	for e := range wanted {
+		cands = append(cands, e)
+	}
+	exists := map[string]bool{}
+	candBiz := map[string]map[int64]bool{}
+	rs, err = tx.QueryContext(ctx, `
+		SELECT e.email, COALESCE(be.business_id, 0)
+		FROM emails e LEFT JOIN business_emails be ON be.email_id = e.id
+		WHERE e.email = ANY($1) AND e.validation_status IS DISTINCT FROM 'malformed'`, pq.Array(cands))
+	if err != nil {
+		return nil, err
+	}
+	for rs.Next() {
+		var e string
+		var bid int64
+		if err := rs.Scan(&e, &bid); err != nil {
+			rs.Close()
+			return nil, err
+		}
+		exists[e] = true
+		if candBiz[e] == nil {
+			candBiz[e] = map[int64]bool{}
+		}
+		candBiz[e][bid] = true
+	}
+	if err := rs.Err(); err != nil {
+		return nil, err
+	}
+	rs.Close()
+
+	for _, r := range pending {
+		c := emailfix.Context{
+			ListingDomains: domainsOf[r.id],
+			Exists:         func(e string) bool { return exists[e] },
+			ExistsLinked: func(e string) bool {
+				for b := range candBiz[e] {
+					if bizOf[r.id][b] {
+						return true
+					}
+				}
+				return false
+			},
+		}
+		if fixed, action, rules := classify(r.email, c); action != "" {
+			fixes = append(fixes, fix{id: r.id, old: r.email, new: fixed, action: action, rules: rules})
+		}
+	}
+	sort.Slice(fixes, func(i, j int) bool { return fixes[i].id < fixes[j].id })
+	return fixes, nil
+}
+
+// ruleStats counts fixes per rule and keeps a uniform random sample of each.
+type ruleStats struct {
+	count   map[string]int
+	samples map[string][]fix
+}
+
+const samplesPerRule = 20
+
+func newRuleStats() *ruleStats {
+	return &ruleStats{count: map[string]int{}, samples: map[string][]fix{}}
+}
+
+func (s *ruleStats) add(x fix) {
+	for _, r := range x.rules {
+		s.count[r]++
+		if len(s.samples[r]) < samplesPerRule {
+			s.samples[r] = append(s.samples[r], x)
+		} else if j := rand.IntN(s.count[r]); j < samplesPerRule { // reservoir sampling
+			s.samples[r][j] = x
+		}
+	}
+}
+
+func (s *ruleStats) log() {
+	rules := make([]string, 0, len(s.count))
+	for r := range s.count {
+		rules = append(rules, r)
+	}
+	sort.Strings(rules)
+	for _, r := range rules {
+		slog.Info("rule", "rule", r, "count", s.count[r])
+		for _, x := range s.samples[r] {
+			slog.Info("sample", "rule", r, "id", x.id, "old", x.old, "new", x.new, "action", x.action, "target", x.target)
+		}
+	}
 }
 
 func applyFixes(ctx context.Context, tx *sql.Tx, fixes []fix, suffix string) error {
