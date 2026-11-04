@@ -46,8 +46,8 @@ func TestTicker_PrintContainsExpectedSegments(t *testing.T) {
 	line := buf.String()
 
 	checks := []struct {
-		desc    string
-		want    string
+		desc string
+		want string
 	}{
 		{"elapsed marker", "["},
 		{"serp section", "serp:"},
