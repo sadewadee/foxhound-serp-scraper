@@ -42,7 +42,6 @@ import (
 	"time"
 
 	"github.com/lib/pq"
-	"golang.org/x/net/publicsuffix"
 
 	"github.com/sadewadee/serp-scraper/internal/emailfix"
 )
@@ -92,8 +91,7 @@ func validTLD(email string) bool {
 	if dot < 0 || dot < strings.LastIndex(email, "@") {
 		return false
 	}
-	_, icann := publicsuffix.PublicSuffix(email[dot+1:])
-	return icann
+	return emailfix.IsTLD(email[dot+1:])
 }
 
 func main() {

@@ -42,8 +42,13 @@ func TestRepair(t *testing.T) {
 		// Unrecoverable.
 		{"nodomain", "nodomain", false, false},
 		{"info@studio", "info@studio", false, false},
+		{"ameliahgroves@gmail.comn", "ameliahgroves@gmail.com", true, true},
 		{"info@studio.zzzzqq", "info@studio.zzzzqq", false, false},
-		{"a@b.com", "a@b.com", false, false}, // local part too short
+		{"a@b.com", "a@b.com", false, false},                                               // local part too short
+		{"kelsey@elevationfitnesspdx.con", "kelsey@elevationfitnesspdx.con", false, false}, // typo, not glue
+		{"aaron@gmail.com.archive", "aaron@gmail.com.archive", false, false},               // ".archi" would be a wrong guess
+		{"paint@gmail.coom", "paint@gmail.coom", false, false},
+		{"hello@liveingermany.de/", "hello@liveingermany.de", true, true},
 		{"in fo@x.com", "in fo@x.com", false, false},
 		{"+1-212-555-7575@x.com", "+1-212-555-7575@x.com", false, true}, // no letter after the run: left alone
 	}
@@ -107,6 +112,14 @@ func TestRepairCtx(t *testing.T) {
 		{"multi-label suffix kept", "info@studio.com.au", Context{ListingDomains: []string{"studio.com.au"}}, "info@studio.com.au", ""},
 		{"co.uk kept", "info@studio.co.uk", Context{}, "info@studio.co.uk", ""},
 		{"suffix-like label kept", "info@mail.company.com", Context{ListingDomains: []string{"company.com"}}, "info@mail.company.com", ""},
+		{"live.mercer.edu kept", "luke.sadd@live.mercer.edu", Context{}, "luke.sadd@live.mercer.edu", ""},
+		{"dealerdesk subdomain kept", "verkauf@auto-zeilinger.dealerdesk.de", Context{Exists: set("verkauf@auto-zeilinger.de")}, "verkauf@auto-zeilinger.dealerdesk.de", ""},
+		{"web.de repeat signal", "martins10@web.deweb.de", Context{}, "martins10@web.de", "middomain"},
+		{"wwww after ccTLD", "nicki@ritesforgirls.co.ukwww.ritesforgirls.com", Context{Exists: set("nicki@ritesforgirls.co.uk")}, "nicki@ritesforgirls.co.uk", "middomain"},
+		{"np tld kept", "info@foodforlife.org.np", Context{}, "info@foodforlife.org.np", ""},
+		{"mm tld kept", "zgs@baganmail.net.mm", Context{}, "zgs@baganmail.net.mm", ""},
+		{"tech support compound", "techsupport@usailighting.com", Context{ListingDomains: []string{"usailighting.com"}}, "techsupport@usailighting.com", ""},
+		{"ptymail kept on own domain", "ptymail@pattayamail.com", Context{ListingDomains: []string{"pattayamail.com"}}, "ptymail@pattayamail.com", ""},
 		// Case 4: free-mail false positives stay blocked.
 		{"services@gmail", "customerservices@gmail.com", Context{Exists: set("services@gmail.com"), ExistsLinked: set("services@gmail.com")}, "customerservices@gmail.com", ""},
 		{"pilates@gmail", "clubpilates@gmail.com", Context{Exists: set("pilates@gmail.com"), ExistsLinked: set("pilates@gmail.com")}, "clubpilates@gmail.com", ""},

@@ -609,3 +609,13 @@ func TestIsCleanEmail_RejectsPhonePrefix(t *testing.T) {
 		}
 	}
 }
+
+// Wildcard-only ccTLDs (np, mm, bd, ...) are valid TLDs even though the public
+// suffix list does not report them as ICANN when asked as a bare label.
+func TestIsCleanEmail_WildcardTLDs(t *testing.T) {
+	for _, e := range []string{"info@foodforlife.org.np", "zgs@baganmail.net.mm", "a1@bank.com.bd"} {
+		if !isCleanEmail(e) {
+			t.Errorf("isCleanEmail(%q) = false, want true", e)
+		}
+	}
+}

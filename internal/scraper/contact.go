@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
-	"golang.org/x/net/publicsuffix"
 
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/parse"
@@ -1286,7 +1285,7 @@ func isCleanEmail(email string) bool {
 	}
 	// Accept any ICANN TLD; glued garbage (inivie.comview) is not one. Only the
 	// last label is checked so private-suffix domains (studio.uk.com) still pass.
-	if _, icann := publicsuffix.PublicSuffix(strings.ToLower(domain[dotIdx+1:])); !icann {
+	if !emailfix.IsTLD(strings.ToLower(domain[dotIdx+1:])) {
 		return false
 	}
 

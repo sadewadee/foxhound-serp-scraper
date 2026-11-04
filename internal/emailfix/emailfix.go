@@ -58,6 +58,14 @@ func isFreeMail(domain string) bool {
 	return false
 }
 
+// IsTLD reports whether label is an ICANN top-level domain. It probes "x."+label
+// because wildcard-only TLDs (np, mm, bd, kh, ...) are not reported as ICANN when
+// asked as a bare label.
+func IsTLD(label string) bool {
+	_, icann := publicsuffix.PublicSuffix("x." + label)
+	return icann
+}
+
 func isPhoneRune(r byte) bool {
 	return r == '+' || (r >= '0' && r <= '9') || strings.IndexByte(" ().-", r) >= 0
 }
@@ -101,13 +109,22 @@ func cutGluedTLD(domain string) string {
 		return domain
 	}
 	label := domain[dot+1:]
-	if _, icann := publicsuffix.PublicSuffix(label); icann {
+	if IsTLD(label) {
 		return domain
 	}
 	for n := len(label) - 1; n >= 2; n-- {
-		if _, icann := publicsuffix.PublicSuffix(label[:n]); icann {
-			return domain[:dot+1] + label[:n]
+		// A cut leaving 1-2 letters is a typo (".con" -> ".co", ".archive" ->
+		// ".archi"), not glue, unless the cut is com/net/org (".comm", ".comn").
+		// Cuts at punctuation are fine.
+		rest := label[n:]
+		typo := len(rest) < 3 && rest[0] >= 'a' && rest[0] <= 'z' && label[:n] != "com" && label[:n] != "net" && label[:n] != "org"
+		if !IsTLD(label[:n]) {
+			continue
 		}
+		if typo {
+			break // a longer TLD fits with a 1-2 letter leftover: guessing a shorter one would be wrong
+		}
+		return domain[:dot+1] + label[:n]
 	}
 	return domain
 }
@@ -164,7 +181,16 @@ var protectedLeads = map[string]bool{
 	"member": true, "student": true, "studierenden": true, "patient": true,
 	"tourist": true, "ticket": true, "tickets": true, "press": true,
 	"media": true, "general": true, "public": true,
+	"tech": true, "technical": true, "web": true, "pro": true, "request": true,
+	"more": true, "get": true, "ask": true, "online": true, "free": true,
+	"news": true, "system": true, "site": true, "sales": true, "service": true,
+	"order": true, "product": true,
 }
+
+// ownDomainRoles are the only roles trusted on the listing's own domain without
+// a standalone twin; compounds like "techsupport" or "ptymail" are too common
+// for support/admin/mail/office.
+var ownDomainRoles = map[string]bool{"info": true, "contact": true, "kontakt": true, "hello": true}
 
 func isRoleLocal(s string) bool {
 	for _, r := range prefixRoles {
@@ -227,31 +253,43 @@ func stripPlaceGlue(local, domain string, c Context) (string, bool) {
 		if !allLetters(lead) || protectedLeads[lead] || isRoleLocal(lead) {
 			continue
 		}
-		if acceptStripped(role, domain, c, c.ownDomain(domain)) {
+		if acceptStripped(role, domain, c, ownDomainRoles[role] && c.ownDomain(domain)) {
 			return role, true
 		}
 	}
 	return local, false
 }
 
+// midFreeMail are the free-mail domains a mid-domain cut may land on.
+var midFreeMail = map[string]bool{
+	"gmail.com": true, "yahoo.com": true, "hotmail.com": true, "outlook.com": true,
+	"live.com": true, "aol.com": true, "ymail.com": true, "icloud.com": true,
+	"web.de": true, "gmx.de": true, "gmx.net": true, "gmx.com": true, "qq.com": true,
+	"163.com": true, "naver.com": true, "hanmail.net": true, "mail.ru": true,
+}
+
 // cutMidDomain handles text between two domains ("gmail.comfacebookfacebook.com"):
-// it cuts a non-final label back to an ICANN suffix prefix, at the first label
-// where the result is vouched for (the listing's domain, a free-mail provider, or
-// an address that exists on its own). Labels that are themselves a suffix
-// ("mail.company.com") are left alone.
+// it cuts a non-final label back to an ICANN TLD prefix, at the first label where
+// the result is vouched for (a free-mail provider, the listing's domain, or an
+// address that exists on its own). Labels that are themselves a TLD
+// ("mail.company.com") are left alone. A cut onto a 2-letter ccTLD also needs a
+// glue signal in the leftover text ("www", or the first label repeated), so
+// "live.mercer.edu" is not read as "live.me".
 func cutMidDomain(local, domain string, c Context) string {
 	labels := strings.Split(domain, ".")
 	for j := 1; j < len(labels)-1; j++ {
 		label := labels[j]
-		if _, icann := publicsuffix.PublicSuffix(label); icann {
+		if IsTLD(label) {
 			continue
 		}
 		for n := len(label) - 1; n >= 2; n-- {
-			if _, icann := publicsuffix.PublicSuffix(label[:n]); !icann {
+			if !IsTLD(label[:n]) {
 				continue
 			}
 			d := strings.Join(labels[:j], ".") + "." + label[:n]
-			if c.ownDomain(d) || isFreeMail(d) || c.exists(local+"@"+d) {
+			rest := label[n:] + "." + strings.Join(labels[j+1:], ".")
+			signal := strings.Contains(rest, "www") || strings.Contains(rest, labels[0])
+			if (n >= 3 || signal) && (midFreeMail[d] || c.ownDomain(d) || c.exists(local+"@"+d)) {
 				return d
 			}
 		}
@@ -294,6 +332,5 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	if len(local) < 2 || !cleanRe.MatchString(fixed) {
 		return fixed, rules, false
 	}
-	_, icann := publicsuffix.PublicSuffix(domain[strings.LastIndex(domain, ".")+1:])
-	return fixed, rules, icann
+	return fixed, rules, IsTLD(domain[strings.LastIndex(domain, ".")+1:])
 }
