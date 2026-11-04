@@ -373,7 +373,7 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 			       e.score, e.is_acceptable, e.mx_valid, e.deliverable,
 			       e.disposable, e.role_account, e.free_email, e.catch_all,
 			       COALESCE(e.reason,''), COALESCE(be.source,'enrichment'),
-			       e.validated_at
+			       e.validated_at, be.person_name, be.person_name_source
 			FROM business_emails be
 			JOIN emails e ON e.id = be.email_id
 			WHERE be.business_id = ANY($1)
@@ -392,7 +392,8 @@ func (s *Server) handleV2ListResults(w http.ResponseWriter, r *http.Request) {
 				err := emailRows.Scan(&businessID, &ei.Email, &ei.Domain, &ei.Status,
 					&ei.Score, &ei.IsAcceptable, &ei.MXValid, &ei.Deliverable,
 					&ei.Disposable, &ei.RoleAccount, &ei.FreeEmail, &ei.CatchAll,
-					&ei.Reason, &ei.Source, &ei.ValidatedAt)
+					&ei.Reason, &ei.Source, &ei.ValidatedAt,
+					&ei.PersonName, &ei.PersonNameSource)
 				if err != nil {
 					slog.Error("v2: email scan error", "error", err)
 					continue
@@ -766,7 +767,7 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 			       e.score, e.is_acceptable, e.mx_valid, e.deliverable,
 			       e.disposable, e.role_account, e.free_email, e.catch_all,
 			       COALESCE(e.reason,''), COALESCE(be.source,'enrichment'),
-			       e.validated_at
+			       e.validated_at, be.person_name, be.person_name_source
 			FROM business_emails be
 			JOIN emails e ON e.id = be.email_id
 			WHERE be.business_id = ANY($1)
@@ -780,7 +781,8 @@ func (s *Server) handleV2Download(w http.ResponseWriter, r *http.Request) {
 				emailRows.Scan(&businessID, &ei.Email, &ei.Domain, &ei.Status,
 					&ei.Score, &ei.IsAcceptable, &ei.MXValid, &ei.Deliverable,
 					&ei.Disposable, &ei.RoleAccount, &ei.FreeEmail, &ei.CatchAll,
-					&ei.Reason, &ei.Source, &ei.ValidatedAt)
+					&ei.Reason, &ei.Source, &ei.ValidatedAt,
+					&ei.PersonName, &ei.PersonNameSource)
 				emailMap[businessID] = append(emailMap[businessID], ei)
 			}
 			emailRows.Close()

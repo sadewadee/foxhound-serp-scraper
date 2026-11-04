@@ -702,6 +702,15 @@ components:
         score: { type: number, nullable: true }
         is_acceptable: { type: boolean, nullable: true }
         validated_at: { type: string, format: date-time, nullable: true }
+        person_name:
+          type: string
+          nullable: true
+          description: Person name the source page itself printed next to / linked to this email. Null when the page gave no evidence (never guessed from the address).
+        person_name_source:
+          type: string
+          nullable: true
+          enum: [jsonld_person, mailto_text, adjacent_text]
+          description: How person_name was found.
 
     BusinessListing:
       type: object

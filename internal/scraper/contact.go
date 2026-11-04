@@ -89,6 +89,10 @@ type ContactData struct {
 	// Contact person name (from JSON-LD author/founder, meta author, vCard).
 	ContactName string
 
+	// EmailNames maps email -> the person name the page itself ties to that
+	// email (see ExtractEmailNames). Only emails with evidence appear.
+	EmailNames map[string]EmailName
+
 	// Business info (from JSON-LD / OpenGraph / meta tags).
 	BusinessName     string
 	BusinessCategory string
@@ -222,6 +226,8 @@ func ExtractContacts(body []byte) *ContactData {
 			cd.PageTitle = strings.TrimSpace(doc.Text("title"))
 		}
 	}
+
+	cd.EmailNames = ExtractEmailNames(body, cd.Emails, cd.BusinessName)
 
 	return cd
 }

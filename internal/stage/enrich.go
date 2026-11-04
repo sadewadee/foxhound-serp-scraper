@@ -738,8 +738,9 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			raw_city = $11, raw_contact_name = $12,
 			raw_opening_hours = $13, raw_rating = $14,
 			raw_tiktok = $15, raw_youtube = $16, raw_telegram = $17,
+			raw_email_names = $18,
 			locked_by = NULL, completed_at = NOW(), updated_at = NOW()
-		WHERE url_hash = $18`,
+		WHERE url_hash = $19`,
 			pq.Array(emails), pq.Array(phones), socialJSON,
 			// sanitizeUTF8 on every scraped text field — a single invalid byte
 			// (Latin-1 / mojibake from a mislabeled page) made the whole UPDATE
@@ -751,6 +752,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			nullIfEmpty(sanitizeUTF8(cd.City)), nullIfEmpty(sanitizeUTF8(cd.ContactName)),
 			nullIfEmpty(sanitizeUTF8(cd.OpeningHours)), nullIfEmpty(sanitizeUTF8(cd.Rating)),
 			nullIfEmpty(sanitizeUTF8(cd.TikTok)), nullIfEmpty(sanitizeUTF8(cd.YouTube)), nullIfEmpty(sanitizeUTF8(cd.Telegram)),
+			internalScraper.EmailNamesJSON(cd.EmailNames, emails),
 			urlHash)
 		if updErr != nil {
 			// Don't leave the job in 'processing' — reconciler would re-fetch
