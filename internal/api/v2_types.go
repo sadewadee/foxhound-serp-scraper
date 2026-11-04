@@ -60,6 +60,11 @@ type V2EmailInfo struct {
 	Reason       string     `json:"reason"`
 	Source       string     `json:"source"`
 	ValidatedAt  *time.Time `json:"validated_at"`
+	// PersonName is the person the source page itself tied to this email
+	// (null when there was no evidence). PersonNameSource: jsonld_person |
+	// mailto_text | adjacent_text.
+	PersonName       *string `json:"person_name"`
+	PersonNameSource *string `json:"person_name_source"`
 }
 
 // V2ResultsStats is the API response shape for results stats.

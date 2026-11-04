@@ -291,7 +291,7 @@ const idxBlReenrichScoreDDL = `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bl_re
 // than the binary's — it does NOT upgrade stale binaries; those still need
 // a real deploy.
 const enqueueTriggerVersion = 20260925
-const normalizeTriggerVersion = 20260926
+const normalizeTriggerVersion = 20261104
 
 // trgEnqueueEnrichmentFnBody is the trg_enqueue_enrichment CREATE OR REPLACE
 // statement, with a %d placeholder for enqueueTriggerVersion — the single
@@ -637,9 +637,19 @@ const trgNormalizeEnrichmentFnBody = `
 		        SELECT id INTO email_id FROM emails WHERE email = e;
 
 		        IF biz_id IS NOT NULL AND email_id IS NOT NULL THEN
-		          INSERT INTO business_emails (business_id, email_id, source)
-		          VALUES (biz_id, email_id, 'enrichment')
-		          ON CONFLICT DO NOTHING;
+		          -- person_name: only when the page tied a name to this email
+		          -- (raw_email_names). A later visit with no name never clears an
+		          -- existing one; a new non-null name replaces it.
+		          INSERT INTO business_emails (business_id, email_id, source, person_name, person_name_source)
+		          VALUES (biz_id, email_id, 'enrichment',
+		                  NULLIF(NEW.raw_email_names -> e ->> 'name', ''),
+		                  NULLIF(NEW.raw_email_names -> e ->> 'source', ''))
+		          ON CONFLICT ON CONSTRAINT business_emails_pkey DO UPDATE
+		            SET person_name        = COALESCE(EXCLUDED.person_name, business_emails.person_name),
+		                person_name_source = CASE WHEN EXCLUDED.person_name IS NOT NULL
+		                                          THEN EXCLUDED.person_name_source
+		                                          ELSE business_emails.person_name_source END
+		            WHERE EXCLUDED.person_name IS NOT NULL;
 		        END IF;
 		      END LOOP;
 		    END IF;
@@ -910,6 +920,11 @@ func runMigrations(db *sql.DB) error {
 		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_tiktok TEXT`,
 		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_youtube TEXT`,
 		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_telegram TEXT`,
+		// Per-email person names: {"email": {"name": "...", "source": "..."}}.
+		// Only set when the page itself ties the name to the email.
+		`ALTER TABLE enrichment_jobs ADD COLUMN IF NOT EXISTS raw_email_names JSONB`,
+		`ALTER TABLE business_emails ADD COLUMN IF NOT EXISTS person_name TEXT`,
+		`ALTER TABLE business_emails ADD COLUMN IF NOT EXISTS person_name_source TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_bl_country ON business_listings(country) WHERE country IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_bl_city ON business_listings(city) WHERE city IS NOT NULL`,
 		// Niche infrastructure (2026-05-22). The category column is contaminated:

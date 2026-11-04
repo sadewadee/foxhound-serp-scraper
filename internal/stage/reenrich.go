@@ -528,6 +528,7 @@ func completeEnrichmentJob(ctx context.Context, db *sql.DB, url, urlHash, domain
 			raw_tiktok         = COALESCE($16, raw_tiktok),
 			raw_youtube        = COALESCE($17, raw_youtube),
 			raw_telegram       = COALESCE($18, raw_telegram),
+			raw_email_names    = $19,
 			completed_at = NOW(), updated_at = NOW()
 		WHERE url_hash = $1`,
 		urlHash,
@@ -536,6 +537,7 @@ func completeEnrichmentJob(ctx context.Context, db *sql.DB, url, urlHash, domain
 		nullIfEmpty(sanitizeUTF8(cd.PageTitle)), nullIfEmpty(sanitizeUTF8(cd.Description)), nullIfEmpty(sanitizeUTF8(cd.Location)), nullIfEmpty(sanitizeUTF8(cd.Country)),
 		nullIfEmpty(sanitizeUTF8(cd.City)), nullIfEmpty(sanitizeUTF8(cd.ContactName)), nullIfEmpty(sanitizeUTF8(cd.OpeningHours)), nullIfEmpty(sanitizeUTF8(cd.Rating)),
 		nullIfEmpty(sanitizeUTF8(cd.TikTok)), nullIfEmpty(sanitizeUTF8(cd.YouTube)), nullIfEmpty(sanitizeUTF8(cd.Telegram)),
+		internalScraper.EmailNamesJSON(cd.EmailNames, emails),
 	); err != nil {
 		return err
 	}

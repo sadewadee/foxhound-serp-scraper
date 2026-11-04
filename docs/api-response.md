@@ -346,7 +346,8 @@ Query (semua optional, kecuali pagination):
           "email":"hi@acme.com","domain":"acme.com","status":"valid",
           "score":0.95,"is_acceptable":true,"mx_valid":true,"deliverable":true,
           "disposable":false,"role_account":false,"free_email":false,"catch_all":false,
-          "reason":"","source":"enrichment","validated_at":"2026-04-20T..."
+          "reason":"","source":"enrichment","validated_at":"2026-04-20T...",
+          "person_name":"Jane Doe","person_name_source":"mailto_text"
         }
       ],
       "total_email_count": 1,
@@ -366,6 +367,13 @@ Catatan: `data[].meta` (di dalam tiap listing) berbeda dengan `meta` level atas
 `business_meta` (label bawaan situs sumber, banyak value per key), selalu ada
 dan bernilai `{}` kalau listing tidak punya meta. Cursor mode juga
 mengembalikannya per listing.
+
+Catatan: `emails_with_info[].person_name` / `person_name_source` adalah nama
+orang yang dicetak halaman sumber itu sendiri untuk email tersebut (bukan tebakan
+dari local part). `null` kalau halaman tidak memberi bukti. `person_name_source`:
+`jsonld_person` (JSON-LD Person dengan email yang sama), `mailto_text` (teks
+anchor `mailto:`), `adjacent_text` (teks tepat di samping email). Field
+`emails` (array string) tidak berubah.
 
 ### `GET /api/v2/results/stats`
 

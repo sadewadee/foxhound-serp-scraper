@@ -87,10 +87,11 @@ psql_run "
     raw_business_name, raw_category, raw_address, raw_page_title,
     raw_description, raw_location, raw_country, raw_city, raw_contact_name,
     raw_opening_hours, raw_rating,
-    raw_tiktok, raw_youtube, raw_telegram
+    raw_tiktok, raw_youtube, raw_telegram,
+    raw_email_names
   ) VALUES (
     '${TEST_URL}', '${TEST_HASH}', '${TEST_DOMAIN}', 'verify_test', 'pending',
-    ARRAY['hi@${TEST_DOMAIN}'],
+    ARRAY['hi@${TEST_DOMAIN}','jane@${TEST_DOMAIN}'],
     ARRAY['+62811000001','+62811000002','+62811000003'],
     '{\"facebook\":\"https://facebook.com/verifytest\"}'::jsonb,
     'Verify Pipeline Test Co', 'Test Category',
@@ -105,7 +106,8 @@ psql_run "
     '4.5',
     'https://tiktok.com/@verifytest',
     'https://youtube.com/@verifytest',
-    'verifytestbot'
+    'verifytestbot',
+    '{\"jane@${TEST_DOMAIN}\":{\"name\":\"Jane Tester\",\"source\":\"mailto_text\"}}'::jsonb
   )
 " >/dev/null
 
@@ -144,6 +146,26 @@ assert_eq tiktok             'https://tiktok.com/@verifytest' "${fields[13]}"
 assert_eq youtube            'https://youtube.com/@verifytest' "${fields[14]}"
 assert_eq telegram           'verifytestbot'            "${fields[15]}"
 
+# Per-email person name: jane@ carries a name + source, hi@ must stay NULL
+# (names are only stored when the page ties them to the email).
+echo "[step 3b] checking business_emails.person_name"
+pn="$(psql_run "
+  SELECT COALESCE(be.person_name,'<null>') || '/' || COALESCE(be.person_name_source,'<null>')
+  FROM business_emails be
+  JOIN business_listings bl ON bl.id = be.business_id
+  JOIN emails e ON e.id = be.email_id
+  WHERE bl.domain = '${TEST_DOMAIN}' AND e.email = 'jane@${TEST_DOMAIN}'
+")"
+assert_eq person_name/source 'Jane Tester/mailto_text' "$pn"
+pn_hi="$(psql_run "
+  SELECT COALESCE(be.person_name,'<null>')
+  FROM business_emails be
+  JOIN business_listings bl ON bl.id = be.business_id
+  JOIN emails e ON e.id = be.email_id
+  WHERE bl.domain = '${TEST_DOMAIN}' AND e.email = 'hi@${TEST_DOMAIN}'
+")"
+assert_eq person_name_unnamed '<null>' "$pn_hi"
+
 # ─── Step 4: assert API exposes every field ──────────────────────────────────
 echo "[step 4] curl /api/v2/results?domain=${TEST_DOMAIN}"
 json="$(curl -fsS -H "x-api-key: ${API_KEY}" \
@@ -168,6 +190,18 @@ assert_json_field rating        '4.5'                                          "
 assert_json_field tiktok        'https://tiktok.com/@verifytest'               "$json"
 assert_json_field youtube       'https://youtube.com/@verifytest'              "$json"
 assert_json_field telegram      'verifytestbot'                                "$json"
+
+# Per-email person name must be exposed in emails_with_info (exit 2 = read-path gap).
+for want in "jane@${TEST_DOMAIN}|Jane Tester|mailto_text" "hi@${TEST_DOMAIN}|null|null"; do
+  IFS='|' read -r em wname wsrc <<< "$want"
+  got="$(printf '%s' "$json" | jq -r --arg e "$em" '.data[0].emails_with_info[] | select(.email==$e) | "\(.person_name)|\(.person_name_source)"')"
+  if [[ "$got" != "${wname}|${wsrc}" ]]; then
+    echo "[FAIL] api.emails_with_info[${em}] person_name|source expected=${wname}|${wsrc} got=${got}"
+    printf '%s\n' "$json" | jq .
+    exit 2
+  fi
+  echo "[ok ] api.emails_with_info[${em}].person_name=${wname}"
+done
 
 # Multi-phone array: API may return phones as JSON array; check length and first entry.
 phones_count="$(printf '%s' "$json" | jq '.data[0].phones | length')"
