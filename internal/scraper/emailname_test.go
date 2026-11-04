@@ -31,7 +31,14 @@ func TestExtractEmailNames(t *testing.T) {
 		{"initial plus surname, short surname", `<p>Wei Li <a href="mailto:wli@x.com">wli@x.com</a></p>`,
 			"wli@x.com", "", "Wei Li", NameSourceAdjacent},
 
+		{"untyped node under employee", `<script type="application/ld+json">{"@type":"LocalBusiness","name":"Acme","employee":{"name":"Tim Berg","email":"tim@acme.com"}}</script>`,
+			"tim@acme.com", "Acme", "Tim Berg", NameSourceJSONLD},
+
 		// must reject
+		{"organization under member", `<script type="application/ld+json">{"@type":"Organization","name":"Acme","member":{"@type":"Organization","name":"Bella Vita","email":"bella@x.com"}}</script>`,
+			"bella@x.com", "Acme", "", ""},
+		{"typed non-person array under founder", `<script type="application/ld+json">{"founder":{"@type":["Organization","LocalBusiness"],"name":"Bella Vita","email":"bella@x.com"}}</script>`,
+			"bella@x.com", "Acme", "", ""},
 		{"anchor Email us", `<a href="mailto:maria@x.com">Email us</a>`, "maria@x.com", "", "", ""},
 		{"anchor Contact", `<a href="mailto:maria@x.com">Contact</a>`, "maria@x.com", "", "", ""},
 		{"anchor is the address", `<a href="mailto:maria@x.com">maria@x.com</a>`, "maria@x.com", "", "", ""},

@@ -131,13 +131,25 @@ func ExtractEmailNames(body []byte, emails []string, businessName string) map[st
 	}
 
 	// c. Text adjacent to the address on the same line.
-	text := pageLines(body)
+	pending := make([]string, 0, len(want))
 	for email := range want {
-		if _, done := out[email]; done {
-			continue
+		if _, done := out[email]; !done {
+			pending = append(pending, email)
 		}
-		for _, line := range text {
-			if n := adjacentName(line, email, businessName); n != "" {
+	}
+	if len(pending) == 0 {
+		return out
+	}
+	text := pageLines(body)
+	lower := make([]string, len(text)) // lowercased once; "" = unusable (byte length changed)
+	for i, line := range text {
+		if l := strings.ToLower(line); len(l) == len(line) {
+			lower[i] = l
+		}
+	}
+	for _, email := range pending {
+		for i, line := range text {
+			if n := adjacentName(line, lower[i], email, businessName); n != "" {
 				out[email] = EmailName{Name: n, Source: NameSourceAdjacent}
 				break
 			}
@@ -225,16 +237,16 @@ var personKeys = setOfWords("employee", "employees", "founder", "founders", "mem
 func isPersonNode(m map[string]any, parentKey string) bool {
 	switch t := m["@type"].(type) {
 	case string:
-		if strings.HasSuffix(t, "Person") {
-			return true
-		}
+		return strings.HasSuffix(t, "Person")
 	case []any:
 		for _, v := range t {
 			if strings.HasSuffix(strVal(v), "Person") {
 				return true
 			}
 		}
+		return false
 	}
+	// The parent-key rule applies only to untyped nodes.
 	return personKeys[strings.ToLower(parentKey)]
 }
 
@@ -254,9 +266,8 @@ func isEmailChar(c byte) bool {
 }
 
 // adjacentName finds email in line and validates the text right before it.
-func adjacentName(line, email, businessName string) string {
-	lower := strings.ToLower(line)
-	if len(lower) != len(line) || !strings.Contains(lower, email) {
+func adjacentName(line, lower, email, businessName string) string {
+	if lower == "" || !strings.Contains(lower, email) {
 		return ""
 	}
 	for from := 0; ; {
