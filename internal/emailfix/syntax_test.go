@@ -82,7 +82,6 @@ func TestRepairSyntaxRound2(t *testing.T) {
 		{"info @studio-a.de", "info@studio-a.de"},
 		{"info@ studio-a.de", "info@studio-a.de"},
 		{"info@studio- berlin.de", "info@studio-berlin.de"},
-		{"info@studio. berlin.de", "info@studio.berlin.de"},
 		// Brackets, a leading "@", HTML tags, doubled parts.
 		{"(info@studio-a.de)", "info@studio-a.de"},
 		{"[info@studio-a.de]", "info@studio-a.de"},
@@ -165,6 +164,8 @@ func TestRepairSyntaxReject(t *testing.T) {
 		"a&b@studio-a.com",
 		"a%zz@studio-a.com",
 		"info@studio-a.com!",
+		// "studio" is a TLD, so the space after the dot is not joined: ambiguous, reject.
+		"info@studio. berlin.de",
 		// Unrepairable CRM-invalid results: the final check adds "syntax".
 		"anna berg@studio-a.com",
 		"name.@studio-a.com",
@@ -196,6 +197,12 @@ func TestCleanList(t *testing.T) {
 		{"comma and encoded space", []string{"anna@studio-a.de,%20office@studio-a.de"}, []string{"anna@studio-a.de", "office@studio-a.de"}},
 		{"colon join", []string{"info@studio-a.de:office@studio-a.de"}, []string{"info@studio-a.de", "office@studio-a.de"}},
 		{"cc join", []string{"info@studio-a.de&cc=office@studio-a.de"}, []string{"info@studio-a.de", "office@studio-a.de"}},
+		{"two-char split with encoded spaces", []string{"ab@one-fixture.com;%20%20cd@two-fixture.org"}, []string{"ab@one-fixture.com", "cd@two-fixture.org"}},
+		{"br join", []string{"ab@one-fixture.com <br>cd@two-fixture.org"}, []string{"ab@one-fixture.com", "cd@two-fixture.org"}},
+		{"encoded space around lub", []string{"ab@one-fixture.com%20lub%20cd.e@two-fixture.org"}, []string{"ab@one-fixture.com", "cd.e@two-fixture.org"}},
+		{"cc join two-char", []string{"ab@one-fixture.com&cc=cd@two-fixture.org"}, []string{"ab@one-fixture.com", "cd@two-fixture.org"}},
+		{"colon repeats one address", []string{"ab@one-fixture.com:ab@one-fixture.com"}, []string{"ab@one-fixture.com"}},
+		{"quote-gt repeats one address", []string{"ab@one-fixture.com\">ab@one-fixture.com"}, []string{"ab@one-fixture.com"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -207,5 +214,57 @@ func TestCleanList(t *testing.T) {
 				assertCRM(t, a)
 			}
 		})
+	}
+}
+
+func TestRepairSyntaxRound3(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		// Whitespace after "." joins only when the label before it is not a TLD.
+		{"info@fixture.com. phone", "info@fixture.com"},
+		{"info@fixture.com. tel", "info@fixture.com"},
+		{"info@fixture.com. info", "info@fixture.com"},
+		{"info@fixture.com. email", "info@fixture.com"},
+		{"info@fixture.com. mobile", "info@fixture.com"},
+		{"xy@pec.rupar. puglia.it", "xy@pec.rupar.puglia.it"},
+		{"xy@a.b. c.it", "xy@a.b.c.it"},
+		{"xy@hot-  tub.com", "xy@hot-tub.com"},
+		// A symbol before a space is a separator; a letter before a space is not.
+		{"\u2709 stay@fixture-hotel.co.uk", "stay@fixture-hotel.co.uk"},
+		{"\U0001F4E7 info@fixture-hotel.co.uk", "info@fixture-hotel.co.uk"},
+		{"\u2022 info@fixture-hotel.co.uk", "info@fixture-hotel.co.uk"},
+		{"\u2192 info@fixture-hotel.co.uk", "info@fixture-hotel.co.uk"},
+		// Repeated wrappers from both ends.
+		{"{{info@fixture-body.co.uk}}", "info@fixture-body.co.uk"},
+		{"[(info@fixture.com)]", "info@fixture.com"},
+	}
+	for _, c := range cases {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok || len(rules) == 0 {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true) with rules", c.in, got, rules, ok, c.want)
+		}
+		assertCRM(t, got)
+		if again, _, _ := RepairCtx(got, Context{}); again != got {
+			t.Errorf("RepairCtx(%q) is not idempotent: %q then %q", c.in, got, again)
+		}
+	}
+
+	rejects := []string{
+		"jos\u00e9 maria@fixture.com",
+		"\u00fcnal kaya@fixture.de",
+		"xy@a.b c.it",
+		"x@sattva samadhi.com",
+		"mary beth smith msmith@gmail.com",
+		"mailto:prayerful touch massage@gmail.com",
+		"info@pilatesfixture@gmail.com",
+		"info@sales@fixture-mon.com",
+		"ab@fixture.dekb@fixture.de",
+	}
+	for _, in := range rejects {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !slices.Contains(rules, "syntax") {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want rules containing syntax and ok=false", in, got, rules, ok)
+		}
 	}
 }

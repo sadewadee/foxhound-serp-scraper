@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/text/unicode/norm"
@@ -329,9 +331,8 @@ const strictCut = ",<>;"
 
 // Whole-string repairs for normalizeSyntax and the list splitter for CleanList.
 var (
-	atSpaceRe     = regexp.MustCompile(`\s*(?:\(@\)|\[@\]|@)\s*`)
-	domainSpaceRe = regexp.MustCompile(`([-.])\s+`)
-	htmlTagRe     = regexp.MustCompile(`(?i)</?[a-z][^<>@]*>`)
+	atSpaceRe = regexp.MustCompile(`\s*(?:\(@\)|\[@\]|@)\s*`)
+	htmlTagRe = regexp.MustCompile(`(?i)</?[a-z][^<>@]*>`)
 	// separatorEscRe and listSepRe mark where a field holding several addresses
 	// is split: encoded separators, and ":", '">' and "&cc=" style joins.
 	separatorEscRe = regexp.MustCompile(`(?i)%(?:20|09|0a|0d|2c|3b)`)
@@ -361,13 +362,15 @@ func labelWord(tok string) string {
 	return strings.TrimRight(strings.TrimLeftFunc(tok, func(r rune) bool { return !isAlnumRune(r) }), ":.")
 }
 
-// trimWrap strips one leading "[", "(" or "{" and one trailing "]", ")" or "}".
+// trimWrap strips wrapper characters from both ends, repeatedly, so "{{x@y.com}}"
+// and "[(x@y.com)]" both come out bare.
 func trimWrap(s string) string {
-	if s != "" && strings.IndexByte("[({", s[0]) >= 0 {
-		s = s[1:]
-	}
-	if s != "" && strings.IndexByte("])}", s[len(s)-1]) >= 0 {
-		s = s[:len(s)-1]
+	for s != "" && (strings.IndexByte("[({", s[0]) >= 0 || strings.IndexByte("])}", s[len(s)-1]) >= 0) {
+		if strings.IndexByte("[({", s[0]) >= 0 {
+			s = s[1:]
+		} else {
+			s = s[:len(s)-1]
+		}
 	}
 	return s
 }
@@ -393,6 +396,57 @@ func collapseDoubled(s string) string {
 	return s
 }
 
+// lastLabel returns the text after the last dot of s.
+func lastLabel(s string) string {
+	return s[strings.LastIndexByte(s, '.')+1:]
+}
+
+// joinDomainSpaces removes whitespace inside a domain after "-", and after "."
+// unless the label before that dot is a TLD ("pec.rupar. puglia.it" joins,
+// "fixture.com. phone" keeps its space).
+func joinDomainSpaces(d string) string {
+	var b strings.Builder
+	for i := 0; i < len(d); i++ {
+		b.WriteByte(d[i])
+		if d[i] != '-' && d[i] != '.' {
+			continue
+		}
+		j := i + 1
+		for j < len(d) && (d[j] == ' ' || d[j] == '\t') {
+			j++
+		}
+		if j == i+1 || j == len(d) {
+			continue
+		}
+		if l := lastLabel(d[:i]); d[i] == '.' && l != "" && IsTLD(l) {
+			continue
+		}
+		i = j - 1
+	}
+	return b.String()
+}
+
+// trimTrailingText cuts a domain at the first whitespace left after joining,
+// but only when the text before it ends in a TLD ("fixture.com. phone").
+func trimTrailingText(d string) string {
+	j := strings.IndexAny(d, " \t")
+	if j < 0 {
+		return d
+	}
+	head := strings.TrimRight(d[:j], ".")
+	if l := lastLabel(head); l != "" && IsTLD(l) {
+		return head
+	}
+	return d
+}
+
+// isPunctRune reports whether the last rune of s is neither a letter, a digit
+// nor a space, so a space after it separates a label ("✉ info", "• info").
+func isPunctRune(s string) bool {
+	r, _ := utf8.DecodeLastRuneInString(s)
+	return r != ' ' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+}
+
 // tidyParts applies the whole-string repairs of normalizeSyntax: spacing around
 // "@", HTML tags, bracket wrappers, a leading "@", doubled parts and spacing
 // inside the domain.
@@ -406,7 +460,7 @@ func tidyParts(s string) string {
 	s = collapseDoubled(s)
 	if strings.Count(s, "@") == 1 {
 		i := strings.IndexByte(s, '@')
-		s = s[:i+1] + domainSpaceRe.ReplaceAllString(s[i+1:], "$1")
+		s = s[:i+1] + trimTrailingText(joinDomainSpaces(s[i+1:]))
 	}
 	return s
 }
@@ -454,7 +508,7 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 			isCut = i == 0
 		case c == ' ':
 			// A space after punctuation separates a label ("studio berlin - info").
-			isCut = prefixWords[local[:i]] || (i > 0 && local[i-1] < 0x80 && !isAlnum(local[i-1]) && local[i-1] != ' ')
+			isCut = prefixWords[local[:i]] || (i > 0 && isPunctRune(local[:i]))
 		}
 		if !isCut {
 			continue
@@ -476,7 +530,7 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 	// ambiguous and stays as it is (rejected later by the final check).
 	if i := strings.LastIndexByte(local, ' '); i > 0 {
 		tok := local[strings.LastIndexByte(local[:i], ' ')+1 : i]
-		if prefixWords[labelWord(tok)] || (tok != "" && tok[len(tok)-1] < 0x80 && !isAlnum(tok[len(tok)-1])) {
+		if prefixWords[labelWord(tok)] || (tok != "" && isPunctRune(tok)) {
 			local, wrapped = strings.TrimSpace(local[i+1:]), true
 		}
 	}
