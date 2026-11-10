@@ -551,3 +551,75 @@ func TestRepairLinkedEvidence(t *testing.T) {
 		t.Errorf("RepairCtx(gaelkm@yahoo.comfacebook.com) with Exists only = (%q, _, true), want ok=false", got)
 	}
 }
+
+// TestRepairFixedPoint: one RepairCtx call gives what a second call would.
+func TestRepairFixedPoint(t *testing.T) {
+	team := Context{
+		Exists:       func(e string) bool { return e == "team@fixture.org" },
+		ExistsLinked: func(e string) bool { return e == "team@fixture.org" },
+	}
+	for _, c := range []struct {
+		in, want string
+		ctx      Context
+		ok       bool
+	}{
+		{"8001151emailinfo@fixture.org", "info@fixture.org", Context{}, true},
+		{"24504800-934-9410emailteam@fixture.org", "team@fixture.org", team, true},
+		{"+4912345678email@fixture.org", "email@fixture.org", Context{}, false},
+		{"+4912345678name@fixture.org", "name@fixture.org", Context{}, false},
+	} {
+		got, rules, ok := RepairCtx(c.in, c.ctx)
+		if got != c.want || ok != c.ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, %v)", c.in, got, rules, ok, c.want, c.ok)
+		}
+		if slices.Contains(rules, "label") != (c.in != "+4912345678email@fixture.org" && c.in != "+4912345678name@fixture.org") {
+			t.Errorf("RepairCtx(%q) rules = %v, unexpected label rule state", c.in, rules)
+		}
+	}
+
+	// Property: repairing the output changes nothing, for every input the tables use.
+	inputs := []string{
+		"8001151emailinfo@fixture.org", "24504800-934-9410emailteam@fixture.org", "+4912345678email@fixture.org",
+		"info@fixture.comwebsitewww.fixture.com", "info@fixture.dewebsitefixture.de", "info@fixture.comfacebook.com",
+		"info@fixture.cominstagraminstagram.com", "info@fixture.live.com.aufacebook.com", "info@fixture.comview",
+		"+1-212-555-7575info@studio.com", "9346082info@yahoo.com", "201010.01mark@yahoo.com", "emailteam@fixture.org",
+		"gaelkm@yahoo.comfacebook.com", "anna@acmeyoga.comacmeyoga.com", "hello@liveingermany.de/",
+	}
+	ctxs := []Context{{}, team,
+		{Exists: func(string) bool { return true }},
+		{ExistsLinked: func(e string) bool { return e == "mark@yahoo.com" || e == "gaelkm@yahoo.com" }}}
+	for _, in := range inputs {
+		for i, c := range ctxs {
+			once, _, ok1 := RepairCtx(in, c)
+			twice, rules2, ok2 := RepairCtx(once, c)
+			// A rejected repair (ok=false) is not applied, so only its string must be stable.
+			if once != twice || (ok1 && (!ok2 || len(rules2) != 0)) {
+				t.Errorf("not a fixed point (ctx %d): %q -> %q -> %q (%v) ok %v/%v", i, in, once, twice, rules2, ok1, ok2)
+			}
+		}
+	}
+}
+
+// TestRepairWebSocialGlue: web or social text after a TLD is cut; real domains that
+// merely contain a web word are not.
+func TestRepairWebSocialGlue(t *testing.T) {
+	for in, want := range map[string]string{
+		"info@fixture.comwebsitewww.fixture.com": "info@fixture.com",
+		"info@fixture.dewebsitefixture.de":       "info@fixture.de",
+		"info@fixture.comfacebook.com":           "info@fixture.com",
+		"info@fixture.cominstagraminstagram.com": "info@fixture.com",
+		"info@fixture.live.com.aufacebook.com":   "info@fixture.live.com.au",
+	} {
+		got, _, ok := RepairCtx(in, Context{})
+		if got != want || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, _, %v), want (%q, _, true)", in, got, ok, want)
+		}
+		assertCRM(t, got)
+	}
+	for _, in := range []string{"info@tmweb.ru", "info@infoweb.ne.jp", "post@fixture.nowebbladfixtureoslo.no"} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}
