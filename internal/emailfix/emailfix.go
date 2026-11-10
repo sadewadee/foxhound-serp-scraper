@@ -297,6 +297,37 @@ var midFreeMail = map[string]bool{
 	"163.com": true, "naver.com": true, "hanmail.net": true, "mail.ru": true,
 }
 
+// glueLead matches a local part that opens with a glued phone or code run and
+// then continues; group 1 is the continuation.
+var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
+
+// domainGlue matches a TLD or a short label glued to a provider name in a domain
+// ("msn.comyahoo.com.sa", "yahoo.com.hkhotmail.com"). "live", "ymail" are left out.
+var domainGlue = regexp.MustCompile(`(^|\.)(com|net|org|edu|gov|[a-z]{2})(gmail|googlemail|yahoo|hotmail|outlook|msn|aol|icloud|gmx)(\.|$)`)
+
+// webHostLocal matches a web or mail host left inside the local part: a "www."
+// label, or a provider domain that starts the local part or follows a non-alnum
+// character. Such a local part is text from the neighbouring domain, never a mailbox.
+var webHostLocal = regexp.MustCompile(`www\.|(^|[^a-z0-9])(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|aol|icloud|gmx)\.(com|net|de|fr|it|es|co)`)
+
+// glueVouched reports whether stripped, the local part after a glued run, is
+// confirmed by the cut-off tail: one of its labels (not "www") or the tail itself.
+// Without that evidence the start of the address is unknown.
+func glueVouched(stripped, tail, domain string) bool {
+	if len(stripped) < 2 || !gmailOK(stripped, domain) {
+		return false
+	}
+	if stripped == tail || stripped == strings.TrimPrefix(tail, "www.") {
+		return true
+	}
+	for _, l := range strings.Split(tail, ".") {
+		if l != "www" && l == stripped {
+			return true
+		}
+	}
+	return false
+}
+
 // cutMidDomain handles text between two domains ("gmail.comfacebookfacebook.com"):
 // it cuts a non-final label back to an ICANN TLD prefix, at the first label where
 // the result is vouched for (a free-mail provider, the listing's domain, or an
@@ -318,7 +349,10 @@ func cutMidDomain(local, domain string, c Context) string {
 			d := strings.Join(labels[:j], ".") + "." + label[:n]
 			rest := label[n:] + "." + strings.Join(labels[j+1:], ".")
 			signal := strings.Contains(rest, "www") || strings.Contains(rest, labels[0])
-			if (n >= 3 || signal) && (midFreeMail[d] || c.ownDomain(d) || c.exists(local+"@"+d)) {
+			// A leftover that starts with "www." or repeats the first label is glue
+			// on its own, so the cut needs no vouching.
+			glue := strings.HasPrefix(rest, "www.") || strings.HasPrefix(rest, labels[0]+".")
+			if (n >= 3 || signal) && (glue || midFreeMail[d] || c.ownDomain(d) || c.exists(local+"@"+d)) {
 				return d
 			}
 		}
@@ -463,6 +497,20 @@ func spansSuffix(head, next string) bool {
 // "✉", "-" or "|" is a separator and "anna-" is not.
 func noLetterOrDigit(s string) bool {
 	return strings.IndexFunc(s, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) < 0
+}
+
+// cutEvidence reports whether a result after a domain cut is trusted: the address
+// exists on its own, the local part is a label or the domain of the cut-off tail,
+// or it is a role word on a domain that is not free-mail. Anything else may be
+// text from either side of the glue, so it is rejected.
+func cutEvidence(local, fixed, tail, domain string, c Context) bool {
+	// A linked address is ownership evidence on any domain. A plain existing
+	// address counts on free-mail only with a distinctive local part.
+	existsOK := c.linked(fixed) || (c.exists(fixed) && (!isFreeMail(domain) || len(strings.ReplaceAll(local, ".", "")) >= 8))
+	if existsOK || glueVouched(local, tail, domain) {
+		return true
+	}
+	return syntaxRoles[local] && !isFreeMail(domain)
 }
 
 // tidyParts applies the whole-string repairs of normalizeSyntax: spacing around
@@ -670,14 +718,30 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 	local, domain := s[:at], s[at+1:]
 
+	fullDomain := domain
 	if d := cutGluedTLD(domain); d != domain {
 		domain, rules = d, append(rules, "tld")
 	} else if d := cutMidDomain(local, domain, c); d != domain {
 		domain, rules = d, append(rules, "middomain")
 	}
 
+	// cut is true when a tld or middomain rule trimmed the domain. Then the left
+	// boundary is trusted only with evidence (see cutEvidence).
+	tail := fullDomain[len(domain):]
+	cut := domain != fullDomain && !noLetterOrDigit(tail)
+
 	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 		local, rules = l, append(rules, "phone")
+		if isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 && !c.linked(local+"@"+domain) {
+			// On free-mail any short remainder is likely another person's mailbox,
+			// role words included: "info" is generic only on a business domain. A linked
+			// address for this listing is the exception.
+			return local + "@" + domain, rules, false
+		}
+	} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
+		// A glued run before the local part is stripped only when the tail vouches
+		// for the rest.
+		local, rules = m[1], append(rules, "phone")
 	} else if l, hit := stripLabel(local, domain, c); hit {
 		local, rules = l, append(rules, "label")
 	} else if l, hit := stripPlaceGlue(local, domain, c); hit {
@@ -685,6 +749,14 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 
 	fixed = local + "@" + domain
+	// Checked on the final local part, after every rule, and before the evidence
+	// check: an existing row cannot vouch for a host embedded in the local part.
+	if webHostLocal.MatchString(local) || domainGlue.MatchString(domain) {
+		return fixed, rules, false
+	}
+	if cut && !cutEvidence(local, fixed, tail, domain, c) {
+		return fixed, rules, false
+	}
 	// A CRM-invalid result that no rule fixed is still flagged, so repair-emails
 	// marks the row malformed instead of leaving it exportable. This runs before
 	// the short-local return so "c@-.at" is rejected too.

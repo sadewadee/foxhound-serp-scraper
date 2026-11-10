@@ -349,3 +349,205 @@ func TestRepairSyntaxRound5(t *testing.T) {
 		}
 	}
 }
+
+func TestRepairGlueBoundary(t *testing.T) {
+	// G2: the leftover after a mid-domain cut is glue on its own ("www." or the
+	// first label repeated). G1: a glued phone or code run in front of the local
+	// part is stripped only when the cut-off tail confirms the remainder.
+	cases := []struct {
+		in, want string
+	}{
+		// A: domain still glued after a phone strip.
+		{"555-1234info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		{"555-123-4567info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		{"emailcontact@acmeyoga.comwww.acmeyoga.com", "contact@acmeyoga.com"},
+		{"acme@acme.lvwww.acme.lv", "acme@acme.lv"},
+		// The phone rule strips these first; G1 is not reached.
+		{"5551234info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		{"33693773info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		// B: domain glue cut, left boundary confirmed by the tail.
+		{"0612345678studioname@gmail.comstudioname.org", "studioname@gmail.com"},
+		{"8123456789studio.yoga@gmail.comstudio.yoga", "studio.yoga@gmail.com"},
+		{"ltd0612345678brandname@gmail.combrandname.lk", "brandname@gmail.com"},
+		// Negatives: no domain cut, or no glue, so nothing changes.
+		{"123john@gmail.com", "123john@gmail.com"},
+		{"xy@mail.company.com", "xy@mail.company.com"},
+		{"xy@live.mercer.edu", "xy@live.mercer.edu"},
+		{"info@sub.acmeyoga.com", "info@sub.acmeyoga.com"},
+	}
+	for _, c := range cases {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true)", c.in, got, rules, ok, c.want)
+		}
+		assertCRM(t, got)
+		if again, rules2, _ := RepairCtx(got, Context{}); again != got || len(rules2) != 0 {
+			t.Errorf("RepairCtx(%q) is not idempotent: %q then %q (rules %v)", c.in, got, again, rules2)
+		}
+	}
+
+	// Ambiguous left boundary: the tail does not confirm the text, so ok=false.
+	// The cut rule stays in rules so repair-emails rejects the row.
+	rejects := []string{
+		"0612345678coachanna@gmail.comwww.facebook.com",
+		"2010boardmembers@hotmail.comother.kw",
+		"ltd0612345678brandname@gmail.comwww.facebook.com",
+		// Four digits are below the phone rule; no evidence in the tail.
+		"6789info@internetspeedtest.prointernetspeedtest.pro",
+		// Left part is not vouched by the tail and is not a role word on a non-free domain.
+		"0612345678anna@acmeyoga.comwww.acmeyoga.com",
+		"lee@studio-one.netwww.other-site.net",
+		"201010.01anna@yahoo.commsn.com",
+		"10.01carlos@msn.commsn.com",
+		"hotmail.comaol.com@mac.commac.com",
+		"korea+82-2-1234-5678acme_korea@acmespace.comwww.acme.co.kr",
+		"info@yahoo.comwww.acme.com",
+		"cakesanna.smith@acmecakes.comacmecakes.com",
+	}
+	for _, in := range rejects {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !(slices.Contains(rules, "middomain") || slices.Contains(rules, "tld")) {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want ok=false with a domain-cut rule", in, got, rules, ok)
+		}
+	}
+
+	// Evidence from the context accepts a cut: the address exists on its own.
+	got, rules, ok := RepairCtx("anna@acmeyoga.comacmeyoga.com", Context{Exists: set("anna@acmeyoga.com")})
+	if got != "anna@acmeyoga.com" || !ok || !slices.Contains(rules, "middomain") {
+		t.Errorf("RepairCtx with Exists = (%q, %v, %v), want anna@acmeyoga.com ok with middomain", got, rules, ok)
+	}
+	assertCRM(t, got)
+}
+
+// TestRepairWebHostLocal: a web or mail host left inside the final local part makes
+// the result ok=false, whether or not a rule fired and whether or not the address
+// exists. Words that only contain a host name (olive.com, live.music) stay ok.
+func TestRepairWebHostLocal(t *testing.T) {
+	rejects := []string{
+		"561.267.6131www.acme.comacme@gmail.com",
+		"758-8818www.acmefh.comlebanon@acmefh.com",
+		"u003ewww.acmeactors@yahoo.com",
+		"yahoo.cominfo@acmepractice.comacme.clinic",
+		"www.acme@yahoo.com",
+		"acme.gmail.comx@acme.com",
+	}
+	for _, in := range rejects {
+		got, _, ok := RepairCtx(in, Context{})
+		if ok {
+			t.Errorf("RepairCtx(%q) = (%q, _, true), want ok=false", in, got)
+		}
+	}
+
+	// The merge target exists in the database, which is evidence (a) for a cut.
+	// The web host check still rejects it.
+	const merge = "gmail.comgmail.com@hotmail.comhotmail.com"
+	if got, _, ok := RepairCtx(merge, Context{Exists: func(string) bool { return true }}); ok {
+		t.Errorf("RepairCtx(%q) with Exists = (%q, _, true), want ok=false", merge, got)
+	}
+
+	stays := []string{
+		"olive.combs@acme.com",
+		"decrypt.computer@gmail.com",
+		"live.music@acmeband.com",
+		"me.frederic@protonmail.com",
+		"web.team@acme.com",
+		"info@acme.com",
+		"anna.yahoo@acme.com",
+	}
+	for _, in := range stays {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+		assertCRM(t, got)
+	}
+}
+
+// TestRepairRound6d covers trailing punctuation, the free-mail phone remainder,
+// existence on free-mail, and a provider glued to a TLD in the domain.
+func TestRepairRound6d(t *testing.T) {
+	// Trailing punctuation after a valid domain is not a cut.
+	for in, want := range map[string]string{
+		"jmkeif@gmail.com/":  "jmkeif@gmail.com",
+		"a.person@acme.net|": "a.person@acme.net",
+	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != want || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true)", in, got, rules, ok, want)
+		}
+		assertCRM(t, got)
+	}
+	split := CleanList([]string{"jmkeif@gmail.com/ sklever@acmeymca.org"})
+	if !slices.Equal(split, []string{"jmkeif@gmail.com", "sklever@acmeymca.org"}) {
+		t.Errorf("CleanList split = %q, want both pieces", split)
+	}
+
+	// Phone strip on free-mail with a short remainder: rejected, phone kept in rules.
+	// "info" is a role word, but it is generic only on a business domain.
+	for _, in := range []string{"201010.01mark@yahoo.com", "800010.01219morgan@hotmail.com", "966-7660bjesup@aol.com", "9346082info@yahoo.com"} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !slices.Contains(rules, "phone") {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want ok=false with phone rule", in, got, rules, ok)
+		}
+	}
+	// Distinctive remainders on free-mail, and any remainder on a business domain, are accepted.
+	for in, want := range map[string]string{
+		"417-2648chayilcots@gmail.com":   "chayilcots@gmail.com",
+		"4-2536-3512rgartside@gmail.com": "rgartside@gmail.com",
+		"849-6789info@acmedesign.com":    "info@acmedesign.com",
+		"9346082info.acmeyoga@yahoo.com": "info.acmeyoga@yahoo.com",
+	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != want || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true)", in, got, rules, ok, want)
+		}
+		assertCRM(t, got)
+	}
+
+	// Existence on free-mail counts only with a distinctive local part.
+	exists := Context{Exists: func(string) bool { return true }}
+	if got, _, ok := RepairCtx("anna@yahoo.comyahoo.com", exists); ok {
+		t.Errorf("RepairCtx(anna@yahoo.comyahoo.com) with Exists = (%q, _, true), want ok=false", got)
+	}
+	if got, _, ok := RepairCtx("annasmith77@yahoo.comyahoo.com", exists); !ok || got != "annasmith77@yahoo.com" {
+		t.Errorf("RepairCtx(annasmith77@yahoo.comyahoo.com) with Exists = (%q, _, %v), want ok", got, ok)
+	}
+	if got, _, ok := RepairCtx("anna@acmeyoga.comacmeyoga.com", exists); !ok || got != "anna@acmeyoga.com" {
+		t.Errorf("RepairCtx(anna@acmeyoga.comacmeyoga.com) with Exists = (%q, _, %v), want ok", got, ok)
+	}
+
+	// Provider glued to a TLD or a short label in the domain: rejected.
+	for _, in := range []string{"arif@msn.comyahoo.com.sa", "hong@yahoo.com.hkhotmail.com", "johnbrown@att.netaol.com"} {
+		if got, rules, ok := RepairCtx(in, Context{}); ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, true), want ok=false", in, got, rules)
+		}
+	}
+	// Words that only contain a provider name stay ok.
+	for _, in := range []string{"xy@nysgmail.com", "xy@sifymail.com", "xy@huaweicloud.com", "xy@golive.com", "xy@triblive.com", "xy@hiergmx.de"} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}
+
+// TestRepairLinkedEvidence: a linked address (exists and linked to this listing) is
+// ownership evidence on free-mail too. A plain existing address is not.
+func TestRepairLinkedEvidence(t *testing.T) {
+	linked := Context{ExistsLinked: func(e string) bool { return e == "mark@yahoo.com" || e == "gaelkm@yahoo.com" }}
+	existsOnly := Context{Exists: func(e string) bool { return e == "gaelkm@yahoo.com" }}
+
+	if got, rules, ok := RepairCtx("201010.01mark@yahoo.com", linked); !ok || got != "mark@yahoo.com" {
+		t.Errorf("RepairCtx(201010.01mark@yahoo.com) with ExistsLinked = (%q, %v, %v), want mark@yahoo.com ok", got, rules, ok)
+	}
+	if got, _, ok := RepairCtx("201010.01mark@yahoo.com", Context{}); ok {
+		t.Errorf("RepairCtx(201010.01mark@yahoo.com) empty context = (%q, _, true), want ok=false", got)
+	}
+
+	if got, rules, ok := RepairCtx("gaelkm@yahoo.comfacebook.com", linked); !ok || got != "gaelkm@yahoo.com" {
+		t.Errorf("RepairCtx(gaelkm@yahoo.comfacebook.com) with ExistsLinked = (%q, %v, %v), want gaelkm@yahoo.com ok", got, rules, ok)
+	}
+	if got, _, ok := RepairCtx("gaelkm@yahoo.comfacebook.com", existsOnly); ok {
+		t.Errorf("RepairCtx(gaelkm@yahoo.comfacebook.com) with Exists only = (%q, _, true), want ok=false", got)
+	}
+}

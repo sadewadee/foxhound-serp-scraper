@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/sadewadee/serp-scraper/internal/emailfix"
@@ -42,5 +43,68 @@ func TestClassifySplit(t *testing.T) {
 				t.Errorf("classify(%q) reject without rules: a rejected row must carry a rule so it is marked malformed", c.in)
 			}
 		})
+	}
+}
+
+// TestClassifyCutEvidence: a domain cut is accepted only with evidence. The
+// Exists stub records which addresses were looked up.
+func TestClassifyCutEvidence(t *testing.T) {
+	const in = "anna@acmeyoga.comacmeyoga.com"
+	const want = "anna@acmeyoga.com"
+
+	var asked []string
+	recorder := func(known string) func(string) bool {
+		return func(e string) bool {
+			asked = append(asked, e)
+			return e == known
+		}
+	}
+
+	fixed, action, rules := classify(in, emailfix.Context{Exists: recorder("")})
+	if action != actReject || fixed != want {
+		t.Errorf("no evidence: classify(%q) = (%q, %q, %v), want (%q, %q, _)", in, fixed, action, rules, want, actReject)
+	}
+	if len(asked) == 0 || asked[len(asked)-1] != want {
+		t.Errorf("no evidence: Exists calls = %v, want a lookup of %q", asked, want)
+	}
+
+	asked = nil
+	fixed, action, _ = classify(in, emailfix.Context{Exists: recorder(want)})
+	if action != actUpdate || fixed != want {
+		t.Errorf("Exists true: classify(%q) = (%q, %q), want (%q, %q)", in, fixed, action, want, actUpdate)
+	}
+
+	fixed, action, _ = classify(in, emailfix.Context{})
+	if action != actReject || fixed != want {
+		t.Errorf("empty context: classify(%q) = (%q, %q), want (%q, %q)", in, fixed, action, want, actReject)
+	}
+}
+
+// TestClassifyPhoneShortLinked: a short free-mail remainder after a phone strip is
+// rejected unless the address is linked to this listing. The lookup must be
+// recorded so pass 1 asks the database for it.
+func TestClassifyPhoneShortLinked(t *testing.T) {
+	const in = "201010.01mark@yahoo.com"
+	const want = "mark@yahoo.com"
+
+	var asked []string
+	linkedStub := func(known string) func(string) bool {
+		return func(e string) bool {
+			asked = append(asked, e)
+			return e == known
+		}
+	}
+
+	fixed, action, rules := classify(in, emailfix.Context{ExistsLinked: linkedStub("")})
+	if action != actReject || fixed != want {
+		t.Errorf("not linked: classify(%q) = (%q, %q, %v), want (%q, %q, _)", in, fixed, action, rules, want, actReject)
+	}
+	if !slices.Contains(asked, want) {
+		t.Errorf("not linked: ExistsLinked calls = %v, want a lookup of %q", asked, want)
+	}
+
+	fixed, action, _ = classify(in, emailfix.Context{ExistsLinked: linkedStub(want)})
+	if action != actUpdate || fixed != want {
+		t.Errorf("linked: classify(%q) = (%q, %q), want (%q, %q)", in, fixed, action, want, actUpdate)
 	}
 }
