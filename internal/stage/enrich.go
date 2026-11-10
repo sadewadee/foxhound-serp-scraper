@@ -22,6 +22,7 @@ import (
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
 	"github.com/sadewadee/serp-scraper/internal/directory"
+	"github.com/sadewadee/serp-scraper/internal/emailfix"
 	"github.com/sadewadee/serp-scraper/internal/feeder"
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
 )
@@ -701,7 +702,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 				status = 'completed', raw_emails = $1, raw_phones = $2, raw_social = $3,
 				completed_at = NOW(), updated_at = NOW()
 			WHERE url_hash = $4`,
-				pq.Array(allEmails), pq.Array(allPhones), socialJSON, urlHash)
+				pq.Array(emailfix.CleanList(allEmails)), pq.Array(allPhones), socialJSON, urlHash)
 
 			redisClient.Del(ctx, "enrich:lock:"+urlHash)
 			c.emailsFound.Add(int64(len(allEmails)))
@@ -740,7 +741,7 @@ func (c *EnrichStage) worker(ctx context.Context, workerID int) {
 			raw_tiktok = $15, raw_youtube = $16, raw_telegram = $17,
 			locked_by = NULL, completed_at = NOW(), updated_at = NOW()
 		WHERE url_hash = $18`,
-			pq.Array(emails), pq.Array(phones), socialJSON,
+			pq.Array(emailfix.CleanList(emails)), pq.Array(phones), socialJSON,
 			// sanitizeUTF8 on every scraped text field — a single invalid byte
 			// (Latin-1 / mojibake from a mislabeled page) made the whole UPDATE
 			// fail with 'invalid byte sequence for encoding UTF8', stranding a

@@ -15,6 +15,7 @@ import (
 	"github.com/lib/pq"
 
 	appdb "github.com/sadewadee/serp-scraper/internal/db"
+	"github.com/sadewadee/serp-scraper/internal/emailfix"
 	"github.com/sadewadee/serp-scraper/internal/query"
 )
 
@@ -681,7 +682,7 @@ func upsert(ctx context.Context, db *sql.DB, l Listing) error {
 		return fmt.Errorf("business_listings upsert: %w", err)
 	}
 
-	for _, email := range l.Emails {
+	for _, email := range emailfix.CleanList(l.Emails) {
 		at := strings.LastIndex(email, "@")
 		if at < 1 {
 			continue

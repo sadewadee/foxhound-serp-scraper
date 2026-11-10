@@ -74,6 +74,7 @@ import (
 	"github.com/lib/pq"
 
 	appdb "github.com/sadewadee/serp-scraper/internal/db"
+	"github.com/sadewadee/serp-scraper/internal/emailfix"
 	"github.com/sadewadee/serp-scraper/internal/prodir"
 )
 
@@ -622,15 +623,17 @@ func upsertEntry(db *sql.DB, e *entry) error {
 		return err
 	}
 
-	if e.email == "" {
+	clean := emailfix.CleanList([]string{e.email})
+	if len(clean) == 0 {
 		return nil
 	}
-	at := strings.LastIndex(e.email, "@")
+	email := clean[0]
+	at := strings.LastIndex(email, "@")
 	if at < 1 {
 		return nil
 	}
-	emailDomain := strings.ToLower(e.email[at+1:])
-	localPart := e.email[:at]
+	emailDomain := email[at+1:]
+	localPart := email[:at]
 
 	var emailID int64
 	err = db.QueryRow(`
@@ -638,7 +641,7 @@ func upsertEntry(db *sql.DB, e *entry) error {
 		VALUES ($1,$2,$3,$4,NOW())
 		ON CONFLICT (email) DO UPDATE SET domain = EXCLUDED.domain
 		RETURNING id`,
-		strings.ToLower(e.email), emailDomain, localPart, freeMail[emailDomain],
+		email, emailDomain, localPart, freeMail[emailDomain],
 	).Scan(&emailID)
 	if err != nil {
 		return fmt.Errorf("emails upsert: %w", err)

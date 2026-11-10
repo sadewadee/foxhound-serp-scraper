@@ -41,7 +41,8 @@ func TestRepair(t *testing.T) {
 		{"Info@Studio.com", "info@studio.com", false, true},
 		// Unrecoverable.
 		{"nodomain", "nodomain", false, false},
-		{"info@studio", "info@studio", false, false},
+		// CRM-invalid and unrepairable: carries the "syntax" rule so repair-emails marks it malformed.
+		{"info@studio", "info@studio", true, false},
 		{"ameliahgroves@gmail.comn", "ameliahgroves@gmail.com", true, true},
 		{"info@studio.zzzzqq", "info@studio.zzzzqq", false, false},
 		{"a@b.com", "a@b.com", false, false},                                               // local part too short
@@ -49,13 +50,17 @@ func TestRepair(t *testing.T) {
 		{"aaron@gmail.com.archive", "aaron@gmail.com.archive", false, false},               // ".archi" would be a wrong guess
 		{"paint@gmail.coom", "paint@gmail.coom", false, false},
 		{"hello@liveingermany.de/", "hello@liveingermany.de", true, true},
-		{"in fo@x.com", "in fo@x.com", false, false},
+		// CRM-invalid and unrepairable: carries the "syntax" rule so repair-emails marks it malformed.
+		{"in fo@x.com", "in fo@x.com", true, false},
 		{"+1-212-555-7575@x.com", "+1-212-555-7575@x.com", false, true}, // no letter after the run: left alone
 	}
 	for _, c := range cases {
 		got, changed, ok := Repair(c.in)
 		if got != c.want || changed != c.changed || ok != c.ok {
 			t.Errorf("Repair(%q) = (%q, %v, %v), want (%q, %v, %v)", c.in, got, changed, ok, c.want, c.changed, c.ok)
+		}
+		if ok {
+			assertCRM(t, got)
 		}
 	}
 }
@@ -134,6 +139,9 @@ func TestRepairCtx(t *testing.T) {
 			got, rules, ok := RepairCtx(c.in, c.ctx)
 			if got != c.want || strings.Join(rules, "+") != c.rules || !ok {
 				t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, %q, true)", c.in, got, rules, ok, c.want, c.rules)
+			}
+			if ok {
+				assertCRM(t, got)
 			}
 		})
 	}
