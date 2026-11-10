@@ -14,6 +14,8 @@ func TestClassifySplit(t *testing.T) {
 		{"only valid pieces kept", "anna@x-a.de, .kowalski@uni-a.pl", "anna@x-a.de", actSplit},
 		{"all pieces invalid rejected", ".kowalski@uni-a.pl; ..jdoe1977@aol.com", ".kowalski@uni-a.pl; ..jdoe1977@aol.com", actReject},
 		{"double at rejected", "info@@studio-a.de", "info@@studio-a.de", actReject},
+		{"encoded comma split", "ab@x-a.com,%20cd@y-b.org", "ab@x-a.com;cd@y-b.org", actSplit},
+		{"one letter local with bad tld rejected", "c@-.at", "c@-.at", actReject},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -68,6 +68,61 @@ func TestRepairSyntax(t *testing.T) {
 			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true) with rules", c.in, got, rules, ok, c.want)
 		}
 		assertCRM(t, got)
+		if again, _, _ := RepairCtx(got, Context{}); again != got {
+			t.Errorf("RepairCtx(%q) is not idempotent: %q then %q", c.in, got, again)
+		}
+	}
+}
+
+func TestRepairSyntaxRound2(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		// Spacing around "@" and inside the domain.
+		{"info @studio-a.de", "info@studio-a.de"},
+		{"info@ studio-a.de", "info@studio-a.de"},
+		{"info@studio- berlin.de", "info@studio-berlin.de"},
+		{"info@studio. berlin.de", "info@studio.berlin.de"},
+		// Brackets, a leading "@", HTML tags, doubled parts.
+		{"(info@studio-a.de)", "info@studio-a.de"},
+		{"[info@studio-a.de]", "info@studio-a.de"},
+		{"@info@studio-a.de", "info@studio-a.de"},
+		{"<p>info@studio-a.de</p>", "info@studio-a.de"},
+		{"info@info@studio-a.de", "info@studio-a.de"},
+		{"info@studio-a.deinfo@studio-a.de", "info@studio-a.de"},
+		{"anna.berg@gmail@gmail.com", "anna.berg@gmail.com"},
+		// Leading dot on a role local, and an escaped role local.
+		{".info@studio-a.de", "info@studio-a.de"},
+		{"%69nfo@studio-a.de", "info@studio-a.de"},
+	}
+	for _, c := range cases {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok || len(rules) == 0 {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true) with rules", c.in, got, rules, ok, c.want)
+		}
+		assertCRM(t, got)
+		if again, _, _ := RepairCtx(got, Context{}); again != got {
+			t.Errorf("RepairCtx(%q) is not idempotent: %q then %q", c.in, got, again)
+		}
+	}
+
+	rejects := []string{
+		// Protection artifact, and an escaped non-role local.
+		"protect.info@studio-a.de",
+		"%61nna@studio-a.de",
+		// A one-letter local with a CRM-invalid domain is flagged, not kept.
+		"c@-.at",
+	}
+	for _, in := range rejects {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !slices.Contains(rules, "syntax") {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want rules containing syntax and ok=false", in, got, rules, ok)
+		}
+	}
+
+	// A one-letter local with a valid domain keeps the #104 result: not ok, no rule.
+	if got, rules, ok := RepairCtx("c@gmail-fixture.com", Context{}); got != "c@gmail-fixture.com" || ok || len(rules) != 0 {
+		t.Errorf("RepairCtx(c@gmail-fixture.com) = (%q, %v, %v), want unchanged, no rules, ok=false", got, rules, ok)
 	}
 }
 
@@ -138,6 +193,9 @@ func TestCleanList(t *testing.T) {
 		{"double at is rejected", []string{"info@@studio-a.de"}, nil},
 		{"dedupe after repair", []string{"mailto:info@a-b.com", "info@a-b.com"}, []string{"info@a-b.com"}},
 		{"drops not ok", []string{"john@x-a.de", "nodomain", ""}, []string{"john@x-a.de"}},
+		{"comma and encoded space", []string{"anna@studio-a.de,%20office@studio-a.de"}, []string{"anna@studio-a.de", "office@studio-a.de"}},
+		{"colon join", []string{"info@studio-a.de:office@studio-a.de"}, []string{"info@studio-a.de", "office@studio-a.de"}},
+		{"cc join", []string{"info@studio-a.de&cc=office@studio-a.de"}, []string{"info@studio-a.de", "office@studio-a.de"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

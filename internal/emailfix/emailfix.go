@@ -327,6 +327,90 @@ func cutMidDomain(local, domain string, c Context) string {
 // text they mean the local part was continuing, so the address is ambiguous.
 const strictCut = ",<>;"
 
+// Whole-string repairs for normalizeSyntax and the list splitter for CleanList.
+var (
+	atSpaceRe     = regexp.MustCompile(`\s*(?:\(@\)|\[@\]|@)\s*`)
+	domainSpaceRe = regexp.MustCompile(`([-.])\s+`)
+	htmlTagRe     = regexp.MustCompile(`(?i)</?[a-z][^<>@]*>`)
+	// separatorEscRe and listSepRe mark where a field holding several addresses
+	// is split: encoded separators, and ":", '">' and "&cc=" style joins.
+	separatorEscRe = regexp.MustCompile(`(?i)%(?:20|09|0a|0d|2c|3b)`)
+	listSepRe      = regexp.MustCompile(`(?i):|["']>|&b?cc=|\?b?cc=`)
+	multiSep       = regexp.MustCompile(`[\s,;]+`)
+)
+
+// syntaxRoles are the role locals the syntax step trusts for leading-dot and
+// percent-escape repairs. prefixRoles stays as it is for stripPlaceGlue.
+var syntaxRoles = func() map[string]bool {
+	m := map[string]bool{
+		"biuro": true, "hola": true, "contato": true, "contacto": true,
+		"sales": true, "help": true, "enquiries": true,
+	}
+	for _, r := range prefixRoles {
+		m[r] = true
+	}
+	return m
+}()
+
+func isAlnumRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+}
+
+// labelWord reduces a label token such as "#email" or "email.:" to its word.
+func labelWord(tok string) string {
+	return strings.TrimRight(strings.TrimLeftFunc(tok, func(r rune) bool { return !isAlnumRune(r) }), ":.")
+}
+
+// trimWrap strips one leading "[", "(" or "{" and one trailing "]", ")" or "}".
+func trimWrap(s string) string {
+	if s != "" && strings.IndexByte("[({", s[0]) >= 0 {
+		s = s[1:]
+	}
+	if s != "" && strings.IndexByte("])}", s[len(s)-1]) >= 0 {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// collapseDoubled turns a doubled address or doubled "@" part back into one:
+// "info@fixture.deinfo@fixture.de", "x@gmail@gmail.com", "info@info@fixture.de".
+func collapseDoubled(s string) string {
+	if n := len(s); n > 0 && n%2 == 0 {
+		h := s[:n/2]
+		if h == s[n/2:] && strings.Count(h, "@") == 1 && cleanRe.MatchString(h) {
+			return h
+		}
+	}
+	parts := strings.Split(s, "@")
+	if len(parts) != 3 {
+		return s
+	}
+	l, a, d := parts[0], parts[1], parts[2]
+	switch {
+	case a == d, strings.HasPrefix(d, a+"."), l == a:
+		return l + "@" + d
+	}
+	return s
+}
+
+// tidyParts applies the whole-string repairs of normalizeSyntax: spacing around
+// "@", HTML tags, bracket wrappers, a leading "@", doubled parts and spacing
+// inside the domain.
+func tidyParts(s string) string {
+	s = atSpaceRe.ReplaceAllString(s, "@")
+	s = strings.TrimSpace(htmlTagRe.ReplaceAllString(s, " "))
+	s = trimWrap(s)
+	if strings.HasPrefix(s, "@") && strings.Count(s, "@") == 2 {
+		s = s[1:]
+	}
+	s = collapseDoubled(s)
+	if strings.Count(s, "@") == 1 {
+		i := strings.IndexByte(s, '@')
+		s = s[:i+1] + domainSpaceRe.ReplaceAllString(s[i+1:], "$1")
+	}
+	return s
+}
+
 // normalizeSyntax strips wrappers, prefixes and encoding from a raw address
 // without any context. It returns the cleaned lowercase address, whether it
 // changed, and ok=false for shapes whose real address cannot be recovered.
@@ -345,7 +429,7 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 		}
 		s = d
 	}
-	s = invisibleRunes.Replace(norm.NFKC.String(s))
+	s = tidyParts(invisibleRunes.Replace(norm.NFKC.String(s)))
 
 	at := strings.LastIndex(s, "@")
 	if at < 0 {
@@ -370,12 +454,13 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 			isCut = i == 0
 		case c == ' ':
 			// A space after punctuation separates a label ("studio berlin - info").
-			isCut = prefixWords[local[:i]] || (i > 0 && !isAlnum(local[i-1]) && local[i-1] != ' ')
+			isCut = prefixWords[local[:i]] || (i > 0 && local[i-1] < 0x80 && !isAlnum(local[i-1]) && local[i-1] != ' ')
 		}
 		if !isCut {
 			continue
 		}
-		if i > 0 && local[i-1] == '.' {
+		tok := local[strings.LastIndexByte(local[:i], ' ')+1 : i]
+		if i > 0 && local[i-1] == '.' && !(c == ':' && prefixWords[labelWord(tok)]) {
 			return orig, false, false // the local part was continuing
 		}
 		if i > 0 && strings.IndexByte(strictCut, c) >= 0 && isAlnum(local[i-1]) {
@@ -387,6 +472,14 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 		local, wrapped = local[cut+1:], true
 	}
 	local = strings.TrimSpace(local)
+	// The last whitespace decides: "via email x" keeps x, "mary beth smith x" is
+	// ambiguous and stays as it is (rejected later by the final check).
+	if i := strings.LastIndexByte(local, ' '); i > 0 {
+		tok := local[strings.LastIndexByte(local[:i], ' ')+1 : i]
+		if prefixWords[labelWord(tok)] || (tok != "" && tok[len(tok)-1] < 0x80 && !isAlnum(tok[len(tok)-1])) {
+			local, wrapped = strings.TrimSpace(local[i+1:]), true
+		}
+	}
 	for stripped := true; stripped; {
 		stripped = false
 		for _, p := range []string{"u003c", "u003e", "u0026"} {
@@ -398,12 +491,15 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 	if wrapped && (strings.HasPrefix(local, "mailto") || strings.HasPrefix(local, "email") || strings.HasPrefix(local, "e-mail")) {
 		return orig, false, false
 	}
-	if escLocal && !wrapped && !isRoleLocal(local) {
+	if strings.HasPrefix(local, "protect.") {
+		return orig, false, false // Cloudflare email-protection artifact
+	}
+	if escLocal && !wrapped && !syntaxRoles[local] {
 		return orig, false, false
 	}
 	if strings.HasPrefix(local, ".") {
 		core := strings.TrimLeft(local, ".")
-		if !isRoleLocal(core) {
+		if !syntaxRoles[core] {
 			return orig, false, false
 		}
 		local = core
@@ -437,10 +533,17 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 	return all, all != orig, true
 }
 
+// splitList breaks a field holding several addresses into candidate pieces.
+func splitList(e string) []string {
+	s := separatorEscRe.ReplaceAllString(e, " ")
+	s = htmlTagRe.ReplaceAllString(s, " ")
+	s = listSepRe.ReplaceAllString(s, " ")
+	return multiSep.Split(s, -1)
+}
+
 // CleanList repairs each address with Repair, drops the ones that are not ok,
-// and dedupes the rest keeping order. An input holding several addresses
-// separated by whitespace, commas or semicolons is split first; "@@" is never
-// split and is rejected.
+// and dedupes the rest keeping order. An input holding several addresses is
+// split first (see splitList); "@@" is never split and is rejected.
 func CleanList(emails []string) []string {
 	var out []string
 	seen := make(map[string]bool, len(emails))
@@ -453,7 +556,7 @@ func CleanList(emails []string) []string {
 	}
 	for _, e := range emails {
 		if strings.Count(e, "@") > 1 && !strings.Contains(e, "@@") {
-			for _, piece := range multiSep.Split(e, -1) {
+			for _, piece := range splitList(e) {
 				add(piece)
 			}
 			continue
@@ -462,8 +565,6 @@ func CleanList(emails []string) []string {
 	}
 	return out
 }
-
-var multiSep = regexp.MustCompile(`[\s,;]+`)
 
 // Repair is RepairCtx without context: only the phone and TLD rules can fire.
 func Repair(email string) (fixed string, changed bool, ok bool) {
@@ -504,15 +605,16 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 
 	fixed = local + "@" + domain
-	if len(local) < 2 {
-		return fixed, rules, false
-	}
 	// A CRM-invalid result that no rule fixed is still flagged, so repair-emails
-	// marks the row malformed instead of leaving it exportable.
+	// marks the row malformed instead of leaving it exportable. This runs before
+	// the short-local return so "c@-.at" is rejected too.
 	if strings.HasPrefix(local, ".") || strings.Contains(fixed, "..") || !cleanRe.MatchString(fixed) {
 		if !slices.Contains(rules, "syntax") {
 			rules = append(rules, "syntax")
 		}
+		return fixed, rules, false
+	}
+	if len(local) < 2 {
 		return fixed, rules, false
 	}
 	return fixed, rules, IsTLD(domain[strings.LastIndex(domain, ".")+1:])
