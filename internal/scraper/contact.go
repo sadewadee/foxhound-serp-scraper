@@ -12,10 +12,11 @@ import (
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
-	"golang.org/x/net/publicsuffix"
 
 	foxhound "github.com/sadewadee/foxhound"
 	"github.com/sadewadee/foxhound/parse"
+
+	"github.com/sadewadee/serp-scraper/internal/emailfix"
 )
 
 // tagRe matches any HTML tag; used to separate text of adjacent elements.
@@ -115,8 +116,8 @@ func ExtractContacts(body []byte) *ContactData {
 	// Post-filter: reject garbage that foxhound's regex picks up from raw HTML.
 	clean := func(r *foxhound.Response) (out []string) {
 		for _, e := range parse.ExtractEmails(r) {
-			e = strings.ToLower(strings.TrimSpace(e))
-			if e != "" && !isExtraBlocklisted(e) && isCleanEmail(e) {
+			e, _, ok := emailfix.Repair(e)
+			if ok && !isExtraBlocklisted(e) && isCleanEmail(e) {
 				out = append(out, e)
 			}
 		}
@@ -127,7 +128,7 @@ func ExtractContacts(body []byte) *ContactData {
 		glued := !slices.Contains(spaced, e) && slices.ContainsFunc(spaced, func(e2 string) bool {
 			return strings.HasSuffix(e, e2)
 		})
-		if !glued {
+		if !glued && !slices.Contains(cd.Emails, e) {
 			cd.Emails = append(cd.Emails, e)
 		}
 	}
@@ -145,7 +146,11 @@ func ExtractContacts(body []byte) *ContactData {
 			continue
 		}
 		e := strings.ToLower(v)
-		if hrefEmailRe.MatchString(e) && !isExtraBlocklisted(e) && isCleanEmail(e) && !slices.Contains(cd.Emails, e) {
+		if !hrefEmailRe.MatchString(e) {
+			continue
+		}
+		e, _, ok := emailfix.Repair(e)
+		if ok && !isExtraBlocklisted(e) && isCleanEmail(e) && !slices.Contains(cd.Emails, e) {
 			cd.Emails = append(cd.Emails, e)
 		}
 	}
@@ -548,9 +553,8 @@ func extractJSONLD(resp *foxhound.Response, cd *ContactData) {
 
 		// Extract email/phone from JSON-LD if not already found.
 		if len(cd.Emails) == 0 {
-			if email, ok := ld["email"].(string); ok && email != "" {
-				email = strings.ToLower(strings.TrimSpace(email))
-				if !isExtraBlocklisted(email) {
+			if raw, ok := ld["email"].(string); ok && raw != "" {
+				if email, _, clean := emailfix.Repair(raw); clean && !isExtraBlocklisted(email) {
 					cd.Emails = append(cd.Emails, email)
 				}
 			}
@@ -1261,10 +1265,15 @@ func isCleanEmail(email string) bool {
 	local := email[:atIdx]
 	domain := email[atIdx+1:]
 
-	// Reject if local part has digits immediately followed by a known email prefix
-	// Pattern: "9346082info@" or "812-3868-7387marcom@" — phone concatenated with email.
 	if len(local) > 40 {
 		return false // Local parts > 40 chars are almost always garbage.
+	}
+
+	// Backstop for phone text glued onto the local part ("9346082info@",
+	// "812-3868-7387marcom@"): callers repair first, so anything Repair would
+	// still change is a leftover glued address.
+	if _, changed, _ := emailfix.Repair(email); changed {
+		return false
 	}
 
 	// Reject if domain has extra text appended after TLD.
@@ -1276,7 +1285,7 @@ func isCleanEmail(email string) bool {
 	}
 	// Accept any ICANN TLD; glued garbage (inivie.comview) is not one. Only the
 	// last label is checked so private-suffix domains (studio.uk.com) still pass.
-	if _, icann := publicsuffix.PublicSuffix(strings.ToLower(domain[dotIdx+1:])); !icann {
+	if !emailfix.IsTLD(strings.ToLower(domain[dotIdx+1:])) {
 		return false
 	}
 

@@ -574,3 +574,48 @@ func TestExtractContacts_MailtoOnlyKept(t *testing.T) {
 		t.Fatalf("emails = %v, want [info@example-studio.com]", cd.Emails)
 	}
 }
+
+// Phone text glued in front of the local part, or website text after the TLD,
+// is repaired to the real address instead of being kept glued or dropped.
+func TestExtractContacts_RepairsGluedEmails(t *testing.T) {
+	cases := map[string]struct{ html, want string }{
+		"phone prefix": {`<p>+1.808.228.8417info@dralysa.com</p>`, "info@dralysa.com"},
+		"phone dashes": {`<p>812-3868-7387marcom@x-studio.com</p>`, "marcom@x-studio.com"},
+		"glued tld":    {`<p>info@inivie.comview</p>`, "info@inivie.com"},
+		"glued tld uk": {`<p>hello@studio.co.ukhome</p>`, "hello@studio.co.uk"},
+		"mailto glued": {`<a href="mailto:info@ttbeach.clubmenu">mail</a>`, "info@ttbeach.club"},
+		"bare href":    {`<a href="212-555-7575info@studio.com">x</a>`, "info@studio.com"},
+		"jsonld glued": {`<script type="application/ld+json">{"@type":"LocalBusiness","email":"9346082info@x-studio.com"}</script>`, "info@x-studio.com"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			cd := ExtractContacts([]byte("<html><body>" + c.html + "</body></html>"))
+			if len(cd.Emails) != 1 || cd.Emails[0] != c.want {
+				t.Fatalf("emails = %v, want [%s]", cd.Emails, c.want)
+			}
+		})
+	}
+}
+
+func TestIsCleanEmail_RejectsPhonePrefix(t *testing.T) {
+	for _, e := range []string{"9346082info@x.com", "812-3868-7387marcom@x.com", "+1-212-555-7575info@studio.com"} {
+		if isCleanEmail(e) {
+			t.Errorf("isCleanEmail(%q) = true, want false", e)
+		}
+	}
+	for _, e := range []string{"13812345678@163.com", "john2024@gmail.com", "info@studio.com"} {
+		if !isCleanEmail(e) {
+			t.Errorf("isCleanEmail(%q) = false, want true", e)
+		}
+	}
+}
+
+// Wildcard-only ccTLDs (np, mm, bd, ...) are valid TLDs even though the public
+// suffix list does not report them as ICANN when asked as a bare label.
+func TestIsCleanEmail_WildcardTLDs(t *testing.T) {
+	for _, e := range []string{"info@foodforlife.org.np", "zgs@baganmail.net.mm", "a1@bank.com.bd"} {
+		if !isCleanEmail(e) {
+			t.Errorf("isCleanEmail(%q) = false, want true", e)
+		}
+	}
+}
