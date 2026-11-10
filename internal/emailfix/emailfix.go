@@ -301,13 +301,13 @@ var midFreeMail = map[string]bool{
 // then continues; group 1 is the continuation.
 var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
 
-// webHostLocal matches a web or mail host left inside the local part: a "www."
-// label, or a provider domain that starts the local part or follows a non-alnum
-// character. Such a local part is text from the neighbouring domain, never a mailbox.
 // domainGlue matches a TLD or a short label glued to a provider name in a domain
 // ("msn.comyahoo.com.sa", "yahoo.com.hkhotmail.com"). "live", "ymail" are left out.
 var domainGlue = regexp.MustCompile(`(^|\.)(com|net|org|edu|gov|[a-z]{2})(gmail|googlemail|yahoo|hotmail|outlook|msn|aol|icloud|gmx)(\.|$)`)
 
+// webHostLocal matches a web or mail host left inside the local part: a "www."
+// label, or a provider domain that starts the local part or follows a non-alnum
+// character. Such a local part is text from the neighbouring domain, never a mailbox.
 var webHostLocal = regexp.MustCompile(`www\.|(^|[^a-z0-9])(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|aol|icloud|gmx)\.(com|net|de|fr|it|es|co)`)
 
 // glueVouched reports whether stripped, the local part after a glued run, is
@@ -730,9 +730,9 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 
 	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 		local, rules = l, append(rules, "phone")
-		if isFreeMail(domain) && !syntaxRoles[local] && len(strings.ReplaceAll(local, ".", "")) < 8 {
-			// On free-mail a short personal remainder is likely another person's
-			// mailbox. A role word ("info") is generic and stays as before.
+		if isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 {
+			// On free-mail any short remainder is likely another person's mailbox,
+			// role words included: "info" is generic only on a business domain.
 			return local + "@" + domain, rules, false
 		}
 	} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {

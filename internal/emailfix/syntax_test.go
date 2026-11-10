@@ -482,8 +482,9 @@ func TestRepairRound6d(t *testing.T) {
 		t.Errorf("CleanList split = %q, want both pieces", split)
 	}
 
-	// Phone strip on free-mail with a short personal remainder: rejected, phone kept in rules.
-	for _, in := range []string{"201010.01mark@yahoo.com", "800010.01219morgan@hotmail.com", "966-7660bjesup@aol.com"} {
+	// Phone strip on free-mail with a short remainder: rejected, phone kept in rules.
+	// "info" is a role word, but it is generic only on a business domain.
+	for _, in := range []string{"201010.01mark@yahoo.com", "800010.01219morgan@hotmail.com", "966-7660bjesup@aol.com", "9346082info@yahoo.com"} {
 		got, rules, ok := RepairCtx(in, Context{})
 		if ok || !slices.Contains(rules, "phone") {
 			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want ok=false with phone rule", in, got, rules, ok)
@@ -494,6 +495,7 @@ func TestRepairRound6d(t *testing.T) {
 		"417-2648chayilcots@gmail.com":   "chayilcots@gmail.com",
 		"4-2536-3512rgartside@gmail.com": "rgartside@gmail.com",
 		"849-6789info@acmedesign.com":    "info@acmedesign.com",
+		"9346082info.acmeyoga@yahoo.com": "info.acmeyoga@yahoo.com",
 	} {
 		got, rules, ok := RepairCtx(in, Context{})
 		if got != want || !ok {

@@ -18,7 +18,7 @@ func TestRepair(t *testing.T) {
 		{"9346082info@x.com", "info@x.com", true, true},
 		{"812-3868-7387marcom@x.com", "marcom@x.com", true, true},
 		{"(212) 555-7575hello@studio.com", "hello@studio.com", true, true},
-		{"9346082info@yahoo.com", "info@yahoo.com", true, true},                  // role word beats free-mail
+		{"9346082info@yahoo.com", "info@yahoo.com", true, false},                 // a role word is generic only on a business domain: a short personal Yahoo mailbox is rejected
 		{"9346082info@gmail.com", "9346082info@gmail.com", false, true},          // Gmail cannot issue a 4-char local part
 		{"+6281234567890johnsmith@gmail.com", "johnsmith@gmail.com", true, true}, // '+' marks a phone
 		{"9346082john@studio.com", "john@studio.com", true, true},                // non-free domain
