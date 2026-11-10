@@ -301,6 +301,11 @@ var midFreeMail = map[string]bool{
 // then continues; group 1 is the continuation.
 var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
 
+// webHostLocal matches a web or mail host left inside the local part: a "www."
+// label, or a provider domain that starts the local part or follows a non-alnum
+// character. Such a local part is text from the neighbouring domain, never a mailbox.
+var webHostLocal = regexp.MustCompile(`www\.|(^|[^a-z0-9])(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|aol|icloud|gmx)\.(com|net|de|fr|it|es|co)`)
+
 // glueVouched reports whether stripped, the local part after a glued run, is
 // confirmed by the cut-off tail: one of its labels (not "www") or the tail itself.
 // Without that evidence the start of the address is unknown.
@@ -731,6 +736,11 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 
 	fixed = local + "@" + domain
+	// Checked on the final local part, after every rule, and before the evidence
+	// check: an existing row cannot vouch for a host embedded in the local part.
+	if webHostLocal.MatchString(local) {
+		return fixed, rules, false
+	}
 	if cut && !cutEvidence(local, fixed, tail, domain, c) {
 		return fixed, rules, false
 	}

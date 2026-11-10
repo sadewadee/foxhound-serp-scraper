@@ -418,3 +418,47 @@ func TestRepairGlueBoundary(t *testing.T) {
 	}
 	assertCRM(t, got)
 }
+
+// TestRepairWebHostLocal: a web or mail host left inside the final local part makes
+// the result ok=false, whether or not a rule fired and whether or not the address
+// exists. Words that only contain a host name (olive.com, live.music) stay ok.
+func TestRepairWebHostLocal(t *testing.T) {
+	rejects := []string{
+		"561.267.6131www.acme.comacme@gmail.com",
+		"758-8818www.acmefh.comlebanon@acmefh.com",
+		"u003ewww.acmeactors@yahoo.com",
+		"yahoo.cominfo@acmepractice.comacme.clinic",
+		"www.acme@yahoo.com",
+		"acme.gmail.comx@acme.com",
+	}
+	for _, in := range rejects {
+		got, _, ok := RepairCtx(in, Context{})
+		if ok {
+			t.Errorf("RepairCtx(%q) = (%q, _, true), want ok=false", in, got)
+		}
+	}
+
+	// The merge target exists in the database, which is evidence (a) for a cut.
+	// The web host check still rejects it.
+	const merge = "gmail.comgmail.com@hotmail.comhotmail.com"
+	if got, _, ok := RepairCtx(merge, Context{Exists: func(string) bool { return true }}); ok {
+		t.Errorf("RepairCtx(%q) with Exists = (%q, _, true), want ok=false", merge, got)
+	}
+
+	stays := []string{
+		"olive.combs@acme.com",
+		"decrypt.computer@gmail.com",
+		"live.music@acmeband.com",
+		"me.frederic@protonmail.com",
+		"web.team@acme.com",
+		"info@acme.com",
+		"anna.yahoo@acme.com",
+	}
+	for _, in := range stays {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+		assertCRM(t, got)
+	}
+}
