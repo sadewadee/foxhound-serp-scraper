@@ -462,3 +462,69 @@ func TestRepairWebHostLocal(t *testing.T) {
 		assertCRM(t, got)
 	}
 }
+
+// TestRepairRound6d covers trailing punctuation, the free-mail phone remainder,
+// existence on free-mail, and a provider glued to a TLD in the domain.
+func TestRepairRound6d(t *testing.T) {
+	// Trailing punctuation after a valid domain is not a cut.
+	for in, want := range map[string]string{
+		"jmkeif@gmail.com/":  "jmkeif@gmail.com",
+		"a.person@acme.net|": "a.person@acme.net",
+	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != want || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true)", in, got, rules, ok, want)
+		}
+		assertCRM(t, got)
+	}
+	split := CleanList([]string{"jmkeif@gmail.com/ sklever@acmeymca.org"})
+	if !slices.Equal(split, []string{"jmkeif@gmail.com", "sklever@acmeymca.org"}) {
+		t.Errorf("CleanList split = %q, want both pieces", split)
+	}
+
+	// Phone strip on free-mail with a short personal remainder: rejected, phone kept in rules.
+	for _, in := range []string{"201010.01mark@yahoo.com", "800010.01219morgan@hotmail.com", "966-7660bjesup@aol.com"} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !slices.Contains(rules, "phone") {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want ok=false with phone rule", in, got, rules, ok)
+		}
+	}
+	// Distinctive remainders on free-mail, and any remainder on a business domain, are accepted.
+	for in, want := range map[string]string{
+		"417-2648chayilcots@gmail.com":   "chayilcots@gmail.com",
+		"4-2536-3512rgartside@gmail.com": "rgartside@gmail.com",
+		"849-6789info@acmedesign.com":    "info@acmedesign.com",
+	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != want || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true)", in, got, rules, ok, want)
+		}
+		assertCRM(t, got)
+	}
+
+	// Existence on free-mail counts only with a distinctive local part.
+	exists := Context{Exists: func(string) bool { return true }}
+	if got, _, ok := RepairCtx("anna@yahoo.comyahoo.com", exists); ok {
+		t.Errorf("RepairCtx(anna@yahoo.comyahoo.com) with Exists = (%q, _, true), want ok=false", got)
+	}
+	if got, _, ok := RepairCtx("annasmith77@yahoo.comyahoo.com", exists); !ok || got != "annasmith77@yahoo.com" {
+		t.Errorf("RepairCtx(annasmith77@yahoo.comyahoo.com) with Exists = (%q, _, %v), want ok", got, ok)
+	}
+	if got, _, ok := RepairCtx("anna@acmeyoga.comacmeyoga.com", exists); !ok || got != "anna@acmeyoga.com" {
+		t.Errorf("RepairCtx(anna@acmeyoga.comacmeyoga.com) with Exists = (%q, _, %v), want ok", got, ok)
+	}
+
+	// Provider glued to a TLD or a short label in the domain: rejected.
+	for _, in := range []string{"arif@msn.comyahoo.com.sa", "hong@yahoo.com.hkhotmail.com", "johnbrown@att.netaol.com"} {
+		if got, rules, ok := RepairCtx(in, Context{}); ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, true), want ok=false", in, got, rules)
+		}
+	}
+	// Words that only contain a provider name stay ok.
+	for _, in := range []string{"xy@nysgmail.com", "xy@sifymail.com", "xy@huaweicloud.com", "xy@golive.com", "xy@triblive.com", "xy@hiergmx.de"} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}

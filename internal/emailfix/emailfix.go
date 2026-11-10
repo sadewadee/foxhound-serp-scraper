@@ -304,6 +304,10 @@ var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
 // webHostLocal matches a web or mail host left inside the local part: a "www."
 // label, or a provider domain that starts the local part or follows a non-alnum
 // character. Such a local part is text from the neighbouring domain, never a mailbox.
+// domainGlue matches a TLD or a short label glued to a provider name in a domain
+// ("msn.comyahoo.com.sa", "yahoo.com.hkhotmail.com"). "live", "ymail" are left out.
+var domainGlue = regexp.MustCompile(`(^|\.)(com|net|org|edu|gov|[a-z]{2})(gmail|googlemail|yahoo|hotmail|outlook|msn|aol|icloud|gmx)(\.|$)`)
+
 var webHostLocal = regexp.MustCompile(`www\.|(^|[^a-z0-9])(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|aol|icloud|gmx)\.(com|net|de|fr|it|es|co)`)
 
 // glueVouched reports whether stripped, the local part after a glued run, is
@@ -500,7 +504,8 @@ func noLetterOrDigit(s string) bool {
 // or it is a role word on a domain that is not free-mail. Anything else may be
 // text from either side of the glue, so it is rejected.
 func cutEvidence(local, fixed, tail, domain string, c Context) bool {
-	if c.exists(fixed) || glueVouched(local, tail, domain) {
+	existsOK := c.exists(fixed) && (!isFreeMail(domain) || len(strings.ReplaceAll(local, ".", "")) >= 8)
+	if existsOK || glueVouched(local, tail, domain) {
 		return true
 	}
 	return syntaxRoles[local] && !isFreeMail(domain)
@@ -720,11 +725,16 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 
 	// cut is true when a tld or middomain rule trimmed the domain. Then the left
 	// boundary is trusted only with evidence (see cutEvidence).
-	cut := domain != fullDomain
 	tail := fullDomain[len(domain):]
+	cut := domain != fullDomain && !noLetterOrDigit(tail)
 
 	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 		local, rules = l, append(rules, "phone")
+		if isFreeMail(domain) && !syntaxRoles[local] && len(strings.ReplaceAll(local, ".", "")) < 8 {
+			// On free-mail a short personal remainder is likely another person's
+			// mailbox. A role word ("info") is generic and stays as before.
+			return local + "@" + domain, rules, false
+		}
 	} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
 		// A glued run before the local part is stripped only when the tail vouches
 		// for the rest.
@@ -738,7 +748,7 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	fixed = local + "@" + domain
 	// Checked on the final local part, after every rule, and before the evidence
 	// check: an existing row cannot vouch for a host embedded in the local part.
-	if webHostLocal.MatchString(local) {
+	if webHostLocal.MatchString(local) || domainGlue.MatchString(domain) {
 		return fixed, rules, false
 	}
 	if cut && !cutEvidence(local, fixed, tail, domain, c) {
