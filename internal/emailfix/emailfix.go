@@ -504,7 +504,9 @@ func noLetterOrDigit(s string) bool {
 // or it is a role word on a domain that is not free-mail. Anything else may be
 // text from either side of the glue, so it is rejected.
 func cutEvidence(local, fixed, tail, domain string, c Context) bool {
-	existsOK := c.exists(fixed) && (!isFreeMail(domain) || len(strings.ReplaceAll(local, ".", "")) >= 8)
+	// A linked address is ownership evidence on any domain. A plain existing
+	// address counts on free-mail only with a distinctive local part.
+	existsOK := c.linked(fixed) || (c.exists(fixed) && (!isFreeMail(domain) || len(strings.ReplaceAll(local, ".", "")) >= 8))
 	if existsOK || glueVouched(local, tail, domain) {
 		return true
 	}
@@ -730,9 +732,10 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 
 	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 		local, rules = l, append(rules, "phone")
-		if isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 {
+		if isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 && !c.linked(local+"@"+domain) {
 			// On free-mail any short remainder is likely another person's mailbox,
-			// role words included: "info" is generic only on a business domain.
+			// role words included: "info" is generic only on a business domain. A linked
+			// address for this listing is the exception.
 			return local + "@" + domain, rules, false
 		}
 	} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {

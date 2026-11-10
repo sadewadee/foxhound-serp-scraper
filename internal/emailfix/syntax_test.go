@@ -530,3 +530,24 @@ func TestRepairRound6d(t *testing.T) {
 		}
 	}
 }
+
+// TestRepairLinkedEvidence: a linked address (exists and linked to this listing) is
+// ownership evidence on free-mail too. A plain existing address is not.
+func TestRepairLinkedEvidence(t *testing.T) {
+	linked := Context{ExistsLinked: func(e string) bool { return e == "mark@yahoo.com" || e == "gaelkm@yahoo.com" }}
+	existsOnly := Context{Exists: func(e string) bool { return e == "gaelkm@yahoo.com" }}
+
+	if got, rules, ok := RepairCtx("201010.01mark@yahoo.com", linked); !ok || got != "mark@yahoo.com" {
+		t.Errorf("RepairCtx(201010.01mark@yahoo.com) with ExistsLinked = (%q, %v, %v), want mark@yahoo.com ok", got, rules, ok)
+	}
+	if got, _, ok := RepairCtx("201010.01mark@yahoo.com", Context{}); ok {
+		t.Errorf("RepairCtx(201010.01mark@yahoo.com) empty context = (%q, _, true), want ok=false", got)
+	}
+
+	if got, rules, ok := RepairCtx("gaelkm@yahoo.comfacebook.com", linked); !ok || got != "gaelkm@yahoo.com" {
+		t.Errorf("RepairCtx(gaelkm@yahoo.comfacebook.com) with ExistsLinked = (%q, %v, %v), want gaelkm@yahoo.com ok", got, rules, ok)
+	}
+	if got, _, ok := RepairCtx("gaelkm@yahoo.comfacebook.com", existsOnly); ok {
+		t.Errorf("RepairCtx(gaelkm@yahoo.comfacebook.com) with Exists only = (%q, _, true), want ok=false", got)
+	}
+}
