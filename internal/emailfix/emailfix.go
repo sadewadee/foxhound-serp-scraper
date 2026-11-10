@@ -17,7 +17,6 @@ import (
 	"slices"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/text/unicode/norm"
@@ -137,7 +136,9 @@ func cutGluedTLD(domain string) string {
 		return domain
 	}
 	label := domain[dot+1:]
-	if IsTLD(label) {
+	// A space in the label is separate text ("co uk"), not glue: leave it to the
+	// trailing-text rule and the final check.
+	if IsTLD(label) || strings.ContainsAny(label, " \t") {
 		return domain
 	}
 	for n := len(label) - 1; n >= 2; n-- {
@@ -427,24 +428,41 @@ func joinDomainSpaces(d string) string {
 }
 
 // trimTrailingText cuts a domain at the first whitespace left after joining,
-// but only when the text before it ends in a TLD ("fixture.com. phone").
+// but only when the text before it ends in a TLD ("fixture.com. phone"). When the
+// next token would extend the public suffix ("company.co" + "uk" is "co.uk"),
+// the address is ambiguous: the domain is returned unchanged so the final check
+// rejects it.
 func trimTrailingText(d string) string {
 	j := strings.IndexAny(d, " \t")
 	if j < 0 {
 		return d
 	}
 	head := strings.TrimRight(d[:j], ".")
-	if l := lastLabel(head); l != "" && IsTLD(l) {
-		return head
+	if l := lastLabel(head); l == "" || !IsTLD(l) {
+		return d
 	}
-	return d
+	rest := strings.TrimLeft(d[j:], " \t")
+	k := 0
+	for k < len(rest) && (isAlnum(rest[k]) || rest[k] == '-') {
+		k++
+	}
+	if k > 0 && spansSuffix(head, rest[:k]) {
+		return d
+	}
+	return head
 }
 
-// isPunctRune reports whether the last rune of s is neither a letter, a digit
-// nor a space, so a space after it separates a label ("✉ info", "• info").
-func isPunctRune(s string) bool {
-	r, _ := utf8.DecodeLastRuneInString(s)
-	return r != ' ' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
+// spansSuffix reports whether head+"."+next has a longer public suffix than next
+// alone, as in "company.co" + "uk" (suffix "co.uk").
+func spansSuffix(head, next string) bool {
+	suffix, _ := publicsuffix.PublicSuffix(head + "." + next)
+	return len(suffix) > len(next)
+}
+
+// noLetterOrDigit reports whether s holds no letter and no digit, so a token like
+// "✉", "-" or "|" is a separator and "anna-" is not.
+func noLetterOrDigit(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) < 0
 }
 
 // tidyParts applies the whole-string repairs of normalizeSyntax: spacing around
@@ -507,8 +525,10 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 		case c == '\'':
 			isCut = i == 0
 		case c == ' ':
-			// A space after punctuation separates a label ("studio berlin - info").
-			isCut = prefixWords[local[:i]] || (i > 0 && isPunctRune(local[:i]))
+			// A space cuts only after a token with no letter or digit, so
+			// "studio berlin - info" cuts and "anna- maria" does not.
+			tok := local[strings.LastIndexByte(local[:i], ' ')+1 : i]
+			isCut = prefixWords[local[:i]] || (i > 0 && noLetterOrDigit(tok))
 		}
 		if !isCut {
 			continue
@@ -530,7 +550,7 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 	// ambiguous and stays as it is (rejected later by the final check).
 	if i := strings.LastIndexByte(local, ' '); i > 0 {
 		tok := local[strings.LastIndexByte(local[:i], ' ')+1 : i]
-		if prefixWords[labelWord(tok)] || (tok != "" && isPunctRune(tok)) {
+		if prefixWords[labelWord(tok)] || (tok != "" && noLetterOrDigit(tok)) {
 			local, wrapped = strings.TrimSpace(local[i+1:]), true
 		}
 	}

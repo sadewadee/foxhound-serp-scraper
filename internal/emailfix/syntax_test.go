@@ -268,3 +268,50 @@ func TestRepairSyntaxRound3(t *testing.T) {
 		}
 	}
 }
+
+func TestRepairSyntaxRound4(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		// A space after a token with no letter or digit separates a label.
+		{"\u2709 stay@fixture-hotel.co.uk", "stay@fixture-hotel.co.uk"},
+		{"\u2022 info@fixture-hotel.co.uk", "info@fixture-hotel.co.uk"},
+		{"studio berlin - info@fixture.de", "info@fixture.de"},
+		{"grace lee | ir@fixture-ir.com", "ir@fixture-ir.com"},
+		{"<span>email:</span> info@fixture-den.ca", "info@fixture-den.ca"},
+		{"e%20mail%20info@fixture-zero.com", "info@fixture-zero.com"},
+		{"via email applications.xy@fixture.com", "applications.xy@fixture.com"},
+		// A dot or dash followed by a space, with a TLD before the dot.
+		{"info@fixture.com. phone", "info@fixture.com"},
+		{"info@fixture.com. tel", "info@fixture.com"},
+		{"info@fixture.com tel", "info@fixture.com"},
+		{"xy@pec.rupar. puglia.it", "xy@pec.rupar.puglia.it"},
+	}
+	for _, c := range cases {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok || len(rules) == 0 {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true) with rules", c.in, got, rules, ok, c.want)
+		}
+		assertCRM(t, got)
+		if again, _, _ := RepairCtx(got, Context{}); again != got {
+			t.Errorf("RepairCtx(%q) is not idempotent: %q then %q", c.in, got, again)
+		}
+	}
+
+	rejects := []string{
+		// Punctuation glued to a word is not a separator.
+		"anna- maria@fixture.de",
+		"john_ smith@fixture.de",
+		"o' brien@fixture.ie",
+		// The space may hide a second label of the same domain.
+		"xy@company.co. uk",
+		"info@fixture.com. au plaisir",
+		"info@company.co uk",
+	}
+	for _, in := range rejects {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !slices.Contains(rules, "syntax") {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want rules containing syntax and ok=false", in, got, rules, ok)
+		}
+	}
+}
