@@ -202,6 +202,7 @@ func TestCleanList(t *testing.T) {
 		{"encoded space around lub", []string{"ab@one-fixture.com%20lub%20cd.e@two-fixture.org"}, []string{"ab@one-fixture.com", "cd.e@two-fixture.org"}},
 		{"cc join two-char", []string{"ab@one-fixture.com&cc=cd@two-fixture.org"}, []string{"ab@one-fixture.com", "cd@two-fixture.org"}},
 		{"colon repeats one address", []string{"ab@one-fixture.com:ab@one-fixture.com"}, []string{"ab@one-fixture.com"}},
+		{"double space between addresses", []string{"ab@one-fixture.com  cd@two-fixture.org"}, []string{"ab@one-fixture.com", "cd@two-fixture.org"}},
 		{"quote-gt repeats one address", []string{"ab@one-fixture.com\">ab@one-fixture.com"}, []string{"ab@one-fixture.com"}},
 	}
 	for _, c := range cases {
@@ -307,6 +308,39 @@ func TestRepairSyntaxRound4(t *testing.T) {
 		"xy@company.co. uk",
 		"info@fixture.com. au plaisir",
 		"info@company.co uk",
+	}
+	for _, in := range rejects {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !slices.Contains(rules, "syntax") {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want rules containing syntax and ok=false", in, got, rules, ok)
+		}
+	}
+}
+
+func TestRepairSyntaxRound5(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"studio berlin  -  info@fixture.de", "info@fixture.de"},
+		{"email:   info@fixture.de", "info@fixture.de"},
+		{"\u2709   stay@fixture-hotel.co.uk", "stay@fixture-hotel.co.uk"},
+	}
+	for _, c := range cases {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok || len(rules) == 0 {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true) with rules", c.in, got, rules, ok, c.want)
+		}
+		assertCRM(t, got)
+		if again, _, _ := RepairCtx(got, Context{}); again != got {
+			t.Errorf("RepairCtx(%q) is not idempotent: %q then %q", c.in, got, again)
+		}
+	}
+
+	rejects := []string{
+		"mary  smith@fixture.com",
+		"anna-  maria@fixture.de",
+		"contact  info@fixture.de",
+		"mt_%20teamxy@fixture-mt.com",
 	}
 	for _, in := range rejects {
 		got, rules, ok := RepairCtx(in, Context{})

@@ -483,6 +483,9 @@ func tidyParts(s string) string {
 	return s
 }
 
+// spaceRunRe matches two or more spaces in a row.
+var spaceRunRe = regexp.MustCompile(" {2,}")
+
 // normalizeSyntax strips wrappers, prefixes and encoding from a raw address
 // without any context. It returns the cleaned lowercase address, whether it
 // changed, and ok=false for shapes whose real address cannot be recovered.
@@ -511,6 +514,9 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 		return orig, false, false
 	}
 	local, domain := s[:at], s[at+1:]
+	// Runs of spaces in the local part count as one space. Other control
+	// characters are left for the cut loop below.
+	local = spaceRunRe.ReplaceAllString(local, " ")
 
 	// Find the last prefix or wrapper separator in the local part.
 	wrapped, cut := false, -1
@@ -528,7 +534,7 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 			// A space cuts only after a token with no letter or digit, so
 			// "studio berlin - info" cuts and "anna- maria" does not.
 			tok := local[strings.LastIndexByte(local[:i], ' ')+1 : i]
-			isCut = prefixWords[local[:i]] || (i > 0 && noLetterOrDigit(tok))
+			isCut = prefixWords[local[:i]] || (i > 0 && tok != "" && noLetterOrDigit(tok))
 		}
 		if !isCut {
 			continue
