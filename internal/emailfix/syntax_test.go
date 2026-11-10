@@ -349,3 +349,51 @@ func TestRepairSyntaxRound5(t *testing.T) {
 		}
 	}
 }
+
+func TestRepairGlueBoundary(t *testing.T) {
+	// G2: the leftover after a mid-domain cut is glue on its own ("www." or the
+	// first label repeated). G1: a glued phone or code run in front of the local
+	// part is stripped only when the cut-off tail confirms the remainder.
+	cases := []struct {
+		in, want string
+	}{
+		// A: domain still glued after a phone strip.
+		{"555-1234info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		{"anna@acmeyoga.comacmeyoga.com", "anna@acmeyoga.com"},
+		{"lee@studio-one.netwww.other-site.net", "lee@studio-one.net"},
+		// B: domain glue cut, left boundary confirmed by the tail.
+		{"0612345678studioname@gmail.comstudioname.org", "studioname@gmail.com"},
+		{"8123456789studio.yoga@gmail.comstudio.yoga", "studio.yoga@gmail.com"},
+		{"ltd0612345678brandname@gmail.combrandname.lk", "brandname@gmail.com"},
+		// Negatives: no domain cut, or no glue, so nothing changes.
+		{"123john@gmail.com", "123john@gmail.com"},
+		{"xy@mail.company.com", "xy@mail.company.com"},
+		{"xy@live.mercer.edu", "xy@live.mercer.edu"},
+		{"info@sub.acmeyoga.com", "info@sub.acmeyoga.com"},
+	}
+	for _, c := range cases {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, _, true)", c.in, got, rules, ok, c.want)
+		}
+		assertCRM(t, got)
+		if again, rules2, _ := RepairCtx(got, Context{}); again != got || len(rules2) != 0 {
+			t.Errorf("RepairCtx(%q) is not idempotent: %q then %q (rules %v)", c.in, got, again, rules2)
+		}
+	}
+
+	// Ambiguous left boundary: the tail does not confirm the text, so ok=false.
+	// The cut rule stays in rules so repair-emails rejects the row.
+	rejects := []string{
+		"0612345678coachanna@gmail.comwww.facebook.com",
+		"2010boardmembers@hotmail.comother.kw",
+		"ltd0612345678brandname@gmail.comwww.facebook.com",
+		"5551234info@acmeyoga.comwww.acmeyoga.com",
+	}
+	for _, in := range rejects {
+		got, rules, ok := RepairCtx(in, Context{})
+		if ok || !(slices.Contains(rules, "middomain") || slices.Contains(rules, "tld")) {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want ok=false with a domain-cut rule", in, got, rules, ok)
+		}
+	}
+}

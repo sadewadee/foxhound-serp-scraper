@@ -297,6 +297,28 @@ var midFreeMail = map[string]bool{
 	"163.com": true, "naver.com": true, "hanmail.net": true, "mail.ru": true,
 }
 
+// glueLead matches a local part that opens with a glued phone or code run and
+// then continues; group 1 is the continuation.
+var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
+
+// glueVouched reports whether stripped, the local part after a glued run, is
+// confirmed by the cut-off tail: one of its labels (not "www") or the tail itself.
+// Without that evidence the start of the address is unknown.
+func glueVouched(stripped, tail, domain string) bool {
+	if len(stripped) < 2 || !gmailOK(stripped, domain) {
+		return false
+	}
+	if stripped == tail || stripped == strings.TrimPrefix(tail, "www.") {
+		return true
+	}
+	for _, l := range strings.Split(tail, ".") {
+		if l != "www" && l == stripped {
+			return true
+		}
+	}
+	return false
+}
+
 // cutMidDomain handles text between two domains ("gmail.comfacebookfacebook.com"):
 // it cuts a non-final label back to an ICANN TLD prefix, at the first label where
 // the result is vouched for (a free-mail provider, the listing's domain, or an
@@ -318,7 +340,10 @@ func cutMidDomain(local, domain string, c Context) string {
 			d := strings.Join(labels[:j], ".") + "." + label[:n]
 			rest := label[n:] + "." + strings.Join(labels[j+1:], ".")
 			signal := strings.Contains(rest, "www") || strings.Contains(rest, labels[0])
-			if (n >= 3 || signal) && (midFreeMail[d] || c.ownDomain(d) || c.exists(local+"@"+d)) {
+			// A leftover that starts with "www." or repeats the first label is glue
+			// on its own, so the cut needs no vouching.
+			glue := strings.HasPrefix(rest, "www.") || strings.HasPrefix(rest, labels[0]+".")
+			if (n >= 3 || signal) && (glue || midFreeMail[d] || c.ownDomain(d) || c.exists(local+"@"+d)) {
 				return d
 			}
 		}
@@ -670,13 +695,22 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 	local, domain := s[:at], s[at+1:]
 
+	fullDomain := domain
 	if d := cutGluedTLD(domain); d != domain {
 		domain, rules = d, append(rules, "tld")
 	} else if d := cutMidDomain(local, domain, c); d != domain {
 		domain, rules = d, append(rules, "middomain")
 	}
 
-	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
+	if cut := domain != fullDomain; cut && glueLead.MatchString(local) {
+		// The domain was cut, so the text before the glued run is unknown unless
+		// the cut-off tail confirms the rest.
+		stripped := glueLead.FindStringSubmatch(local)[1]
+		if !glueVouched(stripped, fullDomain[len(domain):], domain) {
+			return local + "@" + domain, rules, false
+		}
+		local, rules = stripped, append(rules, "phone")
+	} else if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 		local, rules = l, append(rules, "phone")
 	} else if l, hit := stripLabel(local, domain, c); hit {
 		local, rules = l, append(rules, "label")
