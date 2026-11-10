@@ -702,16 +702,16 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 		domain, rules = d, append(rules, "middomain")
 	}
 
-	if cut := domain != fullDomain; cut && glueLead.MatchString(local) {
-		// The domain was cut, so the text before the glued run is unknown unless
-		// the cut-off tail confirms the rest.
+	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
+		local, rules = l, append(rules, "phone")
+	} else if cut := domain != fullDomain; cut && glueLead.MatchString(local) {
+		// The phone rule did not strip and the domain was cut, so the text before
+		// the glued run is unknown unless the cut-off tail confirms the rest.
 		stripped := glueLead.FindStringSubmatch(local)[1]
 		if !glueVouched(stripped, fullDomain[len(domain):], domain) {
 			return local + "@" + domain, rules, false
 		}
 		local, rules = stripped, append(rules, "phone")
-	} else if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
-		local, rules = l, append(rules, "phone")
 	} else if l, hit := stripLabel(local, domain, c); hit {
 		local, rules = l, append(rules, "label")
 	} else if l, hit := stripPlaceGlue(local, domain, c); hit {

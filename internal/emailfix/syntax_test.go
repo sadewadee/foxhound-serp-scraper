@@ -361,6 +361,10 @@ func TestRepairGlueBoundary(t *testing.T) {
 		{"555-1234info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
 		{"anna@acmeyoga.comacmeyoga.com", "anna@acmeyoga.com"},
 		{"lee@studio-one.netwww.other-site.net", "lee@studio-one.net"},
+		// The phone rule strips these first; G1 is not reached.
+		{"5551234info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		{"33693773info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		{"0612345678anna@acmeyoga.comwww.acmeyoga.com", "anna@acmeyoga.com"},
 		// B: domain glue cut, left boundary confirmed by the tail.
 		{"0612345678studioname@gmail.comstudioname.org", "studioname@gmail.com"},
 		{"8123456789studio.yoga@gmail.comstudio.yoga", "studio.yoga@gmail.com"},
@@ -388,7 +392,8 @@ func TestRepairGlueBoundary(t *testing.T) {
 		"0612345678coachanna@gmail.comwww.facebook.com",
 		"2010boardmembers@hotmail.comother.kw",
 		"ltd0612345678brandname@gmail.comwww.facebook.com",
-		"5551234info@acmeyoga.comwww.acmeyoga.com",
+		// Four digits are below the phone rule; no evidence in the tail.
+		"6789info@internetspeedtest.prointernetspeedtest.pro",
 	}
 	for _, in := range rejects {
 		got, rules, ok := RepairCtx(in, Context{})
