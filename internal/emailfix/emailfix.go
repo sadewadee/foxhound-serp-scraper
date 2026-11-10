@@ -490,6 +490,17 @@ func noLetterOrDigit(s string) bool {
 	return strings.IndexFunc(s, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) < 0
 }
 
+// cutEvidence reports whether a result after a domain cut is trusted: the address
+// exists on its own, the local part is a label or the domain of the cut-off tail,
+// or it is a role word on a domain that is not free-mail. Anything else may be
+// text from either side of the glue, so it is rejected.
+func cutEvidence(local, fixed, tail, domain string, c Context) bool {
+	if c.exists(fixed) || glueVouched(local, tail, domain) {
+		return true
+	}
+	return syntaxRoles[local] && !isFreeMail(domain)
+}
+
 // tidyParts applies the whole-string repairs of normalizeSyntax: spacing around
 // "@", HTML tags, bracket wrappers, a leading "@", doubled parts and spacing
 // inside the domain.
@@ -702,16 +713,17 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 		domain, rules = d, append(rules, "middomain")
 	}
 
+	// cut is true when a tld or middomain rule trimmed the domain. Then the left
+	// boundary is trusted only with evidence (see cutEvidence).
+	cut := domain != fullDomain
+	tail := fullDomain[len(domain):]
+
 	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 		local, rules = l, append(rules, "phone")
-	} else if cut := domain != fullDomain; cut && glueLead.MatchString(local) {
-		// The phone rule did not strip and the domain was cut, so the text before
-		// the glued run is unknown unless the cut-off tail confirms the rest.
-		stripped := glueLead.FindStringSubmatch(local)[1]
-		if !glueVouched(stripped, fullDomain[len(domain):], domain) {
-			return local + "@" + domain, rules, false
-		}
-		local, rules = stripped, append(rules, "phone")
+	} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
+		// A glued run before the local part is stripped only when the tail vouches
+		// for the rest.
+		local, rules = m[1], append(rules, "phone")
 	} else if l, hit := stripLabel(local, domain, c); hit {
 		local, rules = l, append(rules, "label")
 	} else if l, hit := stripPlaceGlue(local, domain, c); hit {
@@ -719,6 +731,9 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 
 	fixed = local + "@" + domain
+	if cut && !cutEvidence(local, fixed, tail, domain, c) {
+		return fixed, rules, false
+	}
 	// A CRM-invalid result that no rule fixed is still flagged, so repair-emails
 	// marks the row malformed instead of leaving it exportable. This runs before
 	// the short-local return so "c@-.at" is rejected too.

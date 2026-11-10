@@ -359,12 +359,12 @@ func TestRepairGlueBoundary(t *testing.T) {
 	}{
 		// A: domain still glued after a phone strip.
 		{"555-1234info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
-		{"anna@acmeyoga.comacmeyoga.com", "anna@acmeyoga.com"},
-		{"lee@studio-one.netwww.other-site.net", "lee@studio-one.net"},
+		{"555-123-4567info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
+		{"emailcontact@acmeyoga.comwww.acmeyoga.com", "contact@acmeyoga.com"},
+		{"acme@acme.lvwww.acme.lv", "acme@acme.lv"},
 		// The phone rule strips these first; G1 is not reached.
 		{"5551234info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
 		{"33693773info@acmeyoga.comwww.acmeyoga.com", "info@acmeyoga.com"},
-		{"0612345678anna@acmeyoga.comwww.acmeyoga.com", "anna@acmeyoga.com"},
 		// B: domain glue cut, left boundary confirmed by the tail.
 		{"0612345678studioname@gmail.comstudioname.org", "studioname@gmail.com"},
 		{"8123456789studio.yoga@gmail.comstudio.yoga", "studio.yoga@gmail.com"},
@@ -394,6 +394,15 @@ func TestRepairGlueBoundary(t *testing.T) {
 		"ltd0612345678brandname@gmail.comwww.facebook.com",
 		// Four digits are below the phone rule; no evidence in the tail.
 		"6789info@internetspeedtest.prointernetspeedtest.pro",
+		// Left part is not vouched by the tail and is not a role word on a non-free domain.
+		"0612345678anna@acmeyoga.comwww.acmeyoga.com",
+		"lee@studio-one.netwww.other-site.net",
+		"201010.01anna@yahoo.commsn.com",
+		"10.01carlos@msn.commsn.com",
+		"hotmail.comaol.com@mac.commac.com",
+		"korea+82-2-1234-5678acme_korea@acmespace.comwww.acme.co.kr",
+		"info@yahoo.comwww.acme.com",
+		"cakesanna.smith@acmecakes.comacmecakes.com",
 	}
 	for _, in := range rejects {
 		got, rules, ok := RepairCtx(in, Context{})
@@ -401,4 +410,11 @@ func TestRepairGlueBoundary(t *testing.T) {
 			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want ok=false with a domain-cut rule", in, got, rules, ok)
 		}
 	}
+
+	// Evidence from the context accepts a cut: the address exists on its own.
+	got, rules, ok := RepairCtx("anna@acmeyoga.comacmeyoga.com", Context{Exists: set("anna@acmeyoga.com")})
+	if got != "anna@acmeyoga.com" || !ok || !slices.Contains(rules, "middomain") {
+		t.Errorf("RepairCtx with Exists = (%q, %v, %v), want anna@acmeyoga.com ok with middomain", got, rules, ok)
+	}
+	assertCRM(t, got)
 }

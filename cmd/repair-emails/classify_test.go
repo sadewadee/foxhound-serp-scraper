@@ -44,3 +44,37 @@ func TestClassifySplit(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyCutEvidence: a domain cut is accepted only with evidence. The
+// Exists stub records which addresses were looked up.
+func TestClassifyCutEvidence(t *testing.T) {
+	const in = "anna@acmeyoga.comacmeyoga.com"
+	const want = "anna@acmeyoga.com"
+
+	var asked []string
+	recorder := func(known string) func(string) bool {
+		return func(e string) bool {
+			asked = append(asked, e)
+			return e == known
+		}
+	}
+
+	fixed, action, rules := classify(in, emailfix.Context{Exists: recorder("")})
+	if action != actReject || fixed != want {
+		t.Errorf("no evidence: classify(%q) = (%q, %q, %v), want (%q, %q, _)", in, fixed, action, rules, want, actReject)
+	}
+	if len(asked) == 0 || asked[len(asked)-1] != want {
+		t.Errorf("no evidence: Exists calls = %v, want a lookup of %q", asked, want)
+	}
+
+	asked = nil
+	fixed, action, _ = classify(in, emailfix.Context{Exists: recorder(want)})
+	if action != actUpdate || fixed != want {
+		t.Errorf("Exists true: classify(%q) = (%q, %q), want (%q, %q)", in, fixed, action, want, actUpdate)
+	}
+
+	fixed, action, _ = classify(in, emailfix.Context{})
+	if action != actReject || fixed != want {
+		t.Errorf("empty context: classify(%q) = (%q, %q), want (%q, %q)", in, fixed, action, want, actReject)
+	}
+}
