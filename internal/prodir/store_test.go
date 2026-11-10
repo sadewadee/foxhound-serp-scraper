@@ -389,7 +389,7 @@ func TestLoadEmailsPhones(t *testing.T) {
 	l := Listing{
 		Domain: "ace9.pro.acefitness.org", URL: ACEBase + "/pro/AcE9/", Name: "Fixture Nine", Category: aceCategory,
 		Niche: "fitness", Website: "http://someone@fixture.example", Social: map[string]string{},
-		Emails: []string{"one@fixture.example", "two@gmail.com"},
+		Emails: []string{"one@fixture-studio.com", "twotwo.fixture@gmail.com"},
 		Phones: []string{"(555) 010-0199", "555.010.0142"},
 	}
 	load := func() {
@@ -415,7 +415,7 @@ func TestLoadEmailsPhones(t *testing.T) {
 		t.Errorf("after load: emails=%d links=%d phone=%q phones=%q website=%q", e, k, phone, phones, website)
 	}
 	var free bool
-	if err := d.QueryRow(`SELECT free_email FROM emails WHERE email='two@gmail.com'`).Scan(&free); err != nil || !free {
+	if err := d.QueryRow(`SELECT free_email FROM emails WHERE email='twotwo.fixture@gmail.com'`).Scan(&free); err != nil || !free {
 		t.Errorf("gmail.com free_email = %v, %v", free, err)
 	}
 

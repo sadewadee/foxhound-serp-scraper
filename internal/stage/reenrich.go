@@ -19,6 +19,7 @@ import (
 
 	"github.com/sadewadee/serp-scraper/internal/config"
 	"github.com/sadewadee/serp-scraper/internal/dedup"
+	"github.com/sadewadee/serp-scraper/internal/emailfix"
 	internalScraper "github.com/sadewadee/serp-scraper/internal/scraper"
 )
 
@@ -531,7 +532,7 @@ func completeEnrichmentJob(ctx context.Context, db *sql.DB, url, urlHash, domain
 			completed_at = NOW(), updated_at = NOW()
 		WHERE url_hash = $1`,
 		urlHash,
-		pq.Array(emails), pq.Array(phones), socialJSON,
+		pq.Array(emailfix.CleanList(emails)), pq.Array(phones), socialJSON,
 		nullIfEmpty(sanitizeUTF8(cd.BusinessName)), nullIfEmpty(sanitizeUTF8(cd.BusinessCategory)), nullIfEmpty(sanitizeUTF8(cd.Address)),
 		nullIfEmpty(sanitizeUTF8(cd.PageTitle)), nullIfEmpty(sanitizeUTF8(cd.Description)), nullIfEmpty(sanitizeUTF8(cd.Location)), nullIfEmpty(sanitizeUTF8(cd.Country)),
 		nullIfEmpty(sanitizeUTF8(cd.City)), nullIfEmpty(sanitizeUTF8(cd.ContactName)), nullIfEmpty(sanitizeUTF8(cd.OpeningHours)), nullIfEmpty(sanitizeUTF8(cd.Rating)),

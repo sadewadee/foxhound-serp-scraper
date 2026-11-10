@@ -11,7 +11,8 @@
 //	             emails, no database (used to build the CRM correction list); only the
 //	             context-free rules (phone, tld) apply here
 //
-// Actions: update (fixed address is new, row is rewritten and re-queued for
+// Actions: split (a field holding several addresses becomes one row per valid
+// address; the original row is marked malformed), update (fixed address is new, row is rewritten and re-queued for
 // validation), merge (fixed address already exists, links move to that row and
 // the broken row is marked malformed), reject (not recoverable, row is marked
 // malformed). Rules: phone, tld (context-free); label, prefix, middomain only fire
@@ -52,6 +53,7 @@ const (
 	actUpdate = "update"
 	actMerge  = "merge"
 	actReject = "reject"
+	actSplit  = "split"
 )
 
 type fix struct {
@@ -59,7 +61,8 @@ type fix struct {
 	old, new string
 	action   string
 	rules    []string
-	target   int64 // merge only
+	target   int64    // merge only
+	pieces   []string // split only: the addresses the row is replaced with
 }
 
 type emailRow struct {
@@ -73,6 +76,14 @@ type emailRow struct {
 // otherwise odd-but-real addresses such as a single-char local part would be
 // marked malformed.
 func classify(email string, c emailfix.Context) (fixed, action string, rules []string) {
+	// Several addresses in one field ("a@x.de; b@x.de") are split into rows of
+	// their own. "@@" is never split. Anything with no valid piece falls through
+	// to the rejection below.
+	if strings.Count(email, "@") > 1 && !strings.Contains(email, "@@") {
+		if pieces := emailfix.CleanList([]string{email}); len(pieces) > 0 {
+			return strings.Join(pieces, ";"), actSplit, []string{"split"}
+		}
+	}
 	fixed, rules, ok := emailfix.RepairCtx(email, c)
 	changed := len(rules) > 0
 	switch {
@@ -84,6 +95,14 @@ func classify(email string, c emailfix.Context) (fixed, action string, rules []s
 		return fixed, actReject, rules
 	}
 	return "", "", nil
+}
+
+// splitPieces returns the addresses of a split fix, or nil for other actions.
+func splitPieces(action, fixed string) []string {
+	if action != actSplit {
+		return nil
+	}
+	return strings.Split(fixed, ";")
 }
 
 func validTLD(email string) bool {
@@ -170,7 +189,7 @@ func runMap(in, out string) error {
 		return err
 	}
 	w.Flush()
-	slog.Info("map done", "update", counts[actUpdate], "reject", counts[actReject])
+	slog.Info("map done", "update", counts[actUpdate], "split", counts[actSplit], "reject", counts[actReject])
 	return w.Error()
 }
 
@@ -236,7 +255,7 @@ func runDB(apply bool, out string, fromID int64) error {
 		slog.Info("window done", "from_id", lo, "found", len(fixes))
 	}
 	rc.log()
-	slog.Info("done", "apply", apply, "update", counts[actUpdate], "merge", counts[actMerge], "reject", counts[actReject])
+	slog.Info("done", "apply", apply, "update", counts[actUpdate], "merge", counts[actMerge], "split", counts[actSplit], "reject", counts[actReject])
 	if w != nil {
 		return w.Error()
 	}
@@ -361,7 +380,7 @@ func classifyRows(ctx context.Context, tx *sql.Tx, batch []emailRow) ([]fix, err
 		if touched {
 			pending = append(pending, r)
 		} else if action != "" {
-			fixes = append(fixes, fix{id: r.id, old: r.email, new: fixed, action: action, rules: rules})
+			fixes = append(fixes, fix{id: r.id, old: r.email, new: fixed, action: action, rules: rules, pieces: splitPieces(action, fixed)})
 		}
 	}
 	if len(pending) == 0 {
@@ -444,7 +463,7 @@ func classifyRows(ctx context.Context, tx *sql.Tx, batch []emailRow) ([]fix, err
 			},
 		}
 		if fixed, action, rules := classify(r.email, c); action != "" {
-			fixes = append(fixes, fix{id: r.id, old: r.email, new: fixed, action: action, rules: rules})
+			fixes = append(fixes, fix{id: r.id, old: r.email, new: fixed, action: action, rules: rules, pieces: splitPieces(action, fixed)})
 		}
 	}
 	sort.Slice(fixes, func(i, j int) bool { return fixes[i].id < fixes[j].id })
@@ -489,11 +508,18 @@ func (s *ruleStats) log() {
 }
 
 func applyFixes(ctx context.Context, tx *sql.Tx, fixes []fix, suffix string) error {
-	var all, upID, mgID, mgTarget, rjID []int64
+	var all, upID, mgID, mgTarget, rjID, spID []int64
 	var upOld, upNew []string
+	var spSrc []int64
+	var spEmail []string
 	for _, x := range fixes {
 		all = append(all, x.id)
 		switch x.action {
+		case actSplit:
+			spID = append(spID, x.id)
+			for _, p := range x.pieces {
+				spSrc, spEmail = append(spSrc, x.id), append(spEmail, p)
+			}
 		case actUpdate:
 			upID, upOld, upNew = append(upID, x.id), append(upOld, x.old), append(upNew, x.new)
 		case actMerge:
@@ -551,6 +577,34 @@ func applyFixes(ctx context.Context, tx *sql.Tx, fixes []fix, suffix string) err
 			FROM unnest($1::bigint[], $2::bigint[]) AS v(id, target_id)
 			WHERE e.id = v.id`, pq.Array(mgID), pq.Array(mgTarget)); err != nil {
 			return fmt.Errorf("merge mark: %w", err)
+		}
+	}
+
+	// (c2) split: copy the links to each piece, unlink the broken row, mark it.
+	if len(spID) > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO emails (email, domain, local_part)
+			SELECT DISTINCT v.email, split_part(v.email, '@', 2), split_part(v.email, '@', 1)
+			FROM unnest($1::bigint[], $2::text[]) AS v(src_id, email)
+			ON CONFLICT (email) DO NOTHING`, pq.Array(spSrc), pq.Array(spEmail)); err != nil {
+			return fmt.Errorf("split insert: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO business_emails (business_id, email_id, source, created_at)
+			SELECT be.business_id, e.id, be.source, be.created_at
+			FROM unnest($1::bigint[], $2::text[]) AS v(src_id, email)
+			JOIN emails e ON e.email = v.email
+			JOIN business_emails be ON be.email_id = v.src_id
+			ON CONFLICT DO NOTHING`, pq.Array(spSrc), pq.Array(spEmail)); err != nil {
+			return fmt.Errorf("split links: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM business_emails WHERE email_id = ANY($1)`, pq.Array(spID)); err != nil {
+			return fmt.Errorf("split unlink: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE emails SET is_acceptable = FALSE, validation_status = 'malformed', reason = 'split'
+			WHERE id = ANY($1)`, pq.Array(spID)); err != nil {
+			return fmt.Errorf("split mark: %w", err)
 		}
 	}
 

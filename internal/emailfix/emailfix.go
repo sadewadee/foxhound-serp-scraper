@@ -12,13 +12,39 @@
 package emailfix
 
 import (
+	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/text/unicode/norm"
 )
 
-var cleanRe = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)
+// cleanRe is the CRM (Zod) address check without its lookaheads: RE2 has none,
+// so the leading-dot and ".." rules are checked separately in RepairCtx.
+var cleanRe = regexp.MustCompile(`^[a-z0-9_'+\-.]*[a-z0-9_+\-]@([a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}$`)
+
+var pctRe = regexp.MustCompile(`%[0-9a-f]{2}`)
+
+// invisibleRunes are zero-width or soft-hyphen characters pasted into addresses.
+var invisibleRunes = strings.NewReplacer("\u200b", "", "\u200c", "", "\u200d", "", "\u2060", "", "\ufeff", "", "\u00ad", "")
+
+// prefixWords are mail-label words that can precede an address in page text.
+var prefixWords = map[string]bool{
+	"mailto": true, "matilto": true, "malito": true, "emailto": true,
+	"email": true, "e-mail": true, "e-mailto": true, "mail": true, "tel": true,
+}
+
+// placeholders are local parts that only appear in form examples.
+var placeholders = map[string]bool{
+	"nachname": true, "nazwisko": true, "vorname": true, "yourname": true,
+	"name": true, "email": true, "username": true,
+}
+
+func isAlnum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+}
 
 // minPhoneDigits is the digit count a leading run needs to count as a phone number.
 const minPhoneDigits = 7
@@ -297,6 +323,148 @@ func cutMidDomain(local, domain string, c Context) string {
 	return domain
 }
 
+// strictCut are separators that must not follow a letter or digit: glued onto
+// text they mean the local part was continuing, so the address is ambiguous.
+const strictCut = ",<>;"
+
+// normalizeSyntax strips wrappers, prefixes and encoding from a raw address
+// without any context. It returns the cleaned lowercase address, whether it
+// changed, and ok=false for shapes whose real address cannot be recovered.
+func normalizeSyntax(raw string) (string, bool, bool) {
+	orig := strings.ToLower(strings.TrimSpace(raw))
+	s := invisibleRunes.Replace(orig)
+	// A %XX escape in the local part is trusted only when a wrapper is stripped.
+	escLocal := false
+	if at := strings.LastIndex(s, "@"); at >= 0 {
+		escLocal = pctRe.MatchString(s[:at])
+	}
+	for i := 0; i < 3 && pctRe.MatchString(s); i++ {
+		d, err := url.PathUnescape(s)
+		if err != nil {
+			break
+		}
+		s = d
+	}
+	s = invisibleRunes.Replace(norm.NFKC.String(s))
+
+	at := strings.LastIndex(s, "@")
+	if at < 0 {
+		return s, s != orig, true
+	}
+	if strings.Count(s, "@") != 1 {
+		return orig, false, false
+	}
+	local, domain := s[:at], s[at+1:]
+
+	// Find the last prefix or wrapper separator in the local part.
+	wrapped, cut := false, -1
+	for i := 0; i < len(local); i++ {
+		c := local[i]
+		isCut := false
+		switch {
+		case c < ' ' || c == 0x7f || c == ':' || c == '/' || c == '"':
+			isCut = true
+		case strings.IndexByte(strictCut, c) >= 0:
+			isCut = true
+		case c == '\'':
+			isCut = i == 0
+		case c == ' ':
+			// A space after punctuation separates a label ("studio berlin - info").
+			isCut = prefixWords[local[:i]] || (i > 0 && !isAlnum(local[i-1]) && local[i-1] != ' ')
+		}
+		if !isCut {
+			continue
+		}
+		if i > 0 && local[i-1] == '.' {
+			return orig, false, false // the local part was continuing
+		}
+		if i > 0 && strings.IndexByte(strictCut, c) >= 0 && isAlnum(local[i-1]) {
+			return orig, false, false
+		}
+		cut = i
+	}
+	if cut >= 0 {
+		local, wrapped = local[cut+1:], true
+	}
+	local = strings.TrimSpace(local)
+	for stripped := true; stripped; {
+		stripped = false
+		for _, p := range []string{"u003c", "u003e", "u0026"} {
+			if strings.HasPrefix(local, p) {
+				local, wrapped, stripped = local[len(p):], true, true
+			}
+		}
+	}
+	if wrapped && (strings.HasPrefix(local, "mailto") || strings.HasPrefix(local, "email") || strings.HasPrefix(local, "e-mail")) {
+		return orig, false, false
+	}
+	if escLocal && !wrapped && !isRoleLocal(local) {
+		return orig, false, false
+	}
+	if strings.HasPrefix(local, ".") {
+		core := strings.TrimLeft(local, ".")
+		if !isRoleLocal(core) {
+			return orig, false, false
+		}
+		local = core
+	}
+	if local == "" || strings.HasSuffix(local, ".") || strings.Contains(local, "..") {
+		return orig, false, false
+	}
+
+	if trimmed := strings.Trim(domain, "."); trimmed != domain {
+		if _, err := publicsuffix.EffectiveTLDPlusOne(trimmed); err != nil {
+			return orig, false, false // only a public suffix left
+		}
+		domain = trimmed
+	}
+	if strings.Contains(domain, "..") {
+		return orig, false, false
+	}
+
+	all := local + "@" + domain
+	for i := 0; i < len(all); i++ {
+		if c := all[i]; c >= 0x80 || strings.IndexByte("%&*!=", c) >= 0 {
+			return orig, false, false
+		}
+	}
+	if placeholders[local] || strings.Contains(local, "xxx") || strings.Contains(domain, "xxx") {
+		return orig, false, false
+	}
+	if all != orig && (domain == "gmail.com" || domain == "googlemail.com") && !gmailOK(local, domain) {
+		return orig, false, false
+	}
+	return all, all != orig, true
+}
+
+// CleanList repairs each address with Repair, drops the ones that are not ok,
+// and dedupes the rest keeping order. An input holding several addresses
+// separated by whitespace, commas or semicolons is split first; "@@" is never
+// split and is rejected.
+func CleanList(emails []string) []string {
+	var out []string
+	seen := make(map[string]bool, len(emails))
+	add := func(e string) {
+		fixed, _, ok := Repair(e)
+		if ok && !seen[fixed] {
+			seen[fixed] = true
+			out = append(out, fixed)
+		}
+	}
+	for _, e := range emails {
+		if strings.Count(e, "@") > 1 && !strings.Contains(e, "@@") {
+			for _, piece := range multiSep.Split(e, -1) {
+				add(piece)
+			}
+			continue
+		}
+		add(e)
+	}
+	return out
+}
+
+var multiSep = regexp.MustCompile(`[\s,;]+`)
+
 // Repair is RepairCtx without context: only the phone and TLD rules can fire.
 func Repair(email string) (fixed string, changed bool, ok bool) {
 	fixed, rules, ok := RepairCtx(email, Context{})
@@ -308,11 +476,18 @@ func Repair(email string) (fixed string, changed bool, ok bool) {
 // result is still not a clean address.
 func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) {
 	orig := strings.ToLower(strings.TrimSpace(email))
-	at := strings.LastIndex(orig, "@")
-	if at < 0 {
-		return orig, nil, false
+	s, synChanged, synOK := normalizeSyntax(email)
+	if !synOK {
+		return orig, []string{"syntax"}, false
 	}
-	local, domain := orig[:at], orig[at+1:]
+	if synChanged {
+		rules = append(rules, "syntax")
+	}
+	at := strings.LastIndex(s, "@")
+	if at < 0 {
+		return s, rules, false
+	}
+	local, domain := s[:at], s[at+1:]
 
 	if d := cutGluedTLD(domain); d != domain {
 		domain, rules = d, append(rules, "tld")
@@ -329,7 +504,15 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 
 	fixed = local + "@" + domain
-	if len(local) < 2 || !cleanRe.MatchString(fixed) {
+	if len(local) < 2 {
+		return fixed, rules, false
+	}
+	// A CRM-invalid result that no rule fixed is still flagged, so repair-emails
+	// marks the row malformed instead of leaving it exportable.
+	if strings.HasPrefix(local, ".") || strings.Contains(fixed, "..") || !cleanRe.MatchString(fixed) {
+		if !slices.Contains(rules, "syntax") {
+			rules = append(rules, "syntax")
+		}
 		return fixed, rules, false
 	}
 	return fixed, rules, IsTLD(domain[strings.LastIndex(domain, ".")+1:])
