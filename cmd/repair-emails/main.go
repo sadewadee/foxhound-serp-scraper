@@ -10,6 +10,9 @@
 //	-mode map    -in <file> -out <file>: old_email,new_email,action for a list of
 //	             emails, no database (used to build the CRM correction list); only the
 //	             context-free rules (phone, tld) apply here
+//	-mode revert -in <file> -backup YYYYMMDD [-commit] [-out <csv>]: puts back the rows
+//	             of one apply run (ids from -in, plus rows that merged into them). Dry run
+//	             unless -commit; the whole revert is one transaction. See revert.go
 //
 // Actions: split (a field holding several addresses becomes one row per valid
 // address; the original row is marked malformed), update (fixed address is new, row is rewritten and re-queued for
@@ -25,6 +28,8 @@
 //	POSTGRES_DSN=... ./repair-emails -mode scan -out fixes.csv
 //	POSTGRES_DSN=... ./repair-emails -mode apply -out applied.csv [-from-id N]
 //	./repair-emails -mode map -in emails.txt -out corrections.csv
+//	POSTGRES_DSN=... ./repair-emails -mode revert -in ids.txt -backup 20261110 -out revert.csv
+//	POSTGRES_DSN=... ./repair-emails -mode revert -in ids.txt -backup 20261110 -commit
 package main
 
 import (
@@ -114,10 +119,12 @@ func validTLD(email string) bool {
 }
 
 func main() {
-	mode := flag.String("mode", "scan", "scan | apply | map")
+	mode := flag.String("mode", "scan", "scan | apply | map | revert")
 	out := flag.String("out", "", "output CSV path (required for scan and map)")
-	in := flag.String("in", "", "map mode: input file, one email per line or first CSV column")
+	in := flag.String("in", "", "map and revert mode: input file, one id or email per line, or first CSV column")
 	fromID := flag.Int64("from-id", 0, "resume: start scanning at this emails.id")
+	backup := flag.String("backup", "", "revert mode: YYYYMMDD suffix of the apply run to revert")
+	commit := flag.Bool("commit", false, "revert mode: commit; without it the revert is a dry run that rolls back")
 	flag.Parse()
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
@@ -126,6 +133,8 @@ func main() {
 	switch *mode {
 	case "map":
 		err = runMap(*in, *out)
+	case "revert":
+		err = runRevert(*in, *backup, *commit, *out)
 	case "scan", "apply":
 		if *mode == "scan" && *out == "" {
 			err = fmt.Errorf("-out is required for scan")
