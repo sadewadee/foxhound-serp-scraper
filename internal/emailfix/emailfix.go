@@ -213,13 +213,8 @@ var protectedLeads = map[string]bool{
 	"tech": true, "technical": true, "web": true, "pro": true, "request": true,
 	"more": true, "get": true, "ask": true, "online": true, "free": true,
 	"news": true, "system": true, "site": true, "sales": true, "service": true,
-	"order": true, "product": true,
+	"order": true, "product": true, "say": true,
 }
-
-// ownDomainRoles are the only roles trusted on the listing's own domain without
-// a standalone twin; compounds like "techsupport" or "ptymail" are too common
-// for support/admin/mail/office.
-var ownDomainRoles = map[string]bool{"info": true, "contact": true, "kontakt": true, "hello": true}
 
 func isRoleLocal(s string) bool {
 	for _, r := range prefixRoles {
@@ -282,7 +277,10 @@ func stripPlaceGlue(local, domain string, c Context) (string, bool) {
 		if !allLetters(lead) || protectedLeads[lead] || isRoleLocal(lead) {
 			continue
 		}
-		if acceptStripped(role, domain, c, ownDomainRoles[role] && c.ownDomain(domain)) {
+		// Only a role linked to this listing proves the lead is glue. An existing
+		// role elsewhere in the DB, or the listing's own domain, is not evidence:
+		// "baainfo@jumeirah.com" is a real mailbox, not "info" with a prefix.
+		if gmailOK(role, domain) && c.linked(role+"@"+domain) {
 			return role, true
 		}
 	}
