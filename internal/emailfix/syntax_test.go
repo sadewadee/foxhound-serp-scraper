@@ -582,6 +582,10 @@ func TestRepairFixedPoint(t *testing.T) {
 		"info@fixture.cominstagraminstagram.com", "info@fixture.live.com.aufacebook.com", "info@fixture.comview",
 		"+1-212-555-7575info@studio.com", "9346082info@yahoo.com", "201010.01mark@yahoo.com", "emailteam@fixture.org",
 		"gaelkm@yahoo.comfacebook.com", "anna@acmeyoga.comacmeyoga.com", "hello@liveingermany.de/",
+		"90067emailsupport@fixture.co", "0285e-maildani@fixture.com.br", "77784592525e-mailanna.k@mail.ru",
+		"39emailjane.doe@gmail.com", "307-200e-mailpoststelle@fixture.de", "0e-mailjane.doe@fixture.de",
+		"577-0e-mailbuergermeister@fixture.dewebwww.fixture-vg.de", "0507emailinfo@fixture.nlwebsitefixture.nl",
+		"2020email@fixture.com", "123mailbox@fixture.com", "studio54emailinfo@fixture.com", "39emailbob@gmail.com",
 	}
 	ctxs := []Context{{}, team,
 		{Exists: func(string) bool { return true }},
@@ -621,9 +625,9 @@ func TestRepairWebSocialGlue(t *testing.T) {
 		{"kontakt@fixture.dewebwww.other-fixture.de", "kontakt@fixture.de", []string{"middomain"}, true},
 		{"e-mailkontakt@fixture.dewebsitefixture.de", "kontakt@fixture.de", []string{"middomain", "label"}, true},
 		{"info@fixture.dewebwww.fs-fixture.de", "info@fixture.de", []string{"middomain"}, true},
-		// Domain is cut, local stays glued ("0761" is too short to be a phone run): rejected.
-		{"0761emailinfo@fixture.com.phwebsitefixture.com.ph", "0761emailinfo@fixture.com.ph", []string{"middomain"}, false},
-		{"801600e-mailkreisarchiv@fixture.dewebwww.fixture-kreis.de", "801600e-mailkreisarchiv@fixture.de", []string{"middomain"}, false},
+		// The literal email label proves the left boundary, so the local strip vouches for the cut.
+		{"0761emailinfo@fixture.com.phwebsitefixture.com.ph", "info@fixture.com.ph", []string{"middomain", "phone", "label"}, true},
+		{"801600e-mailkreisarchiv@fixture.dewebwww.fixture-kreis.de", "kreisarchiv@fixture.de", []string{"middomain", "phone", "label"}, true},
 		{"newsletter.someone@fixture.cominstagram.com", "newsletter.someone@fixture.com", []string{"middomain"}, false},
 	} {
 		got, rules, ok := RepairCtx(c.in, Context{})
@@ -638,6 +642,40 @@ func TestRepairWebSocialGlue(t *testing.T) {
 		"kefu@idc.ucweb.com", "bob@dept.fourlakes.com", "info@fixture.comurlaub.de", "info@fixture.comweb.de",
 		"xy@fixture.comwebmail.com", "post@fixture.nowebbladfixtureoslo.no",
 	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}
+
+// TestRepairDigitEmailLabel: a short digit run glued before a literal email/e-mail
+// label is stripped; the label proves the left boundary, also on free-mail and for
+// a domain cut.
+func TestRepairDigitEmailLabel(t *testing.T) {
+	for _, c := range []struct {
+		in, want string
+		rules    []string
+	}{
+		{"90067emailsupport@fixture.co", "support@fixture.co", []string{"phone", "label"}},
+		{"0285e-maildani@fixture.com.br", "dani@fixture.com.br", []string{"phone", "label"}},
+		{"77784592525e-mailanna.k@mail.ru", "anna.k@mail.ru", []string{"phone", "label"}},
+		{"39emailjane.doe@gmail.com", "jane.doe@gmail.com", []string{"phone", "label"}},
+		{"307-200e-mailpoststelle@fixture.de", "poststelle@fixture.de", []string{"phone", "label"}},
+		{"0e-mailjane.doe@fixture.de", "jane.doe@fixture.de", []string{"phone", "label"}},
+		{"577-0e-mailbuergermeister@fixture.dewebwww.fixture-vg.de", "buergermeister@fixture.de", []string{"middomain", "phone", "label"}},
+		{"0507emailinfo@fixture.nlwebsitefixture.nl", "info@fixture.nl", []string{"middomain", "phone", "label"}},
+		{"8001151emailinfo@fixture.com", "info@fixture.com", []string{"phone", "label"}},
+	} {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok || !slices.Equal(rules, c.rules) {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, %v, true)", c.in, got, rules, ok, c.want, c.rules)
+		}
+		assertCRM(t, got)
+	}
+	// Not repaired: empty remainder, "mail" is not the label, letters before the digits,
+	// and a free-mail remainder under 6 chars (gmailOK).
+	for _, in := range []string{"2020email@fixture.com", "123mailbox@fixture.com", "studio54emailinfo@fixture.com", "39emailbob@gmail.com"} {
 		got, rules, ok := RepairCtx(in, Context{})
 		if got != in || len(rules) != 0 || !ok {
 			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)

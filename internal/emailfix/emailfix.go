@@ -304,6 +304,11 @@ var midFreeMail = map[string]bool{
 // then continues; group 1 is the continuation.
 var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
 
+// digitEmailLabel matches a short digit run glued before a literal "email" or
+// "e-mail" label ("Tel 0761 Email: info@x"). The run is too short for
+// stripPhonePrefix, but the label proves the address starts right after it.
+var digitEmailLabel = regexp.MustCompile(`^[0-9][0-9().+-]*(?:e-mail|email)[-._:]?(.+)$`)
+
 // domainGlue matches a TLD or a short label glued to a provider name in a domain
 // ("msn.comyahoo.com.sa", "yahoo.com.hkhotmail.com"). "live", "ymail" are left out.
 var domainGlue = regexp.MustCompile(`(^|\.)(com|net|org|edu|gov|[a-z]{2})(gmail|googlemail|yahoo|hotmail|outlook|msn|aol|icloud|gmx)(\.|$)`)
@@ -767,10 +772,13 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 			rules = append(rules, r)
 		}
 	}
+	var bounded bool // a literal label proved the left boundary of the address
 	for round := 0; round < 4; round++ {
-		var next, rule string
+		var next, rule, also string
 		var phoneStrip bool
-		if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
+		if m := digitEmailLabel.FindStringSubmatch(local); m != nil && len(m[1]) >= 2 && gmailOK(m[1], domain) {
+			next, rule, also, bounded = m[1], "phone", "label", true
+		} else if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 			next, rule, phoneStrip = l, "phone", true
 		} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
 			// A glued run before the local part is stripped only when the tail vouches
@@ -785,6 +793,9 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 		}
 		local = next
 		addRule(rule)
+		if also != "" {
+			addRule(also)
+		}
 		if phoneStrip && isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 && !c.linked(local+"@"+domain) {
 			// On free-mail any short remainder is likely another person's mailbox,
 			// role words included: "info" is generic only on a business domain. A linked
@@ -805,7 +816,7 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 		addRule("syntax")
 		return fixed, rules, false
 	}
-	if cut && !cutEvidence(local, fixed, tail, domain, c) {
+	if cut && !bounded && !cutEvidence(local, fixed, tail, domain, c) {
 		return fixed, rules, false
 	}
 	// A CRM-invalid result that no rule fixed is still flagged, so repair-emails
