@@ -318,6 +318,36 @@ var midFreeMail = map[string]bool{
 // then continues; group 1 is the continuation.
 var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
 
+// digitRole matches 2-6 digits glued before a role word ("240info"), the shape
+// of page text like "Tel 240 info@x". The run is too short for stripPhonePrefix.
+// The role word must end at the separator or at the end of the local part.
+var digitRole = regexp.MustCompile(`^([0-9]{2,6})((?:info|contact|hello|office|admin|mail|bookings|booking|sales|support|enquiries|reception|kontakt|contato|contacto)(?:[._-].*)?)$`)
+
+// digitRoleStrip returns local without its glued digit run and whether the role
+// word alone proves the left boundary. A bare role word on a business domain
+// proves it. A longer remainder, or any free-mail domain, needs the stripped
+// address to exist (or be linked). A domain named after the digits or the whole
+// local part is a brand ("24info@24info.ru"), not glue.
+func digitRoleStrip(local, domain string, c Context) (stripped string, bounded, ok bool) {
+	m := digitRole.FindStringSubmatch(local)
+	if m == nil {
+		return "", false, false
+	}
+	first, _, _ := strings.Cut(domain, ".")
+	if strings.HasPrefix(first, m[1]) || strings.Contains(first, local) {
+		return "", false, false
+	}
+	stripped = m[2]
+	bare := !strings.ContainsAny(stripped, "._-")
+	if bare && !isFreeMail(domain) {
+		return stripped, true, true
+	}
+	if addr := stripped + "@" + domain; c.linked(addr) || c.exists(addr) {
+		return stripped, false, true
+	}
+	return "", false, false
+}
+
 // digitEmailLabel matches a short digit run glued before a literal "email" or
 // "e-mail" label ("Tel 0761 Email: info@x"). The run is too short for
 // stripPhonePrefix, but the label proves the address starts right after it.
@@ -792,6 +822,9 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 		var phoneStrip bool
 		if m := digitEmailLabel.FindStringSubmatch(local); m != nil && len(m[1]) >= 2 && gmailOK(m[1], domain) {
 			next, rule, also, bounded = m[1], "phone", "label", true
+		} else if l, b, hit := digitRoleStrip(local, domain, c); hit {
+			next, rule = l, "digitrole"
+			bounded = bounded || b
 		} else if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
 			next, rule, phoneStrip = l, "phone", true
 		} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
