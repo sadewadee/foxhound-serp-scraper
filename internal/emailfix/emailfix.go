@@ -769,8 +769,9 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	}
 	for round := 0; round < 4; round++ {
 		var next, rule string
+		var phoneStrip bool
 		if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
-			next, rule = l, "phone"
+			next, rule, phoneStrip = l, "phone", true
 		} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
 			// A glued run before the local part is stripped only when the tail vouches
 			// for the rest.
@@ -782,10 +783,9 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 		} else {
 			break
 		}
-		wasPhone := stripPhonePrefix(local, domain) != local
 		local = next
 		addRule(rule)
-		if rule == "phone" && wasPhone && isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 && !c.linked(local+"@"+domain) {
+		if phoneStrip && isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 && !c.linked(local+"@"+domain) {
 			// On free-mail any short remainder is likely another person's mailbox,
 			// role words included: "info" is generic only on a business domain. A linked
 			// address for this listing is the exception.
