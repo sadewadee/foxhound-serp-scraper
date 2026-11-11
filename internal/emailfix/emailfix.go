@@ -40,12 +40,26 @@ var prefixWords = map[string]bool{
 // placeholders are local parts that only appear in form examples.
 var placeholders = map[string]bool{
 	"nachname": true, "nazwisko": true, "vorname": true, "yourname": true,
-	"name": true, "email": true, "username": true,
+	"name": true, "username": true,
 }
 
-// isPlaceholder reports whether an address is a form example ("name@", "xxx").
+// isPlaceholder reports whether an address is a form example ("name@") or a
+// masked one ("nxxxxxxxxxxx@"). A bare "xxx" inside a word is a real handle
+// ("sun.moon.xxx.aki", "xxxlutz.ch"), so only mask shapes count.
 func isPlaceholder(local, domain string) bool {
-	return placeholders[local] || strings.Contains(local, "xxx") || strings.Contains(domain, "xxx")
+	if placeholders[local] || strings.Contains(local, "xxxx") || strings.Contains(domain, "xxxx") {
+		return true
+	}
+	if len(local) >= 3 && strings.Trim(local, "x") == "" {
+		return true
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) >= 3 && strings.Trim(label, "x") == "" {
+			return true
+		}
+	}
+	// Few characters left once the x's are gone: "axxx", "xxxn", "kxxx6x".
+	return strings.Contains(local, "xxx") && len(strings.ReplaceAll(local, "x", "")) < 3
 }
 
 func isAlnum(c byte) bool {

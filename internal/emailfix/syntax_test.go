@@ -566,7 +566,7 @@ func TestRepairFixedPoint(t *testing.T) {
 	}{
 		{"8001151emailinfo@fixture.org", "info@fixture.org", Context{}, []string{"phone", "label"}, true},
 		{"24504800-934-9410emailteam@fixture.org", "team@fixture.org", team, []string{"phone", "label"}, true},
-		{"+4912345678email@fixture.org", "email@fixture.org", Context{}, []string{"phone", "syntax"}, false},
+		{"+4912345678email@fixture.org", "email@fixture.org", Context{}, []string{"phone"}, true},
 		{"+4912345678name@fixture.org", "name@fixture.org", Context{}, []string{"phone", "syntax"}, false},
 	} {
 		got, rules, ok := RepairCtx(c.in, c.ctx)
@@ -676,6 +676,28 @@ func TestRepairDigitEmailLabel(t *testing.T) {
 	// Not repaired: empty remainder, "mail" is not the label, letters before the digits,
 	// and a free-mail remainder under 6 chars (gmailOK).
 	for _, in := range []string{"2020email@fixture.com", "123mailbox@fixture.com", "studio54emailinfo@fixture.com", "39emailbob@gmail.com"} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}
+
+// TestPlaceholderMasks: mask shapes are placeholders, real handles that merely
+// contain "xxx" or "email" are not.
+func TestPlaceholderMasks(t *testing.T) {
+	for _, in := range []string{
+		"xxxx@fixture.com", "xxx@fixture.com", "nxxxxxxxxxxx@gmail.com", "rxxxxr@fixture.com", "axxx@fixture.com",
+		"support@xxx.com", "jane@xxxxxxxxxxxx.de", "name@fixture.com",
+	} {
+		if got, _, ok := RepairCtx(in, Context{}); ok {
+			t.Errorf("RepairCtx(%q) = (%q, _, true), want placeholder ok=false", in, got)
+		}
+	}
+	for _, in := range []string{
+		"email@janedoe-fixture.com", "sun.moon.xxx.aki@gmail.com", "fixture_xxx@hotmail.com",
+		"sweetfixture9xxx@gmail.com", "fil.j8@xxxlutz.ch", "info@exxxtrafixture.com", "alexxx114411@gmail.com",
+	} {
 		got, rules, ok := RepairCtx(in, Context{})
 		if got != in || len(rules) != 0 || !ok {
 			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
