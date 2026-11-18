@@ -392,8 +392,6 @@ func TestRepairGlueBoundary(t *testing.T) {
 		"0612345678coachanna@gmail.comwww.facebook.com",
 		"2010boardmembers@hotmail.comother.kw",
 		"ltd0612345678brandname@gmail.comwww.facebook.com",
-		// Four digits are below the phone rule; no evidence in the tail.
-		"6789info@internetspeedtest.prointernetspeedtest.pro",
 		// Left part is not vouched by the tail and is not a role word on a non-free domain.
 		"0612345678anna@acmeyoga.comwww.acmeyoga.com",
 		"lee@studio-one.netwww.other-site.net",
@@ -549,5 +547,198 @@ func TestRepairLinkedEvidence(t *testing.T) {
 	}
 	if got, _, ok := RepairCtx("gaelkm@yahoo.comfacebook.com", existsOnly); ok {
 		t.Errorf("RepairCtx(gaelkm@yahoo.comfacebook.com) with Exists only = (%q, _, true), want ok=false", got)
+	}
+}
+
+// TestRepairFixedPoint: one RepairCtx call gives what a second call would.
+func TestRepairFixedPoint(t *testing.T) {
+	team := Context{
+		Exists:       func(e string) bool { return e == "team@fixture.org" },
+		ExistsLinked: func(e string) bool { return e == "team@fixture.org" },
+	}
+	for _, c := range []struct {
+		in, want string
+		ctx      Context
+		rules    []string
+		ok       bool
+	}{
+		{"8001151emailinfo@fixture.org", "info@fixture.org", Context{}, []string{"phone", "label"}, true},
+		{"24504800-934-9410emailteam@fixture.org", "team@fixture.org", team, []string{"phone", "label"}, true},
+		{"+4912345678email@fixture.org", "email@fixture.org", Context{}, []string{"phone"}, true},
+		{"+4912345678name@fixture.org", "name@fixture.org", Context{}, []string{"phone", "syntax"}, false},
+	} {
+		got, rules, ok := RepairCtx(c.in, c.ctx)
+		if got != c.want || ok != c.ok || !slices.Equal(rules, c.rules) {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, %v, %v)", c.in, got, rules, ok, c.want, c.rules, c.ok)
+		}
+	}
+
+	// Property: repairing the output changes nothing, for every input the tables use.
+	inputs := []string{
+		"8001151emailinfo@fixture.org", "24504800-934-9410emailteam@fixture.org", "+4912345678email@fixture.org",
+		"info@fixture.comwebsitewww.fixture.com", "info@fixture.dewebsitefixture.de", "info@fixture.comfacebook.com",
+		"info@fixture.cominstagraminstagram.com", "info@fixture.live.com.aufacebook.com", "info@fixture.comview",
+		"+1-212-555-7575info@studio.com", "9346082info@yahoo.com", "201010.01mark@yahoo.com", "emailteam@fixture.org",
+		"gaelkm@yahoo.comfacebook.com", "anna@acmeyoga.comacmeyoga.com", "hello@liveingermany.de/",
+		"90067emailsupport@fixture.co", "0285e-maildani@fixture.com.br", "77784592525e-mailanna.k@mail.ru",
+		"39emailjane.doe@gmail.com", "307-200e-mailpoststelle@fixture.de", "0e-mailjane.doe@fixture.de",
+		"577-0e-mailbuergermeister@fixture.dewebwww.fixture-vg.de", "0507emailinfo@fixture.nlwebsitefixture.nl",
+		"240info@fixture.de", "0507info@fixture.nlwebsitefixture.nl", "24info@24info.ru", "99contact.studio@gmail.com",
+		"2020email@fixture.com", "123mailbox@fixture.com", "studio54emailinfo@fixture.com", "39emailbob@gmail.com",
+	}
+	ctxs := []Context{{}, team,
+		{Exists: func(string) bool { return true }},
+		{ExistsLinked: func(e string) bool { return e == "mark@yahoo.com" || e == "gaelkm@yahoo.com" }}}
+	for _, in := range inputs {
+		for i, c := range ctxs {
+			once, _, ok1 := RepairCtx(in, c)
+			twice, rules2, ok2 := RepairCtx(once, c)
+			// A rejected repair (ok=false) is not applied, so only its string must be stable.
+			if once != twice || (ok1 && (!ok2 || len(rules2) != 0)) {
+				t.Errorf("not a fixed point (ctx %d): %q -> %q -> %q (%v) ok %v/%v", i, in, once, twice, rules2, ok1, ok2)
+			}
+		}
+	}
+}
+
+// TestRepairWebSocialGlue: web or social text after a TLD is cut; real domains that
+// merely contain a web word are not.
+func TestRepairWebSocialGlue(t *testing.T) {
+	for _, c := range []struct {
+		in, want string
+		rules    []string
+		ok       bool
+	}{
+		{"info@fixture.comwebsitewww.fixture.com", "info@fixture.com", []string{"middomain"}, true},
+		{"info@fixture.dewebsitefixture.de", "info@fixture.de", []string{"middomain"}, true},
+		{"info@fixture.comfacebook.com", "info@fixture.com", []string{"middomain"}, true},
+		{"info@fixture.cominstagraminstagram.com", "info@fixture.com", []string{"middomain"}, true},
+		{"info@fixture.live.com.aufacebook.com", "info@fixture.live.com.au", []string{"middomain"}, true},
+		{"emailinfo@fixture.comfacebookfacebook.com", "info@fixture.com", []string{"middomain", "label"}, true},
+		{"info@fixture.orgfacebook.com", "info@fixture.org", []string{"middomain"}, true},
+		// "team" is not a role word (syntaxRoles), so the cut has no evidence: rejected.
+		{"team@fixture.comlinkedin.com", "team@fixture.com", []string{"middomain"}, false},
+		{"usinfo@fixture.orgfacebook.com", "usinfo@fixture.org", []string{"middomain"}, false},
+		// Free-mail-like local part without evidence: rejected.
+		{"jane.doe.fixture@live.com.aufacebook.com", "jane.doe.fixture@live.com.au", []string{"middomain"}, false},
+		{"kontakt@fixture.dewebwww.other-fixture.de", "kontakt@fixture.de", []string{"middomain"}, true},
+		{"e-mailkontakt@fixture.dewebsitefixture.de", "kontakt@fixture.de", []string{"middomain", "label"}, true},
+		{"info@fixture.dewebwww.fs-fixture.de", "info@fixture.de", []string{"middomain"}, true},
+		// The literal email label proves the left boundary, so the local strip vouches for the cut.
+		{"0761emailinfo@fixture.com.phwebsitefixture.com.ph", "info@fixture.com.ph", []string{"middomain", "phone", "label"}, true},
+		{"801600e-mailkreisarchiv@fixture.dewebwww.fixture-kreis.de", "kreisarchiv@fixture.de", []string{"middomain", "phone", "label"}, true},
+		{"newsletter.someone@fixture.cominstagram.com", "newsletter.someone@fixture.com", []string{"middomain"}, false},
+	} {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || ok != c.ok || !slices.Equal(rules, c.rules) {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, %v, %v)", c.in, got, rules, ok, c.want, c.rules, c.ok)
+		}
+	}
+	// Real domains that contain a web word: unchanged. The subdomain forms reach the
+	// web-word branch of cutMidDomain; the .com* forms are TLD-prefix lookalikes.
+	for _, in := range []string{
+		"anna@shop.tmweb.ru", "sales@mysite.vpweb.com", "user@mb.infoweb.ne.jp", "info@parks.myweblinx.net",
+		"kefu@idc.ucweb.com", "bob@dept.fourlakes.com", "info@fixture.comurlaub.de", "info@fixture.comweb.de",
+		"xy@fixture.comwebmail.com", "post@fixture.nowebbladfixtureoslo.no",
+	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}
+
+// TestRepairDigitEmailLabel: a short digit run glued before a literal email/e-mail
+// label is stripped; the label proves the left boundary, also on free-mail and for
+// a domain cut.
+func TestRepairDigitEmailLabel(t *testing.T) {
+	for _, c := range []struct {
+		in, want string
+		rules    []string
+	}{
+		{"90067emailsupport@fixture.co", "support@fixture.co", []string{"phone", "label"}},
+		{"0285e-maildani@fixture.com.br", "dani@fixture.com.br", []string{"phone", "label"}},
+		{"77784592525e-mailanna.k@mail.ru", "anna.k@mail.ru", []string{"phone", "label"}},
+		{"39emailjane.doe@gmail.com", "jane.doe@gmail.com", []string{"phone", "label"}},
+		{"307-200e-mailpoststelle@fixture.de", "poststelle@fixture.de", []string{"phone", "label"}},
+		{"0e-mailjane.doe@fixture.de", "jane.doe@fixture.de", []string{"phone", "label"}},
+		{"577-0e-mailbuergermeister@fixture.dewebwww.fixture-vg.de", "buergermeister@fixture.de", []string{"middomain", "phone", "label"}},
+		{"0507emailinfo@fixture.nlwebsitefixture.nl", "info@fixture.nl", []string{"middomain", "phone", "label"}},
+		{"8001151emailinfo@fixture.com", "info@fixture.com", []string{"phone", "label"}},
+	} {
+		got, rules, ok := RepairCtx(c.in, Context{})
+		if got != c.want || !ok || !slices.Equal(rules, c.rules) {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, %v, true)", c.in, got, rules, ok, c.want, c.rules)
+		}
+		assertCRM(t, got)
+	}
+	// Not repaired: empty remainder, "mail" is not the label, letters before the digits,
+	// and a free-mail remainder under 6 chars (gmailOK).
+	for _, in := range []string{"2020email@fixture.com", "123mailbox@fixture.com", "studio54emailinfo@fixture.com", "39emailbob@gmail.com"} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}
+
+// TestPlaceholderMasks: mask shapes are placeholders, real handles that merely
+// contain "xxx" or "email" are not.
+func TestPlaceholderMasks(t *testing.T) {
+	for _, in := range []string{
+		"xxxx@fixture.com", "xxx@fixture.com", "nxxxxxxxxxxx@gmail.com", "rxxxxr@fixture.com", "axxx@fixture.com",
+		"support@xxx.com", "jane@xxxxxxxxxxxx.de", "name@fixture.com",
+	} {
+		if got, _, ok := RepairCtx(in, Context{}); ok {
+			t.Errorf("RepairCtx(%q) = (%q, _, true), want placeholder ok=false", in, got)
+		}
+	}
+	for _, in := range []string{
+		"email@janedoe-fixture.com", "sun.moon.xxx.aki@gmail.com", "fixture_xxx@hotmail.com",
+		"sweetfixture9xxx@gmail.com", "fil.j8@xxxlutz.ch", "info@exxxtrafixture.com", "alexxx114411@gmail.com",
+	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
+	}
+}
+
+// TestRepairDigitRole: 2-6 digits glued before a role word are stripped. A bare
+// role word on a business domain proves the boundary; a longer remainder or a
+// free-mail domain needs the stripped address to exist. A brand domain is left alone.
+func TestRepairDigitRole(t *testing.T) {
+	ev := Context{Exists: func(e string) bool { return e == "info.colombo@fixture.lk" || e == "contact.studio@gmail.com" }}
+	for _, c := range []struct {
+		in, want string
+		ctx      Context
+		rules    []string
+	}{
+		{"240info@fixture.de", "info@fixture.de", Context{}, []string{"digitrole"}},
+		{"01contact@fixture-scorer.com", "contact@fixture-scorer.com", Context{}, []string{"digitrole"}},
+		{"093554info@fixture.org.uk", "info@fixture.org.uk", Context{}, []string{"digitrole"}},
+		{"9092info@fixtureyoga.com", "info@fixtureyoga.com", Context{}, []string{"digitrole"}},
+		{"12info.colombo@fixture.lk", "info.colombo@fixture.lk", ev, []string{"digitrole"}},
+		{"99contact.studio@gmail.com", "contact.studio@gmail.com", ev, []string{"digitrole"}},
+		// Web cut first, then digitrole; the role word vouches for the cut.
+		{"0507info@fixture.nlwebsitefixture.nl", "info@fixture.nl", Context{}, []string{"middomain", "digitrole"}},
+		{"6789info@internetspeedtest.prointernetspeedtest.pro", "info@internetspeedtest.pro", Context{}, []string{"middomain", "digitrole"}},
+	} {
+		got, rules, ok := RepairCtx(c.in, c.ctx)
+		if got != c.want || !ok || !slices.Equal(rules, c.rules) {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want (%q, %v, true)", c.in, got, rules, ok, c.want, c.rules)
+		}
+		assertCRM(t, got)
+	}
+	// Unchanged, ok=true: no evidence, brand domain, role word not ended by a
+	// separator, single digit, free-mail without evidence.
+	for _, in := range []string{
+		"12info.colombo@fixture.lk", "24info@24info.ru", "123contact@123contact.com",
+		"99contact.studio@gmail.com", "2020mailbox@fixture.com", "5info@fixture.de", "240info@gmail.com",
+	} {
+		got, rules, ok := RepairCtx(in, Context{})
+		if got != in || len(rules) != 0 || !ok {
+			t.Errorf("RepairCtx(%q) = (%q, %v, %v), want unchanged ok=true", in, got, rules, ok)
+		}
 	}
 }

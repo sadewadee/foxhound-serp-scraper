@@ -40,7 +40,26 @@ var prefixWords = map[string]bool{
 // placeholders are local parts that only appear in form examples.
 var placeholders = map[string]bool{
 	"nachname": true, "nazwisko": true, "vorname": true, "yourname": true,
-	"name": true, "email": true, "username": true,
+	"name": true, "username": true,
+}
+
+// isPlaceholder reports whether an address is a form example ("name@") or a
+// masked one ("nxxxxxxxxxxx@"). A bare "xxx" inside a word is a real handle
+// ("sun.moon.xxx.aki", "xxxlutz.ch"), so only mask shapes count.
+func isPlaceholder(local, domain string) bool {
+	if placeholders[local] || strings.Contains(local, "xxxx") || strings.Contains(domain, "xxxx") {
+		return true
+	}
+	if len(local) >= 3 && strings.Trim(local, "x") == "" {
+		return true
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) >= 3 && strings.Trim(label, "x") == "" {
+			return true
+		}
+	}
+	// Few characters left once the x's are gone: "axxx", "xxxn", "kxxx6x".
+	return strings.Contains(local, "xxx") && len(strings.ReplaceAll(local, "x", "")) < 3
 }
 
 func isAlnum(c byte) bool {
@@ -299,6 +318,41 @@ var midFreeMail = map[string]bool{
 // then continues; group 1 is the continuation.
 var glueLead = regexp.MustCompile(`^[a-z]{0,4}\d{3,}[-._]?([a-z].*)$`)
 
+// digitRole matches 2-6 digits glued before a role word ("240info"), the shape
+// of page text like "Tel 240 info@x". The run is too short for stripPhonePrefix.
+// The role word must end at the separator or at the end of the local part.
+var digitRole = regexp.MustCompile(`^([0-9]{2,6})((?:info|contact|hello|office|admin|mail|bookings|booking|sales|support|enquiries|reception|kontakt|contato|contacto)(?:[._-].*)?)$`)
+
+// digitRoleStrip returns local without its glued digit run and whether the role
+// word alone proves the left boundary. A bare role word on a business domain
+// proves it. A longer remainder, or any free-mail domain, needs the stripped
+// address to exist (or be linked). A domain named after the digits or the whole
+// local part is a brand ("24info@24info.ru"), not glue.
+func digitRoleStrip(local, domain string, c Context) (stripped string, bounded, ok bool) {
+	m := digitRole.FindStringSubmatch(local)
+	if m == nil {
+		return "", false, false
+	}
+	first, _, _ := strings.Cut(domain, ".")
+	if strings.HasPrefix(first, m[1]) || strings.Contains(first, local) {
+		return "", false, false
+	}
+	stripped = m[2]
+	bare := !strings.ContainsAny(stripped, "._-")
+	if bare && !isFreeMail(domain) {
+		return stripped, true, true
+	}
+	if addr := stripped + "@" + domain; c.linked(addr) || c.exists(addr) {
+		return stripped, false, true
+	}
+	return "", false, false
+}
+
+// digitEmailLabel matches a short digit run glued before a literal "email" or
+// "e-mail" label ("Tel 0761 Email: info@x"). The run is too short for
+// stripPhonePrefix, but the label proves the address starts right after it.
+var digitEmailLabel = regexp.MustCompile(`^[0-9][0-9().+-]*(?:e-mail|email)[-._:]?(.+)$`)
+
 // domainGlue matches a TLD or a short label glued to a provider name in a domain
 // ("msn.comyahoo.com.sa", "yahoo.com.hkhotmail.com"). "live", "ymail" are left out.
 var domainGlue = regexp.MustCompile(`(^|\.)(com|net|org|edu|gov|[a-z]{2})(gmail|googlemail|yahoo|hotmail|outlook|msn|aol|icloud|gmx)(\.|$)`)
@@ -326,6 +380,31 @@ func glueVouched(stripped, tail, domain string) bool {
 	return false
 }
 
+// webWords introduce the site address in page text ("Website: x.de") and
+// socialHosts are share-button hosts that end up glued after an address.
+var (
+	webWords    = []string{"website", "webseite", "homepage", "web", "url"}
+	socialHosts = []string{"facebook", "instagram", "twitter", "linkedin", "youtube"}
+)
+
+// webGlue reports whether rest, the text left after a TLD-prefix cut, is web or
+// social text: a social host (optionally doubled), or a web word followed by
+// "www." or the first label of the domain. A web word alone is not enough:
+// "tmweb.ru" and "infoweb.ne.jp" are real domains.
+func webGlue(rest, first string) bool {
+	for _, w := range socialHosts {
+		if rest == w+".com" || rest == w+w+".com" {
+			return true
+		}
+	}
+	for _, w := range webWords {
+		if after, ok := strings.CutPrefix(rest, w); ok && (strings.HasPrefix(after, "www.") || (first != "" && strings.HasPrefix(after, first+"."))) {
+			return true
+		}
+	}
+	return false
+}
+
 // cutMidDomain handles text between two domains ("gmail.comfacebookfacebook.com"):
 // it cuts a non-final label back to an ICANN TLD prefix, at the first label where
 // the result is vouched for (a free-mail provider, the listing's domain, or an
@@ -346,10 +425,11 @@ func cutMidDomain(local, domain string, c Context) string {
 			}
 			d := strings.Join(labels[:j], ".") + "." + label[:n]
 			rest := label[n:] + "." + strings.Join(labels[j+1:], ".")
-			signal := strings.Contains(rest, "www") || strings.Contains(rest, labels[0])
-			// A leftover that starts with "www." or repeats the first label is glue
-			// on its own, so the cut needs no vouching.
-			glue := strings.HasPrefix(rest, "www.") || strings.HasPrefix(rest, labels[0]+".")
+			web := webGlue(rest, labels[0])
+			signal := strings.Contains(rest, "www") || strings.Contains(rest, labels[0]) || web
+			// A leftover that starts with "www.", repeats the first label or is web or
+			// social text is glue on its own, so the cut needs no vouching.
+			glue := strings.HasPrefix(rest, "www.") || strings.HasPrefix(rest, labels[0]+".") || web
 			if (n >= 3 || signal) && (glue || midFreeMail[d] || c.ownDomain(d) || c.exists(local+"@"+d)) {
 				return d
 			}
@@ -650,7 +730,7 @@ func normalizeSyntax(raw string) (string, bool, bool) {
 			return orig, false, false
 		}
 	}
-	if placeholders[local] || strings.Contains(local, "xxx") || strings.Contains(domain, "xxx") {
+	if isPlaceholder(local, domain) {
 		return orig, false, false
 	}
 	if all != orig && (domain == "gmail.com" || domain == "googlemail.com") && !gmailOK(local, domain) {
@@ -728,22 +808,47 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	tail := fullDomain[len(domain):]
 	cut := domain != fullDomain && !noLetterOrDigit(tail)
 
-	if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
-		local, rules = l, append(rules, "phone")
-		if isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 && !c.linked(local+"@"+domain) {
+	// The local-part rules repeat until none fires (bounded), so one call gives
+	// what a second call would: "8001151emailinfo" -> "emailinfo" -> "info". Each
+	// rule is named once, in first-fire order.
+	addRule := func(r string) {
+		if !slices.Contains(rules, r) {
+			rules = append(rules, r)
+		}
+	}
+	var bounded bool // a literal label proved the left boundary of the address
+	for round := 0; round < 4; round++ {
+		var next, rule, also string
+		var phoneStrip bool
+		if m := digitEmailLabel.FindStringSubmatch(local); m != nil && len(m[1]) >= 2 && gmailOK(m[1], domain) {
+			next, rule, also, bounded = m[1], "phone", "label", true
+		} else if l, b, hit := digitRoleStrip(local, domain, c); hit {
+			next, rule = l, "digitrole"
+			bounded = bounded || b
+		} else if l := stripPhonePrefix(local, domain); l != local && gmailOK(l, domain) {
+			next, rule, phoneStrip = l, "phone", true
+		} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
+			// A glued run before the local part is stripped only when the tail vouches
+			// for the rest.
+			next, rule = m[1], "phone"
+		} else if l, hit := stripLabel(local, domain, c); hit {
+			next, rule = l, "label"
+		} else if l, hit := stripPlaceGlue(local, domain, c); hit {
+			next, rule = l, "prefix"
+		} else {
+			break
+		}
+		local = next
+		addRule(rule)
+		if also != "" {
+			addRule(also)
+		}
+		if phoneStrip && isFreeMail(domain) && len(strings.ReplaceAll(local, ".", "")) < 8 && !c.linked(local+"@"+domain) {
 			// On free-mail any short remainder is likely another person's mailbox,
 			// role words included: "info" is generic only on a business domain. A linked
 			// address for this listing is the exception.
 			return local + "@" + domain, rules, false
 		}
-	} else if m := glueLead.FindStringSubmatch(local); cut && m != nil && glueVouched(m[1], tail, domain) {
-		// A glued run before the local part is stripped only when the tail vouches
-		// for the rest.
-		local, rules = m[1], append(rules, "phone")
-	} else if l, hit := stripLabel(local, domain, c); hit {
-		local, rules = l, append(rules, "label")
-	} else if l, hit := stripPlaceGlue(local, domain, c); hit {
-		local, rules = l, append(rules, "prefix")
 	}
 
 	fixed = local + "@" + domain
@@ -752,7 +857,13 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	if webHostLocal.MatchString(local) || domainGlue.MatchString(domain) {
 		return fixed, rules, false
 	}
-	if cut && !cutEvidence(local, fixed, tail, domain, c) {
+	// A strip can leave a form example ("+4912345678email" -> "email"), which
+	// normalizeSyntax only checks on the raw input.
+	if isPlaceholder(local, domain) {
+		addRule("syntax")
+		return fixed, rules, false
+	}
+	if cut && !bounded && !cutEvidence(local, fixed, tail, domain, c) {
 		return fixed, rules, false
 	}
 	// A CRM-invalid result that no rule fixed is still flagged, so repair-emails
