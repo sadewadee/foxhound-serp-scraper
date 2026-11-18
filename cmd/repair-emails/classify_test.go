@@ -108,3 +108,13 @@ func TestClassifyPhoneShortLinked(t *testing.T) {
 		t.Errorf("linked: classify(%q) = (%q, %q), want (%q, %q)", in, fixed, action, want, actUpdate)
 	}
 }
+
+func TestClassifyGmailRules(t *testing.T) {
+	if _, action, _ := classify("abcde@gmail.com", emailfix.Context{}); action != actReject {
+		t.Errorf("abcde@gmail.com action = %q, want reject", action)
+	}
+	fixed, action, _ := classify("jane.doe@gmail.con", emailfix.Context{})
+	if action != actUpdate || fixed != "jane.doe@gmail.com" {
+		t.Errorf("gmail.con = %q %q, want update jane.doe@gmail.com", fixed, action)
+	}
+}

@@ -43,11 +43,37 @@ var placeholders = map[string]bool{
 	"name": true, "username": true,
 }
 
-// isPlaceholder reports whether an address is a form example ("name@") or a
-// masked one ("nxxxxxxxxxxx@"). A bare "xxx" inside a word is a real handle
+// formExamples are local parts that, on a free-mail domain, are what a form
+// shows as an example ("you@live.com"). On a business domain "email@" is real.
+var formExamples = map[string]bool{
+	"test": true, "email": true, "e-mail": true, "you": true, "your": true,
+	"youremail": true, "your.email": true, "yourmail": true, "example": true,
+}
+
+// reservedDomains are RFC 2606 example domains; they and their subdomains never
+// belong to a real mailbox.
+var reservedDomains = []string{"example.com", "example.net", "example.org"}
+
+// reservedTLDs are RFC 2606 reserved last labels.
+var reservedTLDs = map[string]bool{"example": true, "test": true, "invalid": true, "localhost": true}
+
+// isPlaceholder reports whether an address is a form example ("name@"), a
+// reserved-domain one ("info@example.com") or a masked one
+// ("nxxxxxxxxxxx@"). A bare "xxx" inside a word is a real handle
 // ("sun.moon.xxx.aki", "xxxlutz.ch"), so only mask shapes count.
 func isPlaceholder(local, domain string) bool {
 	if placeholders[local] || strings.Contains(local, "xxxx") || strings.Contains(domain, "xxxx") {
+		return true
+	}
+	for _, d := range reservedDomains {
+		if domain == d || strings.HasSuffix(domain, "."+d) {
+			return true
+		}
+	}
+	if reservedTLDs[domain[strings.LastIndex(domain, ".")+1:]] {
+		return true
+	}
+	if formExamples[local] && isFreeMail(domain) {
 		return true
 	}
 	if len(local) >= 3 && strings.Trim(local, "x") == "" {
@@ -87,7 +113,7 @@ var freeMail = map[string]bool{
 	"sina.cn": true, "sohu.com": true, "yeah.net": true, "naver.com": true,
 	"daum.net": true, "hanmail.net": true, "mail.ru": true, "aol.com": true,
 	"msn.com": true, "proton.me": true, "protonmail.com": true, "web.de": true,
-	"rediffmail.com": true,
+	"rediffmail.com": true, "mail.com": true, "email.com": true,
 }
 
 var freeMailFamilies = []string{"yahoo.", "hotmail.", "outlook.", "live.", "yandex.", "gmx."}
@@ -204,13 +230,15 @@ func (c Context) ownDomain(domain string) bool {
 	return false
 }
 
-// gmailOK enforces Gmail's 6-30 character local part (dots ignored) so a repair
-// never shortens a real Gmail address into something Gmail cannot issue.
+// gmailOK enforces Gmail's 6-30 character local part (dots and any +tag
+// ignored) so a repair never shortens a real Gmail address into something Gmail
+// cannot issue, and a final address Gmail could never have issued is rejected.
 func gmailOK(local, domain string) bool {
 	if domain != "gmail.com" && domain != "googlemail.com" {
 		return true
 	}
-	n := len(strings.ReplaceAll(local, ".", ""))
+	base, _, _ := strings.Cut(local, "+")
+	n := len(strings.ReplaceAll(base, ".", ""))
 	return n >= 6 && n <= 30
 }
 
@@ -772,6 +800,19 @@ func CleanList(emails []string) []string {
 	return out
 }
 
+// typoTLDProviders are free-mail brands whose ".com" is often mistyped; only a
+// two-label domain of exactly this brand is repaired, so "mygmail.con" is not.
+var typoTLDProviders = map[string]bool{
+	"gmail": true, "googlemail": true, "hotmail": true, "yahoo": true, "outlook": true,
+	"live": true, "msn": true, "aol": true, "icloud": true, "ymail": true,
+}
+
+// typoComs are keyboard slips of "com". Real TLDs like "co" or "org" are absent.
+var typoComs = map[string]bool{
+	"con": true, "cpm": true, "vom": true, "xom": true, "cim": true, "om": true,
+	"cm": true, "cmo": true, "ocm": true, "comm": true, "coom": true,
+}
+
 // Repair is RepairCtx without context: only the phone and TLD rules can fire.
 func Repair(email string) (fixed string, changed bool, ok bool) {
 	fixed, rules, ok := RepairCtx(email, Context{})
@@ -779,8 +820,8 @@ func Repair(email string) (fixed string, changed bool, ok bool) {
 }
 
 // RepairCtx repairs a glued address. fixed is lowercase; rules names every rule
-// that changed it (phone, tld, middomain, label, prefix); ok is false when the
-// result is still not a clean address.
+// that changed it (syntax, typotld, phone, tld, middomain, label, prefix,
+// digitrole); ok is false when the result is still not a clean address.
 func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) {
 	orig := strings.ToLower(strings.TrimSpace(email))
 	s, synChanged, synOK := normalizeSyntax(email)
@@ -795,6 +836,12 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 		return s, rules, false
 	}
 	local, domain := s[:at], s[at+1:]
+
+	// "gmail.con" -> "gmail.com": checked before the glue cuts so the later rules
+	// and the gmail length check see the repaired domain.
+	if labels := strings.Split(domain, "."); len(labels) == 2 && typoTLDProviders[labels[0]] && typoComs[labels[1]] {
+		domain, rules = labels[0]+".com", append(rules, "typotld")
+	}
 
 	fullDomain := domain
 	if d := cutGluedTLD(domain); d != domain {
@@ -860,6 +907,10 @@ func RepairCtx(email string, c Context) (fixed string, rules []string, ok bool) 
 	// A strip can leave a form example ("+4912345678email" -> "email"), which
 	// normalizeSyntax only checks on the raw input.
 	if isPlaceholder(local, domain) {
+		addRule("syntax")
+		return fixed, rules, false
+	}
+	if !gmailOK(local, domain) {
 		addRule("syntax")
 		return fixed, rules, false
 	}
