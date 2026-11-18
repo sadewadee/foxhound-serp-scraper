@@ -48,7 +48,7 @@ func TestRepair(t *testing.T) {
 		{"a@b.com", "a@b.com", false, false},                                               // local part too short
 		{"kelsey@elevationfitnesspdx.con", "kelsey@elevationfitnesspdx.con", false, false}, // typo, not glue
 		{"aaron@gmail.com.archive", "aaron@gmail.com.archive", false, false},               // ".archi" would be a wrong guess
-		{"paint@gmail.coom", "paint@gmail.coom", false, false},
+		{"paint@gmail.coom", "paint@gmail.com", true, false},                               // typotld repairs the domain; gmail's 6-30 rule still rejects
 		{"hello@liveingermany.de/", "hello@liveingermany.de", true, true},
 		// CRM-invalid and unrepairable: carries the "syntax" rule so repair-emails marks it malformed.
 		{"in fo@x.com", "in fo@x.com", true, false},

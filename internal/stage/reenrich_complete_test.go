@@ -23,9 +23,9 @@ func TestCompleteEnrichmentJob_FiresNormalizeTrigger(t *testing.T) {
 	ctx := context.Background()
 
 	// Existing completed job for the listing URL, no emails found first time.
-	const existing = "https://studio-a.example.com/"
+	const existing = "https://studio-a.fixture.com/"
 	if _, err := d.Exec(`INSERT INTO enrichment_jobs (url, url_hash, domain, source, status)
-		VALUES ($1, 'hash-a', 'studio-a.example.com', 'serp_result', 'pending')`, existing); err != nil {
+		VALUES ($1, 'hash-a', 'studio-a.fixture.com', 'serp_result', 'pending')`, existing); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.Exec(`UPDATE enrichment_jobs SET status='completed' WHERE url_hash='hash-a'`); err != nil {
@@ -33,8 +33,8 @@ func TestCompleteEnrichmentJob_FiresNormalizeTrigger(t *testing.T) {
 	}
 
 	cases := []struct{ name, url, hash, domain, email string }{
-		{"existing completed row", existing, "hash-a", "studio-a.example.com", "hello@studio-a.example.com"},
-		{"new row", "https://studio-b.example.org/", "hash-b", "studio-b.example.org", "hello@studio-b.example.org"},
+		{"existing completed row", existing, "hash-a", "studio-a.fixture.com", "hello@studio-a.fixture.com"},
+		{"new row", "https://studio-b.fixture.org/", "hash-b", "studio-b.fixture.org", "hello@studio-b.fixture.org"},
 	}
 	for _, tc := range cases {
 		cd := &internalScraper.ContactData{BusinessName: "Studio " + tc.name}
