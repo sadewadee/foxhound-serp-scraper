@@ -447,10 +447,11 @@ var (
 
 // webGlue reports whether rest, the text left after a TLD-prefix cut, is web or
 // social text: a social host (optionally doubled), or a web word followed by
-// "www.", the first label of the domain, or a hostname (dot inside, ICANN TLD
-// last: "webseitestudio-b.de"). A web word alone is not enough: "tmweb.ru",
-// "infoweb.ne.jp" and "comweb.de" (empty first label) are real domains.
-func webGlue(rest, first string) bool {
+// "www.", the first label of the domain, or (long web words only) a hostname
+// ending in the cut TLD ("webseitestudio-b.de" after "de"); a different TLD is a
+// real host ("mywebsitetransfer.com" cut at "my"). A web word alone is not
+// enough: "tmweb.ru", "infoweb.ne.jp" and "comweb.de" are real domains.
+func webGlue(rest, first, tld string) bool {
 	for _, w := range socialHosts {
 		if rest == w+".com" || rest == w+w+".com" {
 			return true
@@ -464,7 +465,7 @@ func webGlue(rest, first string) bool {
 		if strings.HasPrefix(after, "www.") || (first != "" && strings.HasPrefix(after, first+".")) {
 			return true
 		}
-		if i, j := strings.Index(after, "."), strings.LastIndex(after, "."); i > 0 && w != "web" && w != "url" && IsTLD(after[j+1:]) {
+		if i, j := strings.Index(after, "."), strings.LastIndex(after, "."); i > 0 && w != "web" && w != "url" && after[j+1:] == tld {
 			return true
 		}
 	}
@@ -491,7 +492,7 @@ func cutMidDomain(local, domain string, c Context) string {
 			}
 			d := strings.Join(labels[:j], ".") + "." + label[:n]
 			rest := label[n:] + "." + strings.Join(labels[j+1:], ".")
-			web := webGlue(rest, labels[0])
+			web := webGlue(rest, labels[0], label[:n])
 			signal := strings.Contains(rest, "www") || strings.Contains(rest, labels[0]) || web
 			// A leftover that starts with "www.", repeats the first label or is web or
 			// social text is glue on its own, so the cut needs no vouching.
